@@ -1,0 +1,34 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+
+# Data and models (large files)
+data/raw/
+data/processed/
+models/*.pkl
+models/*.joblib
+models/*.onnx
+models/study.db
+
+# Reports
+reports/
+
+# Logs
+logs/
+
+# Compiled MQL5 binary (source .mq5 is tracked)
+mql5/*.ex5
+
+# IDE
+.vscode/settings.json
+.idea/
