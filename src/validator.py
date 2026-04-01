@@ -21,6 +21,9 @@ from pathlib import Path
 from src.logger import setup_logger
 from src.processor import (
     TF_CONFIG,
+    DXY_RAW_PATH,
+    load_dxy_data,
+    map_dxy_to_bars,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
@@ -28,7 +31,7 @@ from src.processor import (
     compute_atr,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states
-from src.engine_xgb import load_xgb, prepare_features, get_predictions
+from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble
 from src.backtester import vectorized_backtest
 
 logger = setup_logger(__name__)
@@ -67,6 +70,12 @@ def _apply_features(
     df["rsi"]            = compute_rsi(df["Close"])
     df["rsi_slope"]      = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
+
+    # Mirror process_pipeline: add DXY if the shared file exists
+    dxy_df = load_dxy_data(DXY_RAW_PATH)
+    if dxy_df is not None:
+        df["dxy_log_return"] = map_dxy_to_bars(df.index, dxy_df)
+
     df.dropna(inplace=True)
     return df
 
@@ -126,10 +135,10 @@ def run_validation(
             "Run  python main.py --mode train  first."
         )
     try:
-        model_xgb, _ = load_xgb()
+        models_xgb, thresholds_xgb, _ = load_xgb_ensemble()
     except FileNotFoundError:
         raise FileNotFoundError(
-            "XGB model not found at models/xgb_model.pkl. "
+            "XGB ensemble not found at models/xgb_ensemble.pkl. "
             "Run  python main.py --mode train  first."
         )
 
@@ -137,7 +146,7 @@ def run_validation(
     states                = predict_states(model_hmm, df)
     X, _, df_aligned      = prepare_features(df, states)
     states_aligned        = states[df.index.isin(df_aligned.index)]
-    _, probabilities      = get_predictions(model_xgb, X)
+    _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 
     # Backtest the full synced window — no IS/OOS split
     result = vectorized_backtest(
