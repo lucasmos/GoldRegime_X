@@ -79,6 +79,31 @@ def load_dxy_data(path: Path) -> pd.DataFrame | None:
     return df[["dxy_log_return"]]
 
 
+def map_dxy_to_bars(df_index: pd.DatetimeIndex, dxy_df: pd.DataFrame) -> pd.Series:
+    """Map daily DXY log return onto an intraday bar index.
+
+    Handles two gap cases:
+    - Internal gaps (weekends / holidays inside the DXY date range) — filled via ffill.
+    - Future dates beyond the DXY file's end (e.g. live sync data newer than the
+      last DXY export) — the last known daily return is carried forward.
+
+    Also handles tz-aware indices (e.g. UTC from MT5 sync) by stripping timezone
+    before comparison with tz-naive DXY dates.
+    """
+    series = dxy_df["dxy_log_return"].copy()
+    # Strip timezone so tz-aware sync data can be compared against tz-naive DXY dates
+    normalized = df_index.tz_localize(None) if df_index.tz is not None else df_index
+    normalized = normalized.normalize()
+    max_date = normalized.max()
+    if max_date > series.index.max():
+        extension = pd.date_range(
+            series.index.max() + pd.Timedelta(days=1), max_date, freq="D"
+        )
+        series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
+    series = series.ffill()
+    return normalized.map(series)
+
+
 def filter_data(df: pd.DataFrame, years: int = 10) -> pd.DataFrame:
     cutoff = df.index.max() - pd.DateOffset(years=years)
     df = df[df.index >= cutoff]
@@ -175,7 +200,7 @@ def process_pipeline(
         if dxy_df is not None:
             # DXY is daily — normalize each intraday bar's timestamp to midnight
             # so it matches the DXY date index before mapping.
-            df["dxy_log_return"] = df.index.normalize().map(dxy_df["dxy_log_return"])
+            df["dxy_log_return"] = map_dxy_to_bars(df.index, dxy_df)
             n_dxy = df["dxy_log_return"].notna().sum()
             logger.info("DXY merged: %d non-null dxy_log_return values.", n_dxy)
         else:

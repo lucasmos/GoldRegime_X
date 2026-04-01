@@ -36,7 +36,12 @@ Kalman Filter  →  Log Returns (smoothed)
 GaussianHMM   →  Regime Labels  (Bull=0, Bear=1, Chop=2)
       │
       ▼
-XGBoost       →  Signal Probability  [hmm_state, rsi_slope, atr_normalized, prev_log_return]
+XGBoost       →  Three-Model Volatility Ensemble
+               Features: [hmm_state, rsi_slope, atr_normalized, prev_log_return, dxy_log_return*]
+               Low ATR bucket  → XGBoost model (quiet market)
+               Med ATR bucket  → XGBoost model (normal market)
+               High ATR bucket → XGBoost model (volatile market)
+               * optional — requires data/raw/DXY_data.csv
       │
       ▼
 Backtester    →  IS / OOS Sharpe, Drawdown, Trade Count
@@ -184,7 +189,7 @@ python main.py --mode optimize --trials 300 --broker headway_cent --balance 15 -
 Runs an Optuna study that searches across:
 - Kalman filter parameters (`obs_cov`, `trans_cov`)
 - HMM state count (`n_states`: 2–4)
-- Signal probability threshold (`prob_threshold`: 0.52–0.68)
+- Signal probability threshold (`prob_threshold`: 0.505–0.60)
 - XGBoost parameters (`max_depth`, `learning_rate`, `n_estimators`, `subsample`, `colsample_bytree`, `min_child_weight`, `gamma`, `reg_alpha`)
 
 Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials with fewer than 50 OOS trades are discarded. Progress is saved to `models/study.db` after every trial — safe to interrupt with Ctrl+C and resume later.
@@ -199,7 +204,7 @@ Each trial is scored on **OOS Sharpe only** to prevent IS data leakage. Trials w
 python main.py --mode train --broker headway_cent --balance 15 --tf H1
 ```
 
-Trains HMM and XGBoost using the best parameters found by the optimizer. Prints IS/OOS Sharpe, drawdown, and trade count. Saves `models/hmm_model.pkl` and `models/xgb_model.pkl`.
+Trains HMM and the three-model XGBoost volatility ensemble using the best parameters found by the optimizer. Prints IS/OOS Sharpe, drawdown, and trade count per bucket. Saves `models/hmm_model.pkl` and `models/xgb_ensemble.pkl`.
 
 ### Step 4 — Compare timeframes (optional)
 
@@ -215,7 +220,12 @@ Side-by-side OOS performance for multiple timeframes. Supports any comma-separat
 python main.py --mode export
 ```
 
-Converts the XGBoost model to `models/xgb_model.onnx` for use with the MQL5 Expert Advisor. Required only if you want to use the EA instead of the Python bridge.
+Converts each volatility-bucket XGBoost model to ONNX format for use with the MQL5 Expert Advisor. Produces three files:
+- `models/xgb_model_vol_low.onnx` — quiet market model
+- `models/xgb_model_vol_med.onnx` — normal market model
+- `models/xgb_model_vol_high.onnx` — volatile market model
+
+Required only if you want to use the EA instead of the Python bridge.
 
 ### Step 6 — Generate visual report
 
@@ -338,6 +348,55 @@ When TP1 fills, the runner's stop-loss is automatically moved to break-even. If 
 |-----------|----|--------|
 | Normal | 30 pts | 20 pts |
 | High-vol (HMM self-transition < 0.70) | 50 pts | 50 pts |
+
+---
+
+## Volatility Ensemble (Three-Model XGBoost)
+
+Instead of a single XGBoost model, the system trains **three separate models**, each specialising in a different market volatility regime. This prevents a model tuned for quiet markets from misfiring during high-volatility events, and vice versa.
+
+### How bucketing works
+
+ATR percentile thresholds are computed on the **in-sample** portion of the training data only (no look-ahead bias). Each bar is assigned a bucket based on its `atr_normalized` value:
+
+| Bucket | ATR condition | Description |
+|--------|--------------|-------------|
+| `low` | `atr_normalized ≤ p33` | Quiet / tight-range market |
+| `med` | `p33 < atr_normalized ≤ p66` | Normal trending market |
+| `high` | `atr_normalized > p66` | High-volatility / news-driven |
+
+During training, each model only sees bars from its own bucket (IS subset). During inference (live or backtest), each bar is routed to the correct model based on its real-time `atr_normalized`.
+
+### Model files
+
+| File | Purpose |
+|------|---------|
+| `models/xgb_ensemble.pkl` | All three models + ATR thresholds + feature list |
+| `models/xgb_model_vol_low.onnx` | Low-volatility bucket (MQL5 EA use) |
+| `models/xgb_model_vol_med.onnx` | Medium-volatility bucket (MQL5 EA use) |
+| `models/xgb_model_vol_high.onnx` | High-volatility bucket (MQL5 EA use) |
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| `hmm_state` | GaussianHMM regime label (Bull=0, Bear=1, Chop=2) |
+| `rsi_slope` | Rate of change of RSI — momentum direction |
+| `atr_normalized` | ATR / Close — normalised volatility |
+| `prev_log_return` | Previous bar log return — short-term momentum |
+| `dxy_log_return` | Daily DXY log return — USD strength signal *(optional)* |
+
+The DXY feature is included automatically when `data/raw/DXY_data.csv` exists. If the file is absent all three models run with 4 features — no code change needed.
+
+### Probability threshold
+
+A single `prob_threshold` is optimised by Optuna (search range `0.505–0.60`) and applies symmetrically across all three models:
+
+- **BUY**: `prob > prob_threshold`
+- **SELL**: `prob < 1 − prob_threshold`
+- **Chop state**: trades blocked regardless of probability
+
+The threshold is the same for Bull, Bear, and Chop regimes because the XGBoost model already internalises regime via the `hmm_state` feature — it naturally produces higher BUY probabilities in Bull conditions and higher SELL probabilities in Bear conditions.
 
 ---
 

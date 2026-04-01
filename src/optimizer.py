@@ -72,7 +72,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         obs_cov        = trial.suggest_float("obs_cov",        0.1,  5.0,  log=True)
         trans_cov      = trial.suggest_float("trans_cov",      0.001, 0.1, log=True)
         n_states       = trial.suggest_int("n_states", 2, 4)
-        prob_threshold = trial.suggest_float("prob_threshold", 0.52, 0.68)
+        prob_threshold = trial.suggest_float("prob_threshold", 0.505, 0.60)
 
         max_depth        = trial.suggest_int("max_depth", 3, 5)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
