@@ -399,6 +399,7 @@ def cmd_report(args):
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
+        prob_threshold=params.get("prob_threshold"),
     )
 
     arm = AdaptiveRiskManager(balance)
