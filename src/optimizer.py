@@ -38,7 +38,13 @@ except ImportError:
 
 STUDY_DB        = "sqlite:///models/study.db"
 DD_HARD_LIMIT   = 0.15
-MIN_OOS_TRADES  = 50
+# Minimum OOS trades before a trial is considered scoreable.
+# M5 has 288 bars/day — the OOS window (~2yr) allows up to ~870 trades at
+# 2/day cap.  Setting 300 forces at least 0.69 trades/day on average,
+# preventing the optimizer from rewarding ultra-infrequent cherry-picked wins.
+# H1/M15 get lower floors because their datasets are smaller.
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 100, "H1": 50}
+MIN_OOS_TRADES  = 50   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 
@@ -67,6 +73,7 @@ def _score_result(result: dict, tier: str, broker: str) -> float:
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
     """Return an Optuna objective function for the given account / TF context."""
     tier = _get_tier(balance)
+    min_oos_trades = MIN_OOS_TRADES_BY_TF.get(tf.upper(), MIN_OOS_TRADES)
 
     def objective(trial: optuna.Trial) -> float:
         obs_cov        = trial.suggest_float("obs_cov",        0.1,  5.0,  log=True)
@@ -115,7 +122,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             # Score on OOS only to prevent IS data leakage
             if split_idx and "oos_sharpe_ratio" in result:
-                if result.get("oos_n_trades", 0) < MIN_OOS_TRADES:
+                if result.get("oos_n_trades", 0) < min_oos_trades:
                     return -10.0
                 oos_result = {
                     "sharpe_ratio": result["oos_sharpe_ratio"],
