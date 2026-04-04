@@ -79,7 +79,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         obs_cov        = trial.suggest_float("obs_cov",        0.1,  5.0,  log=True)
         trans_cov      = trial.suggest_float("trans_cov",      0.001, 0.1, log=True)
         n_states       = trial.suggest_int("n_states", 2, 4)
-        prob_threshold = trial.suggest_float("prob_threshold", 0.505, 0.60)
+        # M5 probs cluster below 0.56 in live — narrow range forces the
+        # optimizer to find high-frequency signals in the 0.50–0.55 window.
+        # H1/M15 use a wider buffer since their bars carry more information.
+        if tf.upper() == "M5":
+            prob_threshold = trial.suggest_float("prob_threshold", 0.50, 0.55)
+        else:
+            prob_threshold = trial.suggest_float("prob_threshold", 0.52, 0.65)
 
         max_depth        = trial.suggest_int("max_depth", 3, 5)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
@@ -156,15 +162,15 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
     return objective
 
 
-def _make_callbacks(n_trials: int, study_name: str, already_done: int = 0) -> list:
+def _make_callbacks(total_target: int, study_name: str, already_done: int = 0) -> list:
     """Build Optuna callbacks for progress reporting, RAM guard, and Telegram.
 
     Args:
-        n_trials:     Number of trials requested for THIS session.
+        total_target: Total trial target for the full study (not just this session).
         study_name:   Optuna study name (for Telegram messages).
         already_done: Completed trials in the DB before this session started.
-                      All progress percentages are relative to session trials only,
-                      so a resumed run shows [1/500] not [373/500].
+                      Progress is reported as total_done / total_target so a
+                      resumed run correctly shows e.g. [401/500] not [1/100].
     """
     from src.notifier import send_telegram_msg
 
@@ -176,7 +182,6 @@ def _make_callbacks(n_trials: int, study_name: str, already_done: int = 0) -> li
             t for t in study.trials
             if t.state == optuna.trial.TrialState.COMPLETE
         ])
-        # session_done = trials completed in THIS session only
         session_done = max(0, total_done - already_done)
 
         if session_done <= 0:
@@ -195,8 +200,8 @@ def _make_callbacks(n_trials: int, study_name: str, already_done: int = 0) -> li
         # ── Progress dashboard every 5 session trials ─────────────────────────
         if session_done % 5 == 0:
             elapsed   = time.time() - start_time[0]
-            rate      = elapsed / session_done
-            remaining = max(0, n_trials - session_done)
+            rate      = elapsed / session_done          # seconds per trial
+            remaining = max(0, total_target - total_done)
             eta_sec   = remaining * rate
             if eta_sec >= 3600:
                 eta_str = f"{int(eta_sec // 3600)}h {int((eta_sec % 3600) // 60)}m"
@@ -208,14 +213,14 @@ def _make_callbacks(n_trials: int, study_name: str, already_done: int = 0) -> li
                 if _PSUTIL_OK else ""
             )
             print(
-                f"  [{session_done:>4}/{n_trials}]  "
+                f"  [{total_done:>4}/{total_target}]  "
                 f"Best Sharpe: {best:+.3f}  |  "
                 f"ETA: {eta_str}{ram_str}"
             )
 
-        # ── Telegram heartbeat every 10% of SESSION trials ───────────────────
-        if n_trials > 0:
-            milestone = (int(session_done / n_trials * 100) // 10) * 10
+        # ── Telegram heartbeat every 10% of total progress ───────────────────
+        if total_target > 0:
+            milestone = (int(total_done / total_target * 100) // 10) * 10
             if milestone > 0 and milestone not in heartbeat_pct:
                 heartbeat_pct.add(milestone)
                 best = study.best_value if study.best_trial else float("-inf")
@@ -223,7 +228,7 @@ def _make_callbacks(n_trials: int, study_name: str, already_done: int = 0) -> li
                     f"Optimization <b>{milestone}%</b> complete\n"
                     f"Study: <code>{study_name}</code>\n"
                     f"Best Sharpe: <b>{best:.3f}</b>  |  "
-                    f"Trials: {session_done}/{n_trials}"
+                    f"Trials: {total_done}/{total_target}"
                 )
 
     return [_callback]
@@ -285,20 +290,26 @@ def run_optimization(
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE
     ])
+    # n_trials is the TOTAL study target — compute how many remain to run
+    remaining = max(0, n_trials - already_done)
     if already_done > 0:
-        pct = already_done / (already_done + n_trials) * 100
+        pct = already_done / n_trials * 100
         print(
-            f"\nFailsafe: {already_done} completed trials found in study.db "
-            f"({pct:.0f}% of total {already_done + n_trials}). "
-            f"Resuming from trial #{already_done + 1}...\n"
+            f"\nFailsafe: {already_done}/{n_trials} trials already in study.db "
+            f"({pct:.0f}% complete). "
+            f"Resuming from trial #{already_done + 1} — {remaining} remaining.\n"
         )
     else:
-        print(f"\nStarting new study '{name}' — {n_trials} trials.\n")
+        print(f"\nStarting new study '{name}' — target {n_trials} trials.\n")
+
+    if remaining == 0:
+        print("Target already reached — no new trials needed. Use a higher --trials value to continue.\n")
+        return study
 
     logger.info(
         "Optimization: tf=%s  broker=%s  tier=%s  balance=$%.0f  "
-        "n_trials=%d  n_jobs=%d  study=%s  already_done=%d",
-        tf, broker, tier, balance, n_trials, n_jobs, name, already_done,
+        "target=%d  already_done=%d  remaining=%d  n_jobs=%d  study=%s",
+        tf, broker, tier, balance, n_trials, already_done, remaining, n_jobs, name,
     )
 
     # Suppress Optuna's verbose per-trial INFO logs; our callback handles output
@@ -306,7 +317,7 @@ def run_optimization(
 
     study.optimize(
         make_objective(balance=balance, broker=broker, tf=tf),
-        n_trials=n_trials,
+        n_trials=remaining,
         n_jobs=n_jobs,
         show_progress_bar=(n_jobs == 1),   # tqdm bar misleads with threads
         callbacks=_make_callbacks(n_trials, name, already_done=already_done),
