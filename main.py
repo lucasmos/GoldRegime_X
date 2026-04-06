@@ -102,6 +102,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         broker=broker,
         tf=tf,
         prob_threshold=params.get("prob_threshold"),
+        short_threshold=params.get("short_threshold"),
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -325,7 +326,7 @@ def cmd_live(args):
     if not _check_m5_readiness(tf):
         sys.exit(1)
 
-    if args.account == "live":
+    if args.account == "live" and not args.yes:
         print("\n" + "=" * 60)
         print("  WARNING: LIVE ACCOUNT — real money is at risk.")
         print("  Ensure  --mode sync_validate  passed before continuing.")
@@ -400,6 +401,7 @@ def cmd_report(args):
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
         prob_threshold=params.get("prob_threshold"),
+        short_threshold=params.get("short_threshold"),
     )
 
     arm = AdaptiveRiskManager(balance)
@@ -523,6 +525,8 @@ def main():
     parser.add_argument("--account", type=str,   default="demo",
                         choices=["live", "demo"],
                         help="Account type for --mode live. 'live' requires confirmation.")
+    parser.add_argument("--yes", action="store_true",
+                        help="Skip the interactive live-account confirmation (used when launched as a subprocess).")
 
     args = parser.parse_args()
     {

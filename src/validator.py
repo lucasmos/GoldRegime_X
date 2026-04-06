@@ -155,6 +155,8 @@ def run_validation(
         account_size=account_size,
         broker=broker,
         tf=tf,
+        prob_threshold=params.get("prob_threshold"),
+        short_threshold=params.get("short_threshold"),
     )
 
     sharpe   = result["sharpe_ratio"]

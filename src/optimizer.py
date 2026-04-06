@@ -51,8 +51,10 @@ RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 # Study tier objectives --------------------------------------------------------
 # Small accounts ($15–$50): extreme drawdown protection — Sharpe - DD×5.0
 # Growth accounts (>$50):   balanced with higher frequency — Sharpe - DD×3.0
+# Both tiers now use 15% DD cap — BUY+SELL doubles trade frequency so the
+# previous 10% cap rejected every trial even when OOS Sharpe was acceptable.
 TIER_CONFIGS = {
-    "small":  {"dd_penalty": 5.0, "dd_limit": 0.10},
+    "small":  {"dd_penalty": 5.0, "dd_limit": 0.15},
     "growth": {"dd_penalty": 3.0, "dd_limit": 0.15},
 }
 
@@ -76,16 +78,31 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
     min_oos_trades = MIN_OOS_TRADES_BY_TF.get(tf.upper(), MIN_OOS_TRADES)
 
     def objective(trial: optuna.Trial) -> float:
-        obs_cov        = trial.suggest_float("obs_cov",        0.1,  5.0,  log=True)
+        # M5: obs_cov floor raised to 1.0 — values below ~0.5 produce a
+        # degenerate Kalman filter where Bull/Chop become identical states
+        # and the HMM fires 500K+ transitions (every 5-min bar).
+        # H1/M15 keep the wide range since their bars carry more information.
+        if tf.upper() == "M5":
+            obs_cov = trial.suggest_float("obs_cov", 1.0, 5.0, log=True)
+        else:
+            obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
         trans_cov      = trial.suggest_float("trans_cov",      0.001, 0.1, log=True)
         n_states       = trial.suggest_int("n_states", 2, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the
         # optimizer to find high-frequency signals in the 0.50–0.55 window.
         # H1/M15 use a wider buffer since their bars carry more information.
+        # short_threshold must stay below prob_threshold (no-trade zone must exist).
         if tf.upper() == "M5":
-            prob_threshold = trial.suggest_float("prob_threshold", 0.50, 0.55)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.55)
+            short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
         else:
-            prob_threshold = trial.suggest_float("prob_threshold", 0.52, 0.65)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.65)
+            short_threshold = trial.suggest_float("short_threshold", 0.35, 0.48)
+
+        # Guard: thresholds must not overlap — a crossover means every bar gets
+        # both a BUY and SELL signal simultaneously, which is nonsensical.
+        if short_threshold >= prob_threshold:
+            return -10.0
 
         max_depth        = trial.suggest_int("max_depth", 3, 5)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
@@ -124,6 +141,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 broker=broker,
                 tf=tf,
                 prob_threshold=prob_threshold,
+                short_threshold=short_threshold,
             )
 
             # Score on OOS only to prevent IS data leakage
@@ -367,8 +385,26 @@ def get_best_params(
     broker: str    = "standard",
     tf: str        = "H1",
 ) -> dict:
-    """Load the best hyperparameters from the persisted SQLite study."""
+    """Load the best hyperparameters from the persisted SQLite study.
+
+    Tries the tier matching *balance* first.  If that study doesn't exist yet
+    (e.g. growth tier has never been optimized) it falls back to the small tier
+    so that Optuna thresholds are always used rather than hardcoded defaults.
+    """
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
-    study = optuna.load_study(study_name=name, storage=STUDY_DB)
-    return study.best_params
+    try:
+        study = optuna.load_study(study_name=name, storage=STUDY_DB)
+        return study.best_params
+    except Exception:
+        if tier == "small":
+            raise   # small tier is the baseline — nothing to fall back to
+        # Growth (or future tiers) — reuse the small-tier study params so live
+        # trading always benefits from Optuna thresholds.
+        fallback = _study_name(broker=broker, tier="small", tf=tf)
+        logger.info(
+            "Growth study '%s' not found — using small-tier params from '%s'.",
+            name, fallback,
+        )
+        study = optuna.load_study(study_name=fallback, storage=STUDY_DB)
+        return study.best_params

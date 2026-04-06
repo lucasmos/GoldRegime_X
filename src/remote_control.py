@@ -5,17 +5,18 @@ the authorised user and dispatches them as subprocesses so the listener
 thread is never blocked.
 
 Keyboard layout:
-    ┌──────────────────────────────┬─────────────────────┐
-    │  🚀 START TRADING            │  🛑 STOP TRADING     │
-    ├──────────────────────────────┼─────────────────────┤
-    │  📉 OPTIMIZE M5 (0.50-0.55) │  📊 BOT STATUS       │
-    └──────────────────────────────┴─────────────────────┘
+    ┌──────────────┬──────────────┬──────────────┐
+    │  🚀 START M5 │ 🚀 START M15 │ 🚀 START H1  │
+    ├──────────────┴──────┬───────┴──────────────┤
+    │  🛑 STOP TRADING    │  📉 OPTIMIZE M5       │
+    ├─────────────────────┴──────────────────────┤
+    │              📊 BOT STATUS                  │
+    └────────────────────────────────────────────┘
 
 Required env vars (see .env.example):
     TELEGRAM_BOT_TOKEN   — BotFather token
     TELEGRAM_CHAT_ID     — Your chat ID (used for outbound heartbeat messages)
     ALLOWED_USER_ID      — Your numeric Telegram user ID (security gate)
-    LIVE_TF              — Default TF for START TRADING (default: M5)
     LIVE_BROKER          — Default broker  (default: headway_cent)
     LIVE_BALANCE         — Default balance (default: 15)
 
@@ -40,8 +41,8 @@ logger = setup_logger(__name__)
 # one_time_keyboard=False → stays visible after every tap
 _KEYBOARD = {
     "keyboard": [
-        ["🚀 START TRADING",             "🛑 STOP TRADING"],
-        ["📉 OPTIMIZE M5 (0.50-0.55)",   "📊 BOT STATUS"],
+        ["🚀 START M5",    "🚀 START M15",             "🚀 START H1"],
+        ["🛑 STOP TRADING", "📉 OPTIMIZE M5 (0.50-0.55)", "📊 BOT STATUS"],
     ],
     "resize_keyboard":   True,
     "one_time_keyboard": False,
@@ -101,8 +102,10 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
             token, chat_id,
             "<b>Gold Regime X — Command Center</b>\n\n"
             "Use the buttons below to manage the trading system remotely.\n\n"
-            "<b>🚀 START TRADING</b> — Launch the live M5 loop\n"
-            "<b>🛑 STOP TRADING</b>  — Terminate the live loop\n"
+            "<b>🚀 START M5</b>   — Launch the live M5 trading loop\n"
+            "<b>🚀 START M15</b>  — Launch the live M15 trading loop\n"
+            "<b>🚀 START H1</b>   — Launch the live H1 trading loop\n"
+            "<b>🛑 STOP TRADING</b>  — Terminate all active trading loops\n"
             "<b>📉 OPTIMIZE M5</b>   — Resume/start M5 optimisation (0.50–0.55 range)\n"
             "<b>📊 BOT STATUS</b>    — Live P&amp;L, daily trade count, process health",
         )
@@ -113,26 +116,41 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
         _api(token, "sendMessage", chat_id=chat_id, text="Unauthorized.")
         return
 
-    tf      = os.getenv("LIVE_TF",      "M5")
     broker  = os.getenv("LIVE_BROKER",  "headway_cent")
     balance = os.getenv("LIVE_BALANCE", "15")
 
-    if text == "🚀 START TRADING":
-        if _proc_alive("trading"):
-            _reply(token, chat_id, "Trading is already running.")
+    def _start_tf(tf: str) -> None:
+        """Launch a live trading loop for *tf* if one is not already running."""
+        key = f"trading_{tf}"
+        if _proc_alive(key):
+            _reply(token, chat_id, f"{tf} trading is already running.")
             return
-        _procs["trading"] = subprocess.Popen([
+        _procs[key] = subprocess.Popen([
             "python", "main.py",
-            "--mode", "live", "--account", "live",
+            "--mode", "live", "--account", "live", "--yes",
             "--tf", tf, "--broker", broker, "--balance", balance,
         ])
         _reply(token, chat_id,
-               f"<b>Trading started</b>\nTF={tf}  broker={broker}  balance=${balance}")
+               f"<b>{tf} trading started</b>\nbroker={broker}  balance=${balance}")
+
+    if text == "🚀 START M5":
+        _start_tf("M5")
+
+    elif text == "🚀 START M15":
+        _start_tf("M15")
+
+    elif text == "🚀 START H1":
+        _start_tf("H1")
 
     elif text == "🛑 STOP TRADING":
-        if _proc_alive("trading"):
-            _procs["trading"].terminate()
-            _reply(token, chat_id, "<b>Trading stopped.</b>")
+        stopped = []
+        for tf in ("M5", "M15", "H1"):
+            key = f"trading_{tf}"
+            if _proc_alive(key):
+                _procs[key].terminate()
+                stopped.append(tf)
+        if stopped:
+            _reply(token, chat_id, f"<b>Trading stopped.</b>  ({', '.join(stopped)})")
         else:
             _reply(token, chat_id, "No active trading process found.")
 
@@ -155,14 +173,18 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
 
     elif text == "📊 BOT STATUS":
         # ── Process health ───────────────────────────────────────────────────
-        trading_icon   = "✅" if _proc_alive("trading")   else "❌"
+        lines = ["<b>System Status</b>"]
+        for tf in ("M5", "M15", "H1"):
+            key   = f"trading_{tf}"
+            alive = _proc_alive(key)
+            icon  = "✅" if alive else "❌"
+            state = "Running" if alive else "Stopped"
+            lines.append(f"{tf} Loop:       {icon} {state}")
         optimizer_icon = "🔄" if _proc_alive("optimizer") else "💤"
-        proc_block = (
-            "<b>System Status</b>\n"
-            f"Trading Loop: {trading_icon} {'Running' if _proc_alive('trading') else 'Stopped'}\n"
-            f"Optimizer:    {optimizer_icon} {'Running' if _proc_alive('optimizer') else 'Idle'}\n"
-            f"{'—'*28}\n"
-        )
+        opt_state = "Running" if _proc_alive("optimizer") else "Idle"
+        lines.append(f"Optimizer:    {optimizer_icon} {opt_state}")
+        lines.append("—" * 28)
+        proc_block = "\n".join(lines) + "\n"
 
         # ── P&L report from auditor ──────────────────────────────────────────
         # Session limit: 2/day for small accounts (≤$50), 3 otherwise
