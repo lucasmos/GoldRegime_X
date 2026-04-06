@@ -17,8 +17,24 @@ PROB_THRESHOLD = 0.65
 CHOP_STATE     = 2
 
 
-def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD):
-    return ((probabilities > threshold) & (hmm_states != CHOP_STATE)).astype(int)
+def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD,
+                    short_threshold=None):
+    """Generate directional signals: 1=BUY, -1=SELL, 0=no trade.
+
+    BUY  when prob > threshold       and state != Chop
+    SELL when prob < short_threshold and state != Chop
+
+    ``short_threshold`` defaults to ``1 - threshold`` when not supplied,
+    which gives a symmetric no-trade zone around 0.5.
+    Note: short_threshold must be < threshold to avoid a no-trade zone gap
+    inversion.  If they cross Optuna penalises the trial via the objective.
+    """
+    if short_threshold is None:
+        short_threshold = 1.0 - threshold
+    not_chop = (hmm_states != CHOP_STATE)
+    buy  = ((probabilities > threshold)       & not_chop).astype(int)
+    sell = ((probabilities < short_threshold) & not_chop).astype(int)
+    return buy - sell   # 1=BUY, -1=SELL, 0=hold
 
 
 def compute_position_sizes(
@@ -29,6 +45,11 @@ def compute_position_sizes(
     pos_per_trade: int = 1,
 ):
     """Size positions using 1% risk / (2×ATR) with optional dual-position multiplier.
+
+    ``signals`` may be -1 (SELL), 0 (hold), or 1 (BUY).  The sign is
+    preserved so that short positions produce negative sizes, which when
+    multiplied by positive next_returns yield negative (loss) gross returns
+    — correctly reflecting a losing short trade when price rises.
 
     Args:
         pos_per_trade: 1 for small accounts (single), 2 for growth accounts (dual/hedging).
@@ -46,6 +67,8 @@ def apply_session_limits(
     hmm_states: np.ndarray = None,
 ) -> np.ndarray:
     """Cap signals to the adaptive daily limit based on account size and HMM state.
+
+    Counts both BUY (+1) and SELL (-1) signals toward the daily cap.
 
     For growth accounts (> $50), the limit is market-state-dependent:
     - Bull / Bear: 3 signals/day
@@ -71,13 +94,14 @@ def apply_session_limits(
 
         max_daily = limits["max_daily_trades"]
         seg = result[start:end]
-        trade_indices = np.where(seg == 1)[0]
+        # Count BUY (+1) and SELL (-1) trades together toward the daily cap
+        trade_indices = np.where(np.abs(seg) == 1)[0]
         if len(trade_indices) > max_daily:
             seg[trade_indices[max_daily:]] = 0
         result[start:end] = seg
 
-    original = int(np.sum(signals))
-    limited = int(np.sum(result))
+    original = int(np.sum(np.abs(signals)))
+    limited  = int(np.sum(np.abs(result)))
     if original != limited:
         logger.debug(
             "Session limit (acct=$%.0f): %d -> %d trades",
@@ -87,34 +111,37 @@ def apply_session_limits(
 
 
 def compute_trade_costs(signals: np.ndarray, broker: str = "standard") -> np.ndarray:
+    """Apply spread + commission cost to every active trade (BUY or SELL)."""
     config = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
     cost_per_trade = config["spread_frac"] + config["commission_frac"]
-    return signals * cost_per_trade
+    return np.abs(signals) * cost_per_trade   # cost is always positive
 
 
 def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
     ann_factor = ANNUALIZATION_FACTORS.get(tf.upper(), ANNUALIZATION_FACTOR)
     mean_ret = np.mean(strategy_returns)
-    std_ret = np.std(strategy_returns)
-    sharpe = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
+    std_ret  = np.std(strategy_returns)
+    sharpe   = (mean_ret / std_ret) * ann_factor if std_ret > 0 else 0.0
 
-    cumulative = np.cumsum(strategy_returns)
+    cumulative  = np.cumsum(strategy_returns)
     running_max = np.maximum.accumulate(cumulative)
-    drawdowns = running_max - cumulative
-    max_dd = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
+    drawdowns   = running_max - cumulative
+    max_dd      = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
-    active = signals == 1
+    # Count both BUY (+1) and SELL (-1) as active trades
+    active         = np.abs(signals) == 1
     active_returns = strategy_returns[active[:len(strategy_returns)]]
-    n_trades = int(np.sum(active))
-    win_rate = float(np.sum(active_returns > 0) / len(active_returns)) if len(active_returns) > 0 else 0.0
-    total_return = float(np.exp(np.sum(strategy_returns)) - 1)
+    n_trades       = int(np.sum(active))
+    win_rate       = (float(np.sum(active_returns > 0) / len(active_returns))
+                      if len(active_returns) > 0 else 0.0)
+    total_return   = float(np.exp(np.sum(strategy_returns)) - 1)
 
     return {
         "sharpe_ratio": float(sharpe),
         "max_drawdown": max_dd,
-        "win_rate": win_rate,
+        "win_rate":     win_rate,
         "total_return": total_return,
-        "n_trades": n_trades,
+        "n_trades":     n_trades,
     }
 
 
@@ -127,6 +154,7 @@ def vectorized_backtest(
     broker: str = "standard",
     tf: str = "H1",
     prob_threshold: float = None,
+    short_threshold: float = None,
 ):
     """Vectorized backtest with adaptive session limits and broker costs.
 
@@ -138,42 +166,47 @@ def vectorized_backtest(
         account_size: Account balance in USD; drives adaptive session limits.
         broker: Broker profile key from ``BROKER_CONFIGS``.
         tf: Timeframe string used for correct annualization ("H1" or "M15").
-        prob_threshold: XGBoost probability threshold for signal generation.
+        prob_threshold: BUY threshold — signal when prob > this value.
                         Defaults to PROB_THRESHOLD (0.65) if not supplied.
+        short_threshold: SELL threshold — signal when prob < this value.
+                         Defaults to ``1 - prob_threshold`` if not supplied,
+                         giving a symmetric no-trade zone around 0.5.
     """
     log_returns = df["log_return"].values
-    atr_norm = df["atr_normalized"].values
+    atr_norm    = df["atr_normalized"].values
 
+    buy_th = prob_threshold  if prob_threshold  is not None else PROB_THRESHOLD
     raw_signals = compute_signals(
         probabilities, hmm_states,
-        threshold=prob_threshold if prob_threshold is not None else PROB_THRESHOLD,
+        threshold=buy_th,
+        short_threshold=short_threshold,   # None → symmetric default inside
     )
     signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states)
 
     # Determine pos_per_trade from the adaptive risk manager
-    arm = AdaptiveRiskManager(account_size)
-    base_limits = arm.get_trade_limits()
+    arm           = AdaptiveRiskManager(account_size)
+    base_limits   = arm.get_trade_limits()
     pos_per_trade = base_limits["pos_per_trade"]
 
     sizes = compute_position_sizes(signals, atr_norm, pos_per_trade=pos_per_trade)
 
-    next_returns = np.roll(log_returns, -1)
+    next_returns     = np.roll(log_returns, -1)
     next_returns[-1] = 0.0
-    gross_returns = sizes * next_returns
-    costs = compute_trade_costs(signals, broker=broker)
+    gross_returns    = sizes * next_returns
+    costs            = compute_trade_costs(signals, broker=broker)
     strategy_returns = gross_returns - costs
 
     result = _compute_metrics(strategy_returns, signals, tf=tf)
     result.update({
-        "account_size": account_size,
-        "broker": broker,
-        "tf": tf,
+        "account_size":      account_size,
+        "broker":            broker,
+        "tf":                tf,
         "session_max_trades": arm.get_trade_limits()["max_daily_trades"],
-        "pos_per_trade": pos_per_trade,
+        "pos_per_trade":     pos_per_trade,
     })
 
     if split_idx is not None and 0 < split_idx < len(strategy_returns):
-        is_m = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)
+        is_m  = _compute_metrics(strategy_returns[:split_idx], signals[:split_idx], tf)
         oos_m = _compute_metrics(strategy_returns[split_idx:], signals[split_idx:], tf)
         result["split_idx"] = split_idx
         for k, v in is_m.items():
@@ -202,7 +235,8 @@ def vectorized_backtest(
         "small" if arm.is_small_account else "growth",
         arm.get_trade_limits()["max_daily_trades"],
         pos_per_trade,
-        BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0) + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),
+        BROKER_CONFIGS.get(broker, {}).get("spread_frac", 0)
+        + BROKER_CONFIGS.get(broker, {}).get("commission_frac", 0),
     )
     return result
 

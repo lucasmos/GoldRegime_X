@@ -1,4 +1,5 @@
 import logging
+import sys
 from pathlib import Path
 
 LOG_DIR = Path("logs")
@@ -12,6 +13,13 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     logger.setLevel(level)
     fmt = logging.Formatter("[%(asctime)s %(levelname)s] %(name)s: %(message)s")
     sh = logging.StreamHandler()
+    # On Windows the default console encoding (cp1252) can't render emoji from
+    # button labels — reconfigure stdout to UTF-8 so log lines never crash.
+    try:
+        if hasattr(sh.stream, "reconfigure"):
+            sh.stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
     sh.setLevel(level)
     sh.setFormatter(fmt)
     logger.addHandler(sh)

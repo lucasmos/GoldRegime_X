@@ -126,12 +126,20 @@ class AdaptiveRiskManager:
         }
 
     def calculate_lot_size(self, stop_loss_pips: float) -> float:
-        """1% risk rule with Headway Cent pip-value adjustment."""
+        """1% risk rule for Headway cent XAUUSD.
+
+        On the Headway cent account the effective contract is 1 oz per lot, so
+        each $1 price move = $1 P&L per lot.  Formula:
+
+            lot = (balance × 1%) / sl_price_distance
+
+        Example: $15 balance, 14.27-pt SL → $0.15 / 14.27 = 0.0105 → 0.01 lot.
+        This mirrors CentConverter.calculate_lot() which is already correct.
+        """
         risk_per_trade = self.balance * 0.01
         if stop_loss_pips <= 0:
             return 0.01
-        # Cent account pip value: stop_loss_pips × 0.01
-        lot_size = risk_per_trade / (stop_loss_pips * 0.01)
+        lot_size = risk_per_trade / stop_loss_pips
         return max(0.01, round(lot_size, 2))
 
     def can_trade(self, market_state: int = None) -> bool:

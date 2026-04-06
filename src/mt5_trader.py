@@ -16,7 +16,7 @@ double-count trades.
 import time
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from src.notifier import send_telegram_msg
 
 from src.logger import setup_logger
@@ -46,16 +46,18 @@ logger = setup_logger(__name__)
 DEFAULT_SYMBOL               = "XAUUSD"
 MAGIC_NUMBER                 = 123456   # must match GoldRegimeX.mq5 MagicNumber
 CHOP_STATE                   = 2        # HMM Chop state index
-ATR_MULTIPLIER               = 2.0      # SL = entry ± ATR × 2.0  (all TFs)
 DEFAULT_DEVIATION            = 20       # fallback deviation for check_margin / send_market_order
 N_BARS_WARMUP                = 200      # bars fetched for Kalman/HMM warm-up
 POLL_INTERVAL_SEC            = 5        # seconds between bar-change checks
 HIGH_VOL_SELF_TRANS_THRESHOLD = 0.70    # self-transition prob below this -> elevated deviation
 MIN_SPREAD_RATIO             = 1.5      # TP1 must be at least 1.5× spread to be viable
 
+# SL = ATR × multiplier (per TF — M5 tighter to avoid noise-outs on scalps)
+TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
+
 # ── Per-timeframe signal thresholds and order parameters ──────────────────────
 TF_PROB_THRESHOLD  = {"M5": 0.70, "M15": 0.65, "H1": 0.65}
-TF_SHORT_THRESHOLD = {"M5": 0.30, "M15": 0.35, "H1": 0.35}
+TF_SHORT_THRESHOLD = {"M5": 0.30, "M15": 0.35, "H1": 0.35}   # fallback only
 TF_DEFAULT_DEV     = {"M5": 30,   "M15": 20,   "H1": 20}
 TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 
@@ -63,8 +65,10 @@ TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 # Bull / Bear: TP1 quick partial, TP2 runner.
 # Chop: tighter single TP — position 2 (runner) is skipped.
 # Format: {regime: [tp1_mult, tp2_mult]}; single-element list = one TP, close all.
+# M5 uses tighter mults (0.8 / 2.0) — TP1 locks in quick profit, TP2 is realistic
+# for a scalp runner vs the original [1.0, 3.0] which rarely filled on M5.
 TF_TP_CONFIG = {
-    "M5":  {"trending": [1.0, 3.0], "chop": [0.8]},
+    "M5":  {"trending": [0.8, 2.0], "chop": [0.6]},
     "M15": {"trending": [1.5, 3.0], "chop": [1.5]},
     "H1":  {"trending": [1.5, 3.0], "chop": [1.5]},
 }
@@ -300,6 +304,31 @@ def _close_position(ticket: int, mt5) -> None:
     else:
         logger.warning("Position close failed: ticket=%d  retcode=%s",
                        ticket, res.retcode if res else "None")
+
+
+def _log_closed_pnl(tickets: list, mt5) -> None:
+    """Query MT5 deal history for each closed ticket and log realized P&L."""
+    from src.notifier import send_telegram_msg
+    now   = datetime.now(timezone.utc)
+    start = now - timedelta(hours=48)   # wide window covers overnight gaps
+    for ticket in tickets:
+        try:
+            deals = mt5.history_deals_get(start, now, position=ticket)
+            if deals:
+                pnl = sum(d.profit for d in deals)
+                tag = "WIN ✅" if pnl > 0 else "LOSS ❌"
+                logger.info(
+                    "Position #%d CLOSED — P&L: %+.2f USD  [%s]",
+                    ticket, pnl, "WIN" if pnl > 0 else "LOSS",
+                )
+                send_telegram_msg(
+                    f"{'✅' if pnl > 0 else '❌'} <b>Trade closed</b>  #{ticket}\n"
+                    f"Realized P&L: <b>{pnl:+.2f} USD</b>  [{tag}]"
+                )
+            else:
+                logger.info("Position #%d CLOSED (P&L unavailable — not yet in history).", ticket)
+        except Exception as exc:
+            logger.warning("Could not fetch P&L for ticket #%d: %s", ticket, exc)
 
 
 def _build_live_df(
@@ -553,11 +582,12 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
 
-    # Use optimized prob threshold if available; otherwise fall back to TF hardcoded values.
-    # Short threshold is symmetric: 1 - prob_threshold.
+    # Use optimized thresholds if available; otherwise fall back to TF hardcoded values.
+    # Both prob_threshold (BUY) and short_threshold (SELL) are now Optuna-tuned
+    # so the optimizer finds the best asymmetric no-trade zone for each TF.
     if prob_threshold_opt is not None:
         prob_threshold  = prob_threshold_opt
-        short_threshold = 1.0 - prob_threshold_opt
+        short_threshold = params.get("short_threshold", 1.0 - prob_threshold_opt)
     else:
         prob_threshold  = TF_PROB_THRESHOLD.get(tf.upper(), 0.65)
         short_threshold = TF_SHORT_THRESHOLD.get(tf.upper(), 0.35)
@@ -598,6 +628,21 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 continue
             bar_time = bars[0]["time"]
             if bar_time == last_bar_time:
+                # Between bars: detect position closures and report P&L immediately
+                if not dry_run and signal_tracker["tickets"]:
+                    open_set = {
+                        p.ticket
+                        for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
+                        if p.magic == MAGIC_NUMBER
+                    }
+                    closed = [t for t in signal_tracker["tickets"] if t not in open_set]
+                    if closed:
+                        _log_closed_pnl(closed, mt5)
+                        signal_tracker["tickets"] = [
+                            t for t in signal_tracker["tickets"] if t in open_set
+                        ]
+                        if not signal_tracker["tickets"]:
+                            signal_tracker["tp1_hit"] = False
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
             last_bar_time = bar_time
@@ -613,33 +658,18 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             arm              = AdaptiveRiskManager(account_size)
             arm.daily_trades = daily_trades   # restore session count
 
-            # ── 4. Compute live features ──────────────────────────────────
+            # ── 4. Compute live features + probability ────────────────────
             features_df, hmm_state, atr_price = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
                 feature_cols=feature_cols, mt5=mt5,
             )
-
-            # ── 5. Session limit check ────────────────────────────────────
-            if not arm.can_trade(hmm_state):
-                logger.info(
-                    "Session limit reached (state=%d  daily=%d/%d). Skipping bar.",
-                    hmm_state, arm.daily_trades,
-                    arm.get_trade_limits(hmm_state)["max_daily_trades"],
-                )
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            # ── 6. Skip if position already open ─────────────────────────
-            if has_open_position(DEFAULT_SYMBOL, MAGIC_NUMBER):
-                logger.debug("Open position exists — skipping bar.")
-                time.sleep(POLL_INTERVAL_SEC)
-                continue
-
-            bar_str   = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
-            state_lbl = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
-            max_trades_today = arm.get_trade_limits(hmm_state)["max_daily_trades"]
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob = float(_probs[0])
+
+            # ── 5. Log bar info on every new bar (always visible) ─────────
+            bar_str          = datetime.fromtimestamp(bar_time, timezone.utc).strftime("%Y-%m-%d %H:%M")
+            state_lbl        = {0: "Bull", 1: "Bear", 2: "Chop"}.get(hmm_state, str(hmm_state))
+            max_trades_today = arm.get_trade_limits(hmm_state)["max_daily_trades"]
             logger.info(
                 "Bar %s | state=%s | prob=%.3f | trades=%d/%d",
                 bar_str, hmm_state, prob,
@@ -653,22 +683,24 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 + ("  🔴 <i>DRY RUN</i>" if dry_run else "")
             )
 
-            # ── 7b. Break-even SL and Chop-exit position management ───────
+            # ── 6. Position management (always runs — P&L, break-even, chop-exit)
             if not dry_run and signal_tracker["tickets"]:
-                open_tickets = {
+                open_set = {
                     p.ticket
                     for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
                     if p.magic == MAGIC_NUMBER
                 }
-                active = [t for t in signal_tracker["tickets"] if t in open_tickets]
-                # TP1 hit: first position closed → move runner's SL to break-even
+                active = [t for t in signal_tracker["tickets"] if t in open_set]
+                closed = [t for t in signal_tracker["tickets"] if t not in open_set]
+                # Log P&L for any positions that closed since last bar
+                if closed:
+                    _log_closed_pnl(closed, mt5)
+                # TP1 hit: first position gone → move runner's SL to break-even
                 if len(active) < len(signal_tracker["tickets"]) and not signal_tracker["tp1_hit"]:
                     signal_tracker["tp1_hit"] = True
                     for ticket in active:
-                        _move_sl_to_breakeven(
-                            ticket, signal_tracker["entry_price"], mt5,
-                        )
-                # Regime shifted to Chop while runner is active → close immediately
+                        _move_sl_to_breakeven(ticket, signal_tracker["entry_price"], mt5)
+                # Regime shifted to Chop while runner active → close immediately
                 if hmm_state == CHOP_STATE and active:
                     for ticket in active:
                         _close_position(ticket, mt5)
@@ -676,7 +708,28 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                     active = []
                 signal_tracker["tickets"] = active
 
-            # ── 8. Signal routing (TF-specific thresholds) ───────────────
+            # ── 7. Session limit check ────────────────────────────────────
+            if not arm.can_trade(hmm_state):
+                logger.info(
+                    "Session limit reached (state=%d  daily=%d/%d). Skipping bar.",
+                    hmm_state, arm.daily_trades,
+                    arm.get_trade_limits(hmm_state)["max_daily_trades"],
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 8. Skip new signals if a position is still open ──────────
+            if has_open_position(DEFAULT_SYMBOL, MAGIC_NUMBER):
+                logger.info(
+                    "Open position — holding (prob=%.3f  state=%s).",
+                    prob, state_lbl,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 9. Signal routing — BUY and SELL (both Optuna-validated) ─
+            # XGB predicts P(next bar UP).  Both thresholds are tuned by Optuna
+            # against the IS/OOS backtester so shorts are statistically validated.
             if prob > prob_threshold and hmm_state != CHOP_STATE:
                 direction  = "BUY"
                 order_type = mt5.ORDER_TYPE_BUY
@@ -684,7 +737,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 direction  = "SELL"
                 order_type = mt5.ORDER_TYPE_SELL
             else:
-                logger.debug("No signal (prob=%.3f  state=%d). Holding.", prob, hmm_state)
+                logger.info(
+                    "No signal (prob=%.3f  state=%s  need >%.3f or <%.3f).",
+                    prob, state_lbl, prob_threshold, short_threshold,
+                )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
@@ -692,7 +748,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             tp_mults      = _tp_multipliers(tf, hmm_state)
             limits        = arm.get_trade_limits(hmm_state)
             pos_per_trade = min(limits["pos_per_trade"], len(tp_mults))
-            sl_distance   = max(atr_price * ATR_MULTIPLIER, 0.01)
+            sl_distance   = max(atr_price * TF_ATR_MULTIPLIER.get(tf.upper(), 2.0), 0.01)
             lot_total     = arm.calculate_lot_size(stop_loss_pips=sl_distance)
             lot_per_pos   = max(0.01, round(lot_total / pos_per_trade, 2))
 
