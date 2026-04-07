@@ -30,8 +30,8 @@ from src.processor import (
     compute_rsi,
     compute_atr,
 )
-from src.engine_hmm import load_model as load_hmm, predict_states
-from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble
+from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
+from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
 from src.backtester import vectorized_backtest
 
 logger = setup_logger(__name__)
@@ -126,16 +126,33 @@ def run_validation(
     logger.info("Loaded %d bars from %s for validation", len(df), sync_data_path)
     df = _apply_features(df, tf, obs_cov, trans_cov)
 
-    # Load models
+    # Load models — prefer TF-specific file; fall back to generic
+    hmm_path = hmm_model_path(tf)
+    if not hmm_path.exists():
+        hmm_path = HMM_GENERIC_PATH
+        if hmm_path.exists():
+            logger.warning(
+                "No TF-specific HMM model found for %s; falling back to %s. "
+                "Run --mode train --tf %s to create a dedicated model.", tf, hmm_path, tf
+            )
     try:
-        model_hmm = load_hmm()
+        model_hmm = load_hmm(hmm_path)
     except FileNotFoundError:
         raise FileNotFoundError(
-            "HMM model not found at models/hmm_model.pkl. "
+            f"HMM model not found at {hmm_path}. "
             "Run  python main.py --mode train  first."
         )
+
+    xgb_path = get_ensemble_path(tf)
+    if not xgb_path.exists():
+        xgb_path = XGB_GENERIC_PATH
+        if xgb_path.exists():
+            logger.warning(
+                "No TF-specific XGB ensemble found for %s; falling back to %s. "
+                "Run --mode train --tf %s to create a dedicated model.", tf, xgb_path, tf
+            )
     try:
-        models_xgb, thresholds_xgb, _ = load_xgb_ensemble()
+        models_xgb, thresholds_xgb, _ = load_xgb_ensemble(xgb_path)
     except FileNotFoundError:
         raise FileNotFoundError(
             "XGB ensemble not found at models/xgb_ensemble.pkl. "
