@@ -30,9 +30,10 @@ from src.processor import (
     compute_rsi,
     compute_atr,
 )
-from src.engine_hmm import load_model as load_hmm, predict_states
+from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
+    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
 from src.risk_manager import AdaptiveRiskManager, CENT_MULTIPLIER
 
@@ -553,13 +554,20 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
 
     display_account_info(trading_balance=account_size)
 
-    # Load models
+    # Load models — prefer TF-specific file; fall back to generic
+    hmm_path = hmm_model_path(tf)
+    if not hmm_path.exists():
+        hmm_path = HMM_GENERIC_PATH
     try:
-        model_hmm = load_hmm()
+        model_hmm = load_hmm(hmm_path)
     except FileNotFoundError:
         raise FileNotFoundError("HMM model not found. Run --mode train first.")
+
+    xgb_path = get_ensemble_path(tf)
+    if not xgb_path.exists():
+        xgb_path = XGB_GENERIC_PATH
     try:
-        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble()
+        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
         feature_cols = xgb_meta.get("feature_cols", list(FEATURE_COLS))
     except FileNotFoundError:
         raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")

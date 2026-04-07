@@ -93,7 +93,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         else:
             obs_cov = trial.suggest_float("obs_cov", 0.1, 5.0, log=True)
         trans_cov      = trial.suggest_float("trans_cov",      0.001, 0.1, log=True)
-        n_states       = trial.suggest_int("n_states", 2, 4)
+        # M5: n_states=3 is always degenerate for 5-min bars — Bull and Chop
+        # collapse to identical means (0.000016 return, 0.000340 vol) producing
+        # 500K+ HMM transitions and a non-positive-definite covariance matrix.
+        # Restrict M5 to {2, 4} which are both stable.
+        if tf.upper() == "M5":
+            n_states = trial.suggest_categorical("n_states", [2, 4])
+        else:
+            n_states   = trial.suggest_int("n_states", 2, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the
         # optimizer to find high-frequency signals in the 0.50–0.55 window.
         # H1/M15 use a wider buffer since their bars carry more information.
@@ -182,7 +189,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
         except Exception as e:
             logger.warning("Trial %d failed: %s", trial.number, e)
-            return -10.0
+            return -100.0
 
         finally:
             # Release HMM/XGB objects and aligned arrays to prevent RAM creep

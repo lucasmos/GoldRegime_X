@@ -8,6 +8,11 @@ from src.logger import setup_logger, log_regime_transition
 logger = setup_logger(__name__)
 
 MODEL_PATH = Path("models/hmm_model.pkl")
+
+
+def get_model_path(tf: str) -> Path:
+    """Return the TF-specific HMM model path, e.g. models/hmm_model_H1.pkl."""
+    return Path(f"models/hmm_model_{tf.upper()}.pkl")
 STATE_NAMES_3 = {0: "Bull", 1: "Bear", 2: "Chop"}
 STATE_NAMES_2 = {0: "Bull", 1: "Bear"}
 STATE_NAMES_4 = {0: "Bull", 1: "Bear", 2: "Chop_Low", 3: "Chop_High"}

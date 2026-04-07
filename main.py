@@ -15,12 +15,13 @@ except ImportError:
 
 from src.logger import setup_logger
 from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH
-from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm
+from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path
 from src.engine_xgb import (
     prepare_features, train_xgb, get_predictions,
     export_onnx, save_xgb, load_xgb, ONNX_PATH, FEATURE_COLS,
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
+    get_ensemble_path,
 )
 from src.optimizer import run_optimization, get_best_params
 from src.backtester import vectorized_backtest
@@ -166,8 +167,8 @@ def cmd_train(args):
         params = {}
 
     result, model_hmm, state_map, models_ensemble, thresholds, metrics, *_ = _train_for_tf(tf, balance, broker, params)
-    save_hmm(model_hmm)
-    save_xgb_ensemble(models_ensemble, thresholds, metrics)
+    save_hmm(model_hmm, hmm_model_path(tf))
+    save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf))
 
     arm = AdaptiveRiskManager(balance)
     limits = arm.get_trade_limits()
@@ -257,8 +258,12 @@ def cmd_compare(args):
 
 
 def cmd_export(args):
+    tf = args.tf.upper()
+    xgb_path = get_ensemble_path(tf)
+    if not xgb_path.exists():
+        xgb_path = ENSEMBLE_PKL_PATH
     try:
-        models_ensemble, _, xgb_metrics = load_xgb_ensemble()
+        models_ensemble, _, xgb_metrics = load_xgb_ensemble(xgb_path)
     except FileNotFoundError:
         logger.error("No trained ensemble model found. Run --mode train first.")
         sys.exit(1)
@@ -357,8 +362,13 @@ def cmd_report(args):
     df = process_pipeline(obs_cov=params.get("obs_cov"), trans_cov=params.get("trans_cov"),
                           save=False, tf=tf)
 
+    _hmm_path = hmm_model_path(tf)
+    if not _hmm_path.exists():
+        _hmm_path = None  # let the except branch fit a fresh one
     try:
-        model_hmm = load_hmm()
+        if _hmm_path is None:
+            raise FileNotFoundError
+        model_hmm = load_hmm(_hmm_path)
         from src.engine_hmm import predict_states, STATE_NAMES_3, STATE_NAMES_2, STATE_NAMES_4
         states = predict_states(model_hmm, df)
         n = model_hmm.n_components
@@ -368,8 +378,11 @@ def cmd_report(args):
 
     X, y, df_aligned = prepare_features(df, states)
 
+    _xgb_path = get_ensemble_path(tf)
+    if not _xgb_path.exists():
+        _xgb_path = ENSEMBLE_PKL_PATH
     try:
-        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble()
+        models_xgb, thresholds_xgb, metrics = load_xgb_ensemble(_xgb_path)
         # If the saved ensemble was trained with different features (e.g. before DXY
         # was added), retrain in-memory so the report stays consistent with the data.
         if metrics.get("feature_cols") != list(X.columns):

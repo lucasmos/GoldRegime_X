@@ -13,6 +13,11 @@ ONNX_PATH        = Path("models/xgb_model.onnx")
 XGB_PKL_PATH     = Path("models/xgb_model.pkl")
 ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
+
+def get_ensemble_path(tf: str) -> Path:
+    """Return the TF-specific XGB ensemble path, e.g. models/xgb_ensemble_H1.pkl."""
+    return Path(f"models/xgb_ensemble_{tf.upper()}.pkl")
+
 # Base features always present; usdchf_log_return is added when the USDCHF
 # master CSV is available (run  python main.py --mode consolidate  first).
 FEATURE_COLS    = ["hmm_state", "rsi_slope", "atr_normalized", "prev_log_return"]
