@@ -413,8 +413,8 @@ The USDCHF feature is included automatically when `data/processed/USDCHF_master.
 | TF | `prob_threshold` range | `short_threshold` range |
 |----|----------------------|------------------------|
 | M5 | 0.50 – 0.55 | 0.44 – 0.50 |
-| M15 | 0.52 – 0.65 | 0.35 – 0.48 |
-| H1 | 0.52 – 0.65 | 0.35 – 0.48 |
+| M15 | 0.50 – 0.58 | 0.42 – 0.50 |
+| H1 | 0.50 – 0.58 | 0.42 – 0.50 |
 
 The XGBoost model already internalises regime via the `hmm_state` feature — it naturally produces higher BUY probabilities in Bull conditions and higher SELL probabilities in Bear conditions.
 
