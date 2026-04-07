@@ -39,7 +39,8 @@ logger = setup_logger(__name__)
 SYNC_DATA_PATH        = Path("data/processed/mt5_sync_data.csv")
 SHARPE_PASS_THRESHOLD = 0.8
 SHARPE_WARN_THRESHOLD = 0.5
-MIN_TRADES_WARNING    = 30   # warn (not fail) if fewer trades than this
+# TF-aware minimum: H1 naturally fires ~10 trades/quarter, M15 ~15, M5 ~30+
+MIN_TRADES_WARNING_BY_TF: dict = {"M5": 30, "M15": 15, "H1": 10}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -181,7 +182,8 @@ def run_validation(
     win_rate = result["win_rate"]
     max_dd   = result["max_drawdown"]
 
-    if n_trades < MIN_TRADES_WARNING:
+    min_trades_warn = MIN_TRADES_WARNING_BY_TF.get(tf.upper(), 15)
+    if n_trades < min_trades_warn:
         logger.warning(
             "Only %d trades in the validation window — Sharpe estimate may be "
             "unreliable.  Consider using a longer --period (e.g. '6m').",

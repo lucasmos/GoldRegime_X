@@ -42,8 +42,9 @@ DD_HARD_LIMIT   = 0.15
 # M5 has 288 bars/day — the OOS window (~2yr) allows up to ~870 trades at
 # 2/day cap.  Setting 300 forces at least 0.69 trades/day on average,
 # preventing the optimizer from rewarding ultra-infrequent cherry-picked wins.
-# H1/M15 get lower floors because their datasets are smaller.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 100, "H1": 50}
+# Both M15 and H1 have ~4.1 years of OOS data (125K H1 / 493K M15 bars, 20% split),
+# so 200 trades = ~49/year = ~12/quarter — active enough to validate on 3m live data.
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 200}
 MIN_OOS_TRADES  = 50   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
