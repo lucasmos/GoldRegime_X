@@ -320,18 +320,36 @@ def cmd_sync_validate(args):
         print("\nWARNING: Borderline performance — consider re-optimising before live trading.")
 
 
-def cmd_live(args):
-    """Connect to MT5 and start the live signal execution loop."""
+def cmd_demo(args):
+    """Connect to MT5 demo account and start the live signal execution loop."""
     from src.mt5_trader import run_live_loop
 
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
-    dry_run = (args.account == "demo")
 
     if not _check_m5_readiness(tf):
         sys.exit(1)
 
-    if args.account == "live" and not args.yes:
+    logger.info(
+        "Starting demo loop — TF=%s  broker=%s  balance=$%.0f",
+        tf, args.broker, balance,
+    )
+    run_live_loop(tf=tf, broker=args.broker, account_size=balance,
+                  prob_threshold_override=getattr(args, "prob_threshold", None),
+                  short_threshold_override=getattr(args, "short_threshold", None))
+
+
+def cmd_live(args):
+    """Connect to MT5 live account and start the live signal execution loop."""
+    from src.mt5_trader import run_live_loop
+
+    balance = _resolve_balance(args)
+    tf      = args.tf.upper()
+
+    if not _check_m5_readiness(tf):
+        sys.exit(1)
+
+    if not args.yes:
         print("\n" + "=" * 60)
         print("  WARNING: LIVE ACCOUNT — real money is at risk.")
         print("  Ensure  --mode sync_validate  passed before continuing.")
@@ -343,10 +361,10 @@ def cmd_live(args):
         print("=" * 60 + "\n")
 
     logger.info(
-        "Starting live loop — TF=%s  broker=%s  balance=$%.0f  dry_run=%s",
-        tf, args.broker, balance, dry_run,
+        "Starting live loop — TF=%s  broker=%s  balance=$%.0f",
+        tf, args.broker, balance,
     )
-    run_live_loop(tf=tf, broker=args.broker, account_size=balance, dry_run=dry_run,
+    run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   prob_threshold_override=getattr(args, "prob_threshold", None),
                   short_threshold_override=getattr(args, "short_threshold", None))
 
@@ -531,7 +549,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
-                 "sync_validate", "live", "audit", "guardian", "listen", "consolidate"],
+                 "sync_validate", "demo", "live", "audit", "guardian", "listen", "consolidate"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -550,9 +568,6 @@ def main():
                         help="Timeframe: H1 | M15 | M15,H1 (process/compare accept comma list)")
     parser.add_argument("--period",  type=str,   default="3m",
                         help="Lookback window for MT5 sync, e.g. '3m' '6m' '12m'.")
-    parser.add_argument("--account", type=str,   default="demo",
-                        choices=["live", "demo"],
-                        help="Account type for --mode live. 'live' requires confirmation.")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive live-account confirmation (used when launched as a subprocess).")
     parser.add_argument("--prob_threshold",  type=float, default=None,
@@ -569,6 +584,7 @@ def main():
         "export":        cmd_export,
         "report":        cmd_report,
         "sync_validate": cmd_sync_validate,
+        "demo":          cmd_demo,
         "live":          cmd_live,
         "audit":         cmd_audit,
         "guardian":      cmd_guardian,
