@@ -576,13 +576,16 @@ def run_live_loop(
         raise ConnectionError("Could not connect to MT5 terminal.")
 
     try:
-        _run_loop_inner(tf, broker, account_size, dry_run, mt5)
+        _run_loop_inner(tf, broker, account_size, dry_run, mt5,
+                        prob_threshold_override, short_threshold_override)
     finally:
         disconnect_mt5()
         logger.info("Live loop terminated.  MT5 disconnected.")
 
 
-def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt5) -> None:
+def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt5,
+                    prob_threshold_override: float = None,
+                    short_threshold_override: float = None) -> None:
     """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
     tf_mt5 = _get_tf_map()[tf.upper()]
 
