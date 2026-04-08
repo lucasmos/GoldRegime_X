@@ -348,26 +348,47 @@ def _close_position(ticket: int, mt5) -> None:
 
 
 def _log_closed_pnl(tickets: list, mt5) -> None:
-    """Query MT5 deal history for each closed ticket and log realized P&L."""
+    """Query MT5 deal history for each closed ticket and log realized P&L.
+
+    MT5 can take several seconds to move a freshly-closed deal into history.
+    Retries up to 5 times with 1-second gaps before giving up.
+    """
     from src.notifier import send_telegram_msg
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=48)   # wide window covers overnight gaps
     for ticket in tickets:
         try:
-            deals = mt5.history_deals_get(start, now, position=ticket)
-            if deals:
-                pnl = sum(d.profit for d in deals)
-                tag = "WIN ✅" if pnl > 0 else "LOSS ❌"
-                logger.info(
-                    "Position #%d CLOSED — P&L: %+.2f USD  [%s]",
-                    ticket, pnl, "WIN" if pnl > 0 else "LOSS",
-                )
-                send_telegram_msg(
-                    f"{'✅' if pnl > 0 else '❌'} <b>Trade closed</b>  #{ticket}\n"
-                    f"Realized P&L: <b>{pnl:+.2f} USD</b>  [{tag}]"
-                )
-            else:
+            deals = None
+            for _ in range(5):          # retry — history lags up to ~5 s after close
+                deals = mt5.history_deals_get(start, now, position=ticket)
+                if deals:
+                    break
+                time.sleep(1.0)
+
+            if not deals:
                 logger.info("Position #%d CLOSED (P&L unavailable — not yet in history).", ticket)
+                continue
+
+            pnl        = sum(d.profit + d.commission for d in deals)
+            in_deal    = next((d for d in deals if d.entry == 0), None)   # entry fill
+            out_deal   = next((d for d in deals if d.entry == 1), None)   # exit fill
+            entry_px   = in_deal.price   if in_deal  else 0.0
+            exit_px    = out_deal.price  if out_deal else 0.0
+            lot        = (out_deal or in_deal).volume if (out_deal or in_deal) else 0.0
+            direction  = "BUY" if (in_deal and in_deal.type == 0) else "SELL"
+            emoji      = "✅" if pnl > 0 else "❌"
+            tag        = "WIN" if pnl > 0 else "LOSS"
+
+            logger.info(
+                "Position #%d CLOSED — P&L: %+.2f USD  [%s]  %s  entry=%.2f -> exit=%.2f  lot=%.2f",
+                ticket, pnl, tag, direction, entry_px, exit_px, lot,
+            )
+            send_telegram_msg(
+                f"{emoji} <b>Trade closed</b>  #{ticket}\n"
+                f"{direction}  lot=<b>{lot:.2f}</b>  "
+                f"entry: <b>{entry_px:.2f}</b> → exit: <b>{exit_px:.2f}</b>\n"
+                f"Realized P&L: <b>{pnl:+.2f} USD</b>  [{emoji} {tag}]"
+            )
         except Exception as exc:
             logger.warning("Could not fetch P&L for ticket #%d: %s", ticket, exc)
 
@@ -889,6 +910,19 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                             p + 1, pos_per_trade,
                             result["retcode"], result["comment"],
                         )
+
+            # Send one Telegram message per signal summarising all filled positions
+            if signal_tracker["tickets"] and not dry_run:
+                _emoji  = "🟢" if direction == "BUY" else "🔴"
+                _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)
+                _tix    = "  ".join(f"#{t}" for t in signal_tracker["tickets"])
+                send_telegram_msg(
+                    f"{_emoji} <b>Trade opened</b> [{tf}]\n"
+                    f"<b>{direction}</b>  Regime: <b>{state_lbl}</b>  Prob: <b>{prob:.3f}</b>\n"
+                    f"Lot: <b>{pos_per_trade}×{lot_per_pos:.2f}</b>  "
+                    f"SL: <b>{sl_price:.2f}</b>  TP: <b>{_tp_str}</b>\n"
+                    f"Tickets: {_tix}"
+                )
 
             if dry_run:
                 daily_trades += 1   # count dry-run signals for session limit testing
