@@ -346,7 +346,9 @@ def cmd_live(args):
         "Starting live loop — TF=%s  broker=%s  balance=$%.0f  dry_run=%s",
         tf, args.broker, balance, dry_run,
     )
-    run_live_loop(tf=tf, broker=args.broker, account_size=balance, dry_run=dry_run)
+    run_live_loop(tf=tf, broker=args.broker, account_size=balance, dry_run=dry_run,
+                  prob_threshold_override=getattr(args, "prob_threshold", None),
+                  short_threshold_override=getattr(args, "short_threshold", None))
 
 
 def cmd_report(args):
@@ -553,6 +555,10 @@ def main():
                         help="Account type for --mode live. 'live' requires confirmation.")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive live-account confirmation (used when launched as a subprocess).")
+    parser.add_argument("--prob_threshold",  type=float, default=None,
+                        help="Override BUY probability threshold for --mode live (skips Optuna lookup).")
+    parser.add_argument("--short_threshold", type=float, default=None,
+                        help="Override SELL probability threshold for --mode live (skips Optuna lookup).")
 
     args = parser.parse_args()
     {

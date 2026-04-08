@@ -56,8 +56,8 @@ MIN_SPREAD_RATIO             = 1.5      # TP1 must be at least 1.5× spread to b
 TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
 
 # ── Per-timeframe signal thresholds and order parameters ──────────────────────
-TF_PROB_THRESHOLD  = {"M5": 0.70, "M15": 0.65, "H1": 0.65}
-TF_SHORT_THRESHOLD = {"M5": 0.30, "M15": 0.35, "H1": 0.35}   # fallback only
+TF_PROB_THRESHOLD  = {"M5": 0.52, "M15": 0.54, "H1": 0.54}   # fallback — Optuna value used when available
+TF_SHORT_THRESHOLD = {"M5": 0.48, "M15": 0.46, "H1": 0.46}   # fallback only
 TF_DEFAULT_DEV     = {"M5": 30,   "M15": 20,   "H1": 20}
 TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 
@@ -68,9 +68,9 @@ TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 # M5 uses tighter mults (0.8 / 2.0) — TP1 locks in quick profit, TP2 is realistic
 # for a scalp runner vs the original [1.0, 3.0] which rarely filled on M5.
 TF_TP_CONFIG = {
-    "M5":  {"trending": [0.8, 2.0], "chop": [0.6]},
-    "M15": {"trending": [1.5, 3.0], "chop": [1.5]},
-    "H1":  {"trending": [1.5, 3.0], "chop": [1.5]},
+    "M5":  {"trending": [0.8, 1.5], "chop": [0.5]},   # fast partial 0.8x, runner 1.5x
+    "M15": {"trending": [1.0, 2.0], "chop": [0.8]},
+    "H1":  {"trending": [1.5, 3.0], "chop": [1.0]},
 }
 
 # Lazy MT5 timeframe map
@@ -275,6 +275,47 @@ def _move_sl_to_breakeven(ticket: int, entry_price: float, mt5) -> None:
     else:
         logger.warning("Break-even SL failed: ticket=%d  retcode=%s",
                        ticket, res.retcode if res else "None")
+
+
+def _apply_profit_guard(signal_tracker: dict, mt5) -> None:
+    """Move SL to entry + 2×spread once price reaches 70% of TP1 distance.
+
+    Fires once per signal (guarded by signal_tracker["guard_hit"]).  Applies
+    to all open tickets in the tracker regardless of timeframe.  This protects
+    profit before TP1 fills by effectively making the position risk-free.
+    """
+    if signal_tracker.get("guard_hit") or signal_tracker.get("tp1_hit"):
+        return   # already protected or TP1 already hit
+    tp1_level = signal_tracker.get("tp1_level")
+    entry     = signal_tracker.get("entry_price", 0.0)
+    direction = signal_tracker.get("direction")
+    tickets   = signal_tracker.get("tickets", [])
+    if not tp1_level or not tickets or not direction:
+        return
+
+    tick = mt5.symbol_info_tick(DEFAULT_SYMBOL)
+    if not tick:
+        return
+
+    spread       = tick.ask - tick.bid
+    tp1_dist     = abs(tp1_level - entry)
+    guard_buffer = tp1_dist * 0.70   # trigger at 70% of the way to TP1
+
+    if direction == "BUY":
+        triggered = tick.bid >= entry + guard_buffer
+        new_sl    = round(entry + spread * 2, 2)
+    else:
+        triggered = tick.ask <= entry - guard_buffer
+        new_sl    = round(entry - spread * 2, 2)
+
+    if triggered:
+        for ticket in tickets:
+            _move_sl_to_breakeven(ticket, new_sl, mt5)
+        signal_tracker["guard_hit"] = True
+        logger.info(
+            "Profit guard triggered: entry=%.2f  new_sl=%.2f  (70%% of TP1 at %.2f)",
+            entry, new_sl, tp1_level,
+        )
 
 
 def _close_position(ticket: int, mt5) -> None:
@@ -512,6 +553,8 @@ def run_live_loop(
     broker: str      = "headway_cent",
     account_size: float = None,
     dry_run: bool    = False,
+    prob_threshold_override: float = None,
+    short_threshold_override: float = None,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
 
@@ -598,6 +641,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     else:
         prob_threshold  = TF_PROB_THRESHOLD.get(tf.upper(), 0.65)
         short_threshold = TF_SHORT_THRESHOLD.get(tf.upper(), 0.35)
+    # CLI override has highest priority — applied after Optuna resolution
+    if prob_threshold_override is not None:
+        prob_threshold  = prob_threshold_override
+    if short_threshold_override is not None:
+        short_threshold = short_threshold_override
 
     # Session state (persists across bars within a day)
     daily_trades  = 0
@@ -606,7 +654,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     # Tracks the tickets and entry context of the most recently placed signal
     # so the break-even SL logic can fire when TP1 closes position 1.
     signal_tracker = {"tickets": [], "entry_price": 0.0,
-                      "direction": None, "tp1_hit": False}
+                      "direction": None, "tp1_hit": False,
+                      "tp1_level": None, "guard_hit": False}
 
     arm = AdaptiveRiskManager(account_size, tf=tf)
     logger.info(
@@ -616,7 +665,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
     logger.info(
         "Signal thresholds — BUY>%.3f  SELL<%.3f  (source: %s)",
         prob_threshold, short_threshold,
-        "optuna" if prob_threshold_opt is not None else "hardcoded",
+        "override" if (prob_threshold_override or short_threshold_override)
+        else ("optuna" if prob_threshold_opt is not None else "hardcoded"),
     )
 
     while True:
@@ -702,6 +752,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 # Log P&L for any positions that closed since last bar
                 if closed:
                     _log_closed_pnl(closed, mt5)
+                # Profit guard: move SL to entry+spread when 70% to TP1 (all TFs)
+                if active:
+                    _apply_profit_guard(signal_tracker, mt5)
                 # TP1 hit: first position gone → move runner's SL to break-even
                 if len(active) < len(signal_tracker["tickets"]) and not signal_tracker["tp1_hit"]:
                     signal_tracker["tp1_hit"] = True
@@ -797,7 +850,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
 
             # ── 13. Send order(s) with state-aware staged TPs ─────────────
             signal_tracker = {"tickets": [], "entry_price": entry_price,
-                              "direction": direction, "tp1_hit": False}
+                              "direction": direction, "tp1_hit": False,
+                              "tp1_level": tp_levels[0], "guard_hit": False}
             logger.info(
                 "SIGNAL %s | state=%d | prob=%.3f | lot×%d=%.2f | sl=%.2f | tp=%s | dev=%d",
                 direction, hmm_state, prob, pos_per_trade, lot_per_pos,

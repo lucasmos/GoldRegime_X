@@ -109,7 +109,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # 0.42 (was 0.35) for symmetric buy/sell sensitivity.
         # short_threshold must stay below prob_threshold (no-trade zone must exist).
         if tf.upper() == "M5":
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.55)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.53)
             short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
         else:
             prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.58)
