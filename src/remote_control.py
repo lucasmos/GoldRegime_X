@@ -127,7 +127,7 @@ def _handle(token: str, chat_id, user_id: str, text: str) -> None:
             return
         _procs[key] = subprocess.Popen([
             "python", "main.py",
-            "--mode", "live", "--account", "live", "--yes",
+            "--mode", "live", "--yes",
             "--tf", tf, "--broker", broker, "--balance", balance,
         ])
         _reply(token, chat_id,

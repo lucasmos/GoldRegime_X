@@ -5,7 +5,8 @@ pipeline, margin validation, and live order placement through the
 MetaTrader5 Python package.
 
 Usage (via main.py):
-    python main.py --mode live --account demo --broker headway_cent --balance 15 --tf H1
+    python main.py --mode demo --broker headway_cent --balance 15 --tf H1
+    python main.py --mode live --broker headway_cent --balance 15 --tf H1
 
 IMPORTANT: Remove the GoldRegimeX.mq5 EA from the XAUUSD chart before running
 this script.  Both the EA and the Python bridge use MAGIC_NUMBER = 123456 and
@@ -352,12 +353,21 @@ def _close_position(ticket: int, mt5) -> None:
 def _log_closed_pnl(tickets: list, mt5) -> None:
     """Query MT5 deal history for each closed ticket and log realized P&L.
 
-    MT5 can take several seconds to move a freshly-closed deal into history.
-    Retries up to 5 times with 1-second gaps before giving up.
+    MT5 deal profits are reported in the account currency.  On Headway Cent
+    accounts the currency is cUSD (cents); divide by CENT_MULTIPLIER to get
+    real USD.  Retries up to 20 s waiting for the closing fill to appear.
     """
     from src.notifier import send_telegram_msg
     now   = datetime.now(timezone.utc)
     start = now - timedelta(hours=48)   # wide window covers overnight gaps
+
+    # Detect cent account once per call — raw balance > 10 000 → cents display
+    try:
+        raw_balance = mt5.account_info().balance
+        is_cent     = raw_balance > 10_000
+    except Exception:
+        is_cent = False
+
     for ticket in tickets:
         try:
             deals = None
@@ -376,7 +386,8 @@ def _log_closed_pnl(tickets: list, mt5) -> None:
                 )
                 continue
 
-            pnl        = sum(d.profit + d.commission for d in deals)
+            pnl_raw    = sum(d.profit + d.commission for d in deals)
+            pnl        = pnl_raw / CENT_MULTIPLIER if is_cent else pnl_raw
             in_deal    = next((d for d in deals if d.entry == 0), None)   # entry fill
             out_deal   = next((d for d in deals if d.entry == 1), None)   # exit fill
             entry_px   = in_deal.price   if in_deal  else 0.0
@@ -386,14 +397,23 @@ def _log_closed_pnl(tickets: list, mt5) -> None:
             emoji      = "✅" if pnl > 0 else ("➡️" if pnl == 0 else "❌")
             tag        = "WIN" if pnl > 0 else ("BREAK-EVEN" if pnl == 0 else "LOSS")
 
+            # Points moved: positive = trade went in our favour
+            if entry_px > 0 and exit_px > 0:
+                raw_pts = exit_px - entry_px if direction == "BUY" else entry_px - exit_px
+                pts_str = f"{raw_pts:+.2f} pts"
+            else:
+                pts_str = "n/a pts"
+
             logger.info(
-                "Position #%d CLOSED — P&L: %+.2f USD  [%s]  %s  entry=%.2f -> exit=%.2f  lot=%.2f",
-                ticket, pnl, tag, direction, entry_px, exit_px, lot,
+                "Position #%d CLOSED — P&L: %+.2f USD  [%s]  %s  "
+                "entry=%.2f -> exit=%.2f  %s  lot=%.2f",
+                ticket, pnl, tag, direction, entry_px, exit_px, pts_str, lot,
             )
             send_telegram_msg(
                 f"{emoji} <b>Trade closed</b>  #{ticket}\n"
                 f"{direction}  lot=<b>{lot:.2f}</b>  "
                 f"entry: <b>{entry_px:.2f}</b> → exit: <b>{exit_px:.2f}</b>\n"
+                f"Move: <b>{pts_str}</b>  |  "
                 f"Realized P&L: <b>{pnl:+.2f} USD</b>  [{emoji} {tag}]"
             )
         except Exception as exc:
@@ -580,7 +600,6 @@ def run_live_loop(
     tf: str          = "H1",
     broker: str      = "headway_cent",
     account_size: float = None,
-    dry_run: bool    = False,
     prob_threshold_override: float = None,
     short_threshold_override: float = None,
 ) -> None:
@@ -590,12 +609,10 @@ def run_live_loop(
     margin validation are enforced before every order.
 
     Args:
-        tf:           Timeframe to trade — "H1" or "M15".
+        tf:           Timeframe to trade — "H1", "M15", or "M5".
         broker:       Broker config key from risk_manager.BROKER_CONFIGS.
         account_size: USD balance used for lot-sizing.  If None, reads from MT5
                       and normalises for cent accounts automatically.
-        dry_run:      When True, signals are logged but no orders are placed.
-                      Use with --account demo for paper-trading simulation.
     """
     import MetaTrader5 as mt5
     from src.mt5_sync import connect_mt5, disconnect_mt5
@@ -604,14 +621,14 @@ def run_live_loop(
         raise ConnectionError("Could not connect to MT5 terminal.")
 
     try:
-        _run_loop_inner(tf, broker, account_size, dry_run, mt5,
+        _run_loop_inner(tf, broker, account_size, mt5,
                         prob_threshold_override, short_threshold_override)
     finally:
         disconnect_mt5()
         logger.info("Live loop terminated.  MT5 disconnected.")
 
 
-def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt5,
+def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     prob_threshold_override: float = None,
                     short_threshold_override: float = None) -> None:
     """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
@@ -690,8 +707,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
 
     arm = AdaptiveRiskManager(account_size, tf=tf)
     logger.info(
-        "Live loop started — TF=%s  broker=%s  balance=$%.2f  dry_run=%s  %s",
-        tf, broker, account_size, dry_run, arm,
+        "Live loop started — TF=%s  broker=%s  balance=$%.2f  %s",
+        tf, broker, account_size, arm,
     )
     logger.info(
         "Signal thresholds — BUY>%.3f  SELL<%.3f  (source: %s)",
@@ -717,7 +734,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             bar_time = bars[0]["time"]
             if bar_time == last_bar_time:
                 # Between bars: detect position closures and report P&L immediately
-                if not dry_run and signal_tracker["tickets"]:
+                if signal_tracker["tickets"]:
                     open_set = {
                         p.ticket
                         for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
@@ -768,11 +785,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 f"Regime: <b>{state_lbl}</b> ({hmm_state})  |  "
                 f"Prob: <b>{prob:.3f}</b>\n"
                 f"Trades today: <b>{arm.daily_trades}/{max_trades_today}</b>"
-                + ("  🔴 <i>DRY RUN</i>" if dry_run else "")
             )
 
             # ── 6. Position management (always runs — P&L, break-even, chop-exit)
-            if not dry_run and signal_tracker["tickets"]:
+            if signal_tracker["tickets"]:
                 open_set = {
                     p.ticket
                     for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
@@ -891,35 +907,29 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
             for p in range(pos_per_trade):
                 tp_price = tp_levels[p]
                 comment  = f"GRX_{direction}_p{p+1}of{pos_per_trade}_s{hmm_state}_tp{p+1}"
-                if dry_run:
-                    logger.info(
-                        "[DRY RUN] Would send: %s  lot=%.2f  sl=%.2f  tp=%.2f  dev=%d  comment=%s",
-                        direction, lot_per_pos, sl_price, tp_price, deviation, comment,
-                    )
+                result = send_market_order(
+                    symbol=DEFAULT_SYMBOL,
+                    order_type=order_type,
+                    lot=lot_per_pos,
+                    sl=sl_price,
+                    tp=tp_price,
+                    deviation=deviation,
+                    magic=MAGIC_NUMBER,
+                    comment=comment,
+                )
+                if result["success"]:
+                    signal_tracker["tickets"].append(result["order"])
+                    daily_trades += 1
+                    arm.log_trade()
                 else:
-                    result = send_market_order(
-                        symbol=DEFAULT_SYMBOL,
-                        order_type=order_type,
-                        lot=lot_per_pos,
-                        sl=sl_price,
-                        tp=tp_price,
-                        deviation=deviation,
-                        magic=MAGIC_NUMBER,
-                        comment=comment,
+                    logger.error(
+                        "Order %d/%d failed — retcode=%d  %s",
+                        p + 1, pos_per_trade,
+                        result["retcode"], result["comment"],
                     )
-                    if result["success"]:
-                        signal_tracker["tickets"].append(result["order"])
-                        daily_trades += 1
-                        arm.log_trade()
-                    else:
-                        logger.error(
-                            "Order %d/%d failed — retcode=%d  %s",
-                            p + 1, pos_per_trade,
-                            result["retcode"], result["comment"],
-                        )
 
             # Send one Telegram message per signal summarising all filled positions
-            if signal_tracker["tickets"] and not dry_run:
+            if signal_tracker["tickets"]:
                 _emoji  = "🟢" if direction == "BUY" else "🔴"
                 _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)
                 _tix    = "  ".join(f"#{t}" for t in signal_tracker["tickets"])
@@ -930,9 +940,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                     f"SL: <b>{sl_price:.2f}</b>  TP: <b>{_tp_str}</b>\n"
                     f"Tickets: {_tix}"
                 )
-
-            if dry_run:
-                daily_trades += 1   # count dry-run signals for session limit testing
 
         except KeyboardInterrupt:
             logger.info("KeyboardInterrupt — stopping live loop.")
