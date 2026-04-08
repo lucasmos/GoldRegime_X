@@ -131,7 +131,7 @@ def cmd_optimize(args):
     for tf in tfs:
         logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
         study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
-        arm = AdaptiveRiskManager(balance)
+        arm = AdaptiveRiskManager(balance, broker=broker)
         limits = arm.get_trade_limits()
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
@@ -170,7 +170,7 @@ def cmd_train(args):
     save_hmm(model_hmm, hmm_model_path(tf))
     save_xgb_ensemble(models_ensemble, thresholds, metrics, get_ensemble_path(tf))
 
-    arm = AdaptiveRiskManager(balance)
+    arm = AdaptiveRiskManager(balance, broker=broker)
     limits = arm.get_trade_limits()
     print(f"\n=== Training Results [{tf}] ===")
     print(f"Broker: {broker} | Balance: ${balance:.0f} | Tier: {'small' if arm.is_small_account else 'growth'}")
@@ -437,7 +437,7 @@ def cmd_report(args):
         short_threshold=params.get("short_threshold"),
     )
 
-    arm = AdaptiveRiskManager(balance)
+    arm = AdaptiveRiskManager(balance, broker=broker)
     limits = arm.get_trade_limits()
     display_params = dict(params)
     display_params.update({

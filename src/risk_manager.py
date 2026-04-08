@@ -78,29 +78,40 @@ class SessionManager:
 
 
 class AdaptiveRiskManager:
-    """Dynamic trade limits and lot sizing per the Headway Cent spec.
+    """Dynamic trade limits and lot sizing for Headway Cent and Standard accounts.
 
     Account tiers
     ─────────────
     ≤ $50 USD  — small account:
-        • max_daily_trades : 2
+        • max_daily_trades : 2  (4 for M5/M15)
         • pos_per_trade    : 1  (single position per signal)
-        • total daily pos  : 2
+        • total daily pos  : same as max_daily_trades
 
     > $50 USD  — growth account:
         • max_daily_trades : 3 in Bull/Bear, 2 in Chop  (market-dependent)
-        • pos_per_trade    : 2  (dual/hedging positions per signal)
+        • pos_per_trade    : 2  (dual positions per signal)
         • total daily pos  : 4 or 6
+
+    Standard account guard
+    ──────────────────────
+    When ``broker == "standard"`` and balance < $50, ``pos_per_trade`` is
+    forced to 1 regardless of tier.  A 0.01 standard lot on XAUUSD has a
+    notional of ~$48 and a margin requirement that makes dual positions
+    unsafe on a $15 account.
     """
 
     CHOP_STATE = 2
 
-    def __init__(self, balance: float, tf: str = "H1"):
+    def __init__(self, balance: float, tf: str = "H1", broker: str = "headway_cent"):
         self.balance = max(float(balance), MIN_CAPITAL_USD)
-        self.tf = tf.upper()
+        self.tf      = tf.upper()
+        self.broker  = broker
         self.daily_trades = 0
         tier = "small" if self.balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
-        logger.debug("AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s", self.balance, tier, self.tf)
+        logger.debug(
+            "AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s broker=%s",
+            self.balance, tier, self.tf, self.broker,
+        )
 
     @property
     def is_small_account(self) -> bool:
@@ -126,7 +137,9 @@ class AdaptiveRiskManager:
         # Growth account: market-state-dependent
         in_chop = (market_state == self.CHOP_STATE) if market_state is not None else False
         max_daily = 2 if in_chop else 3
-        pos_per_trade = 2
+        # Standard account guard: a 0.01 standard lot on XAUUSD has ~$48 notional;
+        # dual positions on a sub-$50 standard account exceed safe margin usage.
+        pos_per_trade = 1 if (self.broker == "standard" and self.balance < SMALL_ACCOUNT_THRESHOLD) else 2
         return {
             "max_daily_trades": max_daily,
             "pos_per_trade": pos_per_trade,
@@ -162,4 +175,7 @@ class AdaptiveRiskManager:
 
     def __repr__(self) -> str:
         tier = "small" if self.is_small_account else "growth"
-        return f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, daily_trades={self.daily_trades})"
+        return (
+            f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, "
+            f"broker={self.broker}, daily_trades={self.daily_trades})"
+        )

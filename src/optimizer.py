@@ -117,14 +117,20 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 probs cluster below 0.56 in live — narrow range forces the
-        # optimizer to find high-frequency signals in the 0.50–0.55 window.
+        # optimizer to find high-frequency signals in the 0.50–0.55 window
+        # for cent accounts.  Standard accounts have higher per-trade costs
+        # so a more conservative range (0.55–0.60) ensures spread is covered.
         # H1/M15: ceiling cut to 0.58 (was 0.65) — prevents ultra-conservative
         # solutions that produce <5 live trades/quarter; short floor raised to
         # 0.42 (was 0.35) for symmetric buy/sell sensitivity.
         # short_threshold must stay below prob_threshold (no-trade zone must exist).
         if tf.upper() == "M5":
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.53)
-            short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
+            if broker == "standard":
+                prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.60)
+                short_threshold = trial.suggest_float("short_threshold", 0.40, 0.45)
+            else:
+                prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.53)
+                short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
         else:
             prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.58)
             short_threshold = trial.suggest_float("short_threshold", 0.42, 0.50)

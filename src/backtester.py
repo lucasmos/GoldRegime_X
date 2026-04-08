@@ -69,6 +69,7 @@ def apply_session_limits(
     account_size: float = 15.0,
     hmm_states: np.ndarray = None,
     tf: str = "H1",
+    broker: str = "standard",
 ) -> np.ndarray:
     """Cap signals to the adaptive daily limit based on account size, HMM state and TF.
 
@@ -83,7 +84,7 @@ def apply_session_limits(
 
     Uses the majority HMM state within each calendar day to decide the cap.
     """
-    arm = AdaptiveRiskManager(account_size)
+    arm = AdaptiveRiskManager(account_size, broker=broker)
     result = signals.copy()
     day_labels = pd.DatetimeIndex(dates).normalize().values
 
@@ -188,10 +189,10 @@ def vectorized_backtest(
         threshold=buy_th,
         short_threshold=short_threshold,   # None → symmetric default inside
     )
-    signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states, tf=tf)
+    signals = apply_session_limits(raw_signals, df.index, account_size, hmm_states, tf=tf, broker=broker)
 
     # Determine pos_per_trade from the adaptive risk manager
-    arm           = AdaptiveRiskManager(account_size)
+    arm           = AdaptiveRiskManager(account_size, broker=broker)
     base_limits   = arm.get_trade_limits(tf=tf)
     pos_per_trade = base_limits["pos_per_trade"]
 
