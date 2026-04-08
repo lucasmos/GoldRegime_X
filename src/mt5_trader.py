@@ -53,7 +53,7 @@ DEFAULT_DEVIATION            = 20       # fallback deviation for check_margin / 
 N_BARS_WARMUP                = 200      # bars fetched for Kalman/HMM warm-up
 POLL_INTERVAL_SEC            = 5        # seconds between bar-change checks
 HIGH_VOL_SELF_TRANS_THRESHOLD = 0.70    # self-transition prob below this -> elevated deviation
-MIN_SPREAD_RATIO             = 1.5      # TP1 must be at least 1.5× spread to be viable
+MIN_SPREAD_RATIO = {"headway_cent": 1.5, "standard": 3.0}  # TP1 vs spread floor
 
 # SL = ATR × multiplier (per TF — M5 tighter to avoid noise-outs on scalps)
 TF_ATR_MULTIPLIER  = {"M5": 1.5, "M15": 2.0, "H1": 2.0}
@@ -705,7 +705,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                       "direction": None, "tp1_hit": False,
                       "tp1_level": None, "guard_hit": False}
 
-    arm = AdaptiveRiskManager(account_size, tf=tf)
+    arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
     logger.info(
         "Live loop started — TF=%s  broker=%s  balance=$%.2f  %s",
         tf, broker, account_size, arm,
@@ -760,7 +760,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             except Exception:
                 telemetry = {}
 
-            arm              = AdaptiveRiskManager(account_size, tf=tf)
+            arm              = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
             arm.daily_trades = daily_trades   # restore session count
 
             # ── 4. Compute live features + probability ────────────────────
@@ -873,15 +873,16 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 sl_price    = round(entry_price + sl_distance, 2)
                 tp_levels   = [round(entry_price - sl_distance * m, 2) for m in tp_mults]
 
-            # ── 11b. Spread viability guard (M5 scalping only) ───────────
-            if tf.upper() == "M5":
+            # ── 11b. Spread viability guard (M5 scalps + all TFs on standard) ─
+            spread_ratio = MIN_SPREAD_RATIO.get(broker, 1.5)
+            if tf.upper() == "M5" or broker == "standard":
                 sym_info     = mt5.symbol_info(DEFAULT_SYMBOL)
                 spread_price = (sym_info.spread * sym_info.point) if sym_info else 0.0
                 tp1_distance = sl_distance * tp_mults[0]
-                if spread_price > 0 and tp1_distance < spread_price * MIN_SPREAD_RATIO:
+                if spread_price > 0 and tp1_distance < spread_price * spread_ratio:
                     logger.warning(
-                        "Unviable M5 trade: TP1=%.4f < %.1fx spread=%.4f. Skipping.",
-                        tp1_distance, MIN_SPREAD_RATIO, spread_price,
+                        "Unviable trade [%s/%s]: TP1=%.4f < %.1fx spread=%.4f. Skipping.",
+                        tf, broker, tp1_distance, spread_ratio, spread_price,
                     )
                     time.sleep(POLL_INTERVAL_SEC)
                     continue
