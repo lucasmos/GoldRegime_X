@@ -14,26 +14,29 @@ ANNUALIZATION_FACTOR = ANNUALIZATION_FACTORS["H1"]   # default
 
 RISK_PER_TRADE = 0.01
 PROB_THRESHOLD = 0.65
-CHOP_STATE     = 2
+BULL_STATE     = 0     # HMM Bull regime
+BEAR_STATE     = 1     # HMM Bear regime
+CHOP_STATE     = 2     # HMM Chop regime (no signals)
 
 
 def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD,
                     short_threshold=None):
     """Generate directional signals: 1=BUY, -1=SELL, 0=no trade.
 
-    BUY  when prob > threshold       and state != Chop
-    SELL when prob < short_threshold and state != Chop
+    Regime-aligned rules (applied consistently in backtester and live trader):
+      BUY  when prob > threshold        AND state == Bull
+      SELL when prob < short_threshold  AND state == Bear
+      Chop state generates no signals regardless of probability.
 
-    ``short_threshold`` defaults to ``1 - threshold`` when not supplied,
-    which gives a symmetric no-trade zone around 0.5.
-    Note: short_threshold must be < threshold to avoid a no-trade zone gap
-    inversion.  If they cross Optuna penalises the trial via the objective.
+    ``short_threshold`` defaults to ``1 - threshold`` when not supplied.
+    Note: short_threshold must be < threshold; Optuna penalises crossovers.
     """
     if short_threshold is None:
         short_threshold = 1.0 - threshold
-    not_chop = (hmm_states != CHOP_STATE)
-    buy  = ((probabilities > threshold)       & not_chop).astype(int)
-    sell = ((probabilities < short_threshold) & not_chop).astype(int)
+    bull_regime = (hmm_states == BULL_STATE)
+    bear_regime = (hmm_states == BEAR_STATE)
+    buy  = ((probabilities > threshold)       & bull_regime).astype(int)
+    sell = ((probabilities < short_threshold) & bear_regime).astype(int)
     return buy - sell   # 1=BUY, -1=SELL, 0=hold
 
 
