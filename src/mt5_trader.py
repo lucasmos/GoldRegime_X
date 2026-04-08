@@ -376,8 +376,8 @@ def _log_closed_pnl(tickets: list, mt5) -> None:
             exit_px    = out_deal.price  if out_deal else 0.0
             lot        = (out_deal or in_deal).volume if (out_deal or in_deal) else 0.0
             direction  = "BUY" if (in_deal and in_deal.type == 0) else "SELL"
-            emoji      = "✅" if pnl > 0 else "❌"
-            tag        = "WIN" if pnl > 0 else "LOSS"
+            emoji      = "✅" if pnl > 0 else ("➡️" if pnl == 0 else "❌")
+            tag        = "WIN" if pnl > 0 else ("BREAK-EVEN" if pnl == 0 else "LOSS")
 
             logger.info(
                 "Position #%d CLOSED — P&L: %+.2f USD  [%s]  %s  entry=%.2f -> exit=%.2f  lot=%.2f",
