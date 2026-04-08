@@ -46,6 +46,8 @@ logger = setup_logger(__name__)
 DEFAULT_SYMBOL               = "XAUUSD"
 MAGIC_NUMBER                 = 123456   # must match GoldRegimeX.mq5 MagicNumber
 CHOP_STATE                   = 2        # HMM Chop state index
+BULL_STATE                   = 0        # HMM Bull state index
+BEAR_STATE                   = 1        # HMM Bear state index
 DEFAULT_DEVIATION            = 20       # fallback deviation for check_margin / send_market_order
 N_BARS_WARMUP                = 200      # bars fetched for Kalman/HMM warm-up
 POLL_INTERVAL_SEC            = 5        # seconds between bar-change checks
@@ -359,14 +361,19 @@ def _log_closed_pnl(tickets: list, mt5) -> None:
     for ticket in tickets:
         try:
             deals = None
-            for _ in range(5):          # retry — history lags up to ~5 s after close
+            for _ in range(20):          # retry — exit deal can lag 10–15 s after close
                 deals = mt5.history_deals_get(start, now, position=ticket)
-                if deals:
+                # Only accept once we have the closing fill (DEAL_ENTRY_OUT = 1)
+                # The opening deal (entry=0) appears immediately; that is why a
+                # shorter retry loop returns pnl=0.0 — it only finds the open fill.
+                if deals and any(d.entry == 1 for d in deals):
                     break
                 time.sleep(1.0)
 
-            if not deals:
-                logger.info("Position #%d CLOSED (P&L unavailable — not yet in history).", ticket)
+            if not (deals and any(d.entry == 1 for d in deals)):
+                logger.info(
+                    "Position #%d CLOSED (exit deal not in history after 20 s).", ticket
+                )
                 continue
 
             pnl        = sum(d.profit + d.commission for d in deals)
@@ -811,13 +818,13 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, dry_run: bool, mt
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 9. Signal routing — BUY and SELL (both Optuna-validated) ─
-            # XGB predicts P(next bar UP).  Both thresholds are tuned by Optuna
-            # against the IS/OOS backtester so shorts are statistically validated.
-            if prob > prob_threshold and hmm_state != CHOP_STATE:
+            # ── 9. Signal routing — regime-aligned (Bull→BUY, Bear→SELL) ──
+            # Mirrors compute_signals() in backtester exactly.
+            # Chop generates no signal regardless of probability.
+            if prob > prob_threshold and hmm_state == BULL_STATE:
                 direction  = "BUY"
                 order_type = mt5.ORDER_TYPE_BUY
-            elif prob < short_threshold and hmm_state != CHOP_STATE:
+            elif prob < short_threshold and hmm_state == BEAR_STATE:
                 direction  = "SELL"
                 order_type = mt5.ORDER_TYPE_SELL
             else:
