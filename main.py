@@ -58,7 +58,7 @@ def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
         _legacy = Path("models/m5_meta.json")
         if _legacy.exists():
             logger.info(
-                "Migrating legacy m5_meta.json → %s for broker=%s.", meta_path, broker
+                "Migrating legacy m5_meta.json -> %s for broker=%s.", meta_path, broker
             )
             meta_path.write_text(_legacy.read_text())
         else:
