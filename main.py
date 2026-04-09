@@ -54,11 +54,19 @@ def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
         return True
     meta_path = _m5_meta_path(broker)
     if not meta_path.exists():
-        print(
-            "\nERROR: M5 model meta-data not found.\n"
-            "Run  python main.py --mode optimize --tf M5  before live trading."
-        )
-        return False
+        # Legacy fallback: files created before per-broker naming used models/m5_meta.json
+        _legacy = Path("models/m5_meta.json")
+        if _legacy.exists():
+            logger.info(
+                "Migrating legacy m5_meta.json → %s for broker=%s.", meta_path, broker
+            )
+            meta_path.write_text(_legacy.read_text())
+        else:
+            print(
+                "\nERROR: M5 model meta-data not found.\n"
+                "Run  python main.py --mode optimize --tf M5  before live trading."
+            )
+            return False
     meta     = json.loads(meta_path.read_text())
     age_h    = (time.time() - meta.get("timestamp", 0)) / 3600
     if age_h > _M5_EXPIRY_HOURS:
