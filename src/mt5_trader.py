@@ -844,10 +844,14 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 direction  = "SELL"
                 order_type = mt5.ORDER_TYPE_SELL
             else:
-                logger.info(
-                    "No signal (prob=%.3f  state=%s  need >%.3f or <%.3f).",
-                    prob, state_lbl, prob_threshold, short_threshold,
-                )
+                # Explain exactly why no signal fired
+                if hmm_state == BULL_STATE:
+                    reason = f"Bull state but prob={prob:.3f} not >{prob_threshold:.3f}"
+                elif hmm_state == BEAR_STATE:
+                    reason = f"Bear state but prob={prob:.3f} not <{short_threshold:.3f}"
+                else:
+                    reason = f"Chop state — no signal regardless of prob"
+                logger.info("No signal (%s).", reason)
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
