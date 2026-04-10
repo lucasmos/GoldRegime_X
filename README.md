@@ -110,13 +110,13 @@ A standard account operates at full contract size in real USD. What you see in M
 
 | Item | Standard Account | Example |
 |------|-----------------|---------|
-| Minimum recommended balance | $500+ USD | For safe lot sizing |
+| Minimum recommended balance | $15+ USD | Same as cent for testing |
 | Minimum lot | 0.01 | = 1 oz gold |
 | P&L per $1 gold move at 0.01 lot | **$1.00 real USD** | 100× more than cent |
 | Trade history shows `+2.40` | = **$2.40 real USD** | No conversion needed |
-| Bridge balance handling | Uses raw balance directly | Pass `--balance 500` |
+| Bridge balance handling | Uses raw balance directly | Pass `--balance 15` |
 | Spread viability guard | TP1 ≥ 3.0× spread | Applied on **all timeframes** |
-| Small-balance guard | `pos_per_trade = 1` enforced when balance < $50 | Prevents margin overuse |
+| Positions per signal (≤ $50) | 2 (each 0.01 lots, floored) | Minimal notional per position |
 
 **Best for:** Scaling to meaningful P&L once the strategy is proven on cent. The stricter 3× spread guard prevents entering trades where the spread eats too much of the expected move.
 
@@ -365,7 +365,7 @@ You will be prompted to type `YES` to confirm. This is the **only difference** f
 5. Places IOC market orders with ATR-based SL and staged TPs
 6. Logs closed P&L in real USD with pip movement after every trade
 
-**Important**: Remove the GoldRegimeX.mq5 EA from the XAUUSD chart before starting the Python bridge. Both use `MAGIC_NUMBER = 123456` — running both simultaneously will double-count daily trades.
+**Important**: Remove the GoldRegimeX.mq5 EA from the XAUUSD chart before starting the Python bridge. Both use `MAGIC_NUMBER = 123456` — running both simultaneously causes the bridge to see the EA's positions as its own, blocking all signal generation and logging no P&L. The bridge logs a `CONFLICT` warning at startup if it detects existing positions with that magic number.
 
 ---
 
@@ -403,6 +403,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `--interval` | `3600` | Guardian check interval in seconds |
 | `--prob_threshold` | (from Optuna) | Override BUY probability threshold for live |
 | `--short_threshold` | (from Optuna) | Override SELL probability threshold for live |
+| `--profit_target` | 4.0 on M5, off elsewhere | Quick-profit close threshold in USD (per position). Pass `0` to disable on M5 |
 
 > **Note:** `--balance` is always in **real USD**. For a Headway Cent account with a $15 deposit, pass `--balance 15` — the bridge handles the ×100 display conversion internally.
 
@@ -446,21 +447,42 @@ M5 standard uses a stricter floor (0.55–0.60) because standard lots cost propo
 
 ### Staged Take-Profits
 
-Each signal places multiple positions when `pos_per_trade = 2` (SL = ATR × TF multiplier):
+Each signal opens multiple positions (one per TP level) up to `pos_per_trade`. Positions share the same SL but close at separate TPs as price reaches each target.
 
-| Regime | TF | TP1 | TP2 (Runner) | SL ATR mult |
-|--------|----|-----|--------------|-------------|
-| Bull / Bear | M5 | 0.8× SL | 1.5× SL | 1.5× |
-| Bull / Bear | M15 | 1.0× SL | 2.0× SL | 2.0× |
-| Bull / Bear | H1 | 1.5× SL | 3.0× SL | 2.0× |
-| Chop | M5 | 0.5× SL | None (single) | 1.5× |
-| Chop | M15 | 0.8× SL | None (single) | 2.0× |
-| Chop | H1 | 1.0× SL | None (single) | 2.0× |
+**M5 — `pos_per_trade` adapts by account tier:**
 
-**Profit protection chain (all timeframes):**
-1. **Profit guard** — when price reaches 70% of TP1 distance, SL moves to `entry + 2×spread` (trade becomes risk-free before TP1 fills)
-2. **Break-even** — when TP1 fills and closes position 1, the runner's SL moves to exact entry price
-3. **Chop-exit** — if HMM shifts to Chop while a runner is active, the runner is closed at market immediately
+| Account | Positions opened | TPs used |
+|---------|-----------------|----------|
+| ≤ $50 (small) | 2 | TP1 (0.8×) + TP2 (1.5×) |
+| > $50 (growth) | 3 | TP1 (0.8×) + TP2 (1.5×) + TP3 (3.0×) |
+
+**TP multipliers by timeframe** (SL = ATR × TF multiplier):
+
+| Regime | TF | TP1 | TP2 (Runner) | TP3 (Growth only) | SL ATR mult |
+|--------|----|-----|--------------|-------------------|-------------|
+| Bull / Bear | M5 | 0.8× SL | 1.5× SL | 3.0× SL | 1.5× |
+| Bull / Bear | M15 | 1.0× SL | 2.0× SL | — | 2.0× |
+| Bull / Bear | H1 | 1.0× SL | 2.0× SL | — | 2.0× |
+| Chop | any | blocked | blocked | blocked | — |
+
+> **M5 TP3 rationale:** TP3 at 3.0× SL only fills on genuine momentum sessions (e.g. London/NY overlap, news-driven moves). On most bars the Hybrid Scalp Protection exits position 3 before price reaches TP3 — the target acts as a ceiling for strong sessions, not the primary exit.
+
+**Full profit protection chain (M5):**
+
+1. **Profit guard** — SL moves to `entry + 2×spread` once price reaches 70% of TP1 (trade becomes risk-free)
+2. **Break-even** — runner SL moves to exact entry when TP1 fills
+3. **Fixed scalp target** — each position closed independently when floating P&L reaches **+$4 USD**; does not wait for bar close; re-entry evaluated on next bar
+4. **Trailing guard** — once a position's peak P&L reaches **$2 USD**, closes if P&L pulls back to ≤ 50% of peak (e.g. peak $3.00 → closes below $1.50); catches stalling trades and bypasses the 5-minute HMM detection delay
+5. **Chop-exit** — all positions closed at market if HMM shifts to Chop mid-trade
+
+> Items 3 and 4 (**Hybrid Scalp Protection**) run every 5 seconds between bar closes. Items 1, 2 and 5 fire at bar close. The combination means position 3 is always protected — either TP3 fills in a strong move, or the trailing guard exits it gracefully when momentum dies.
+
+**Disabling the fixed scalp target (if needed):**
+```bash
+python main.py --mode demo --tf M5 --broker standard --balance 15 --profit_target 0
+```
+
+**Profit protection for H1 / M15:** Only items 1, 2 and 5 apply. Hybrid Scalp Protection is disabled by default on longer timeframes and must be enabled explicitly with `--profit_target N`.
 
 ### Deviation (Slippage Tolerance)
 
@@ -530,17 +552,18 @@ Minimum lot is always 0.01 (micro-lot). All lots are rounded to 2 decimal places
 
 ### Daily Trade Limits
 
-| Account Balance | Broker | TF | Regime | Max Trades/Day | Positions/Signal |
-|----------------|--------|----|--------|----------------|-----------------|
-| ≤ $50 | Any | M5 / M15 | Any | 4 | 1 |
-| ≤ $50 | Any | H1 | Any | 2 | 1 |
-| > $50 | Any | Any | Bull / Bear | 3 | 2 |
-| > $50 | Any | Any | Chop | 2 | 2 |
-| > $50 | `standard` + balance < $50 | Any | Any | 3 / 2 | **1** |
+| Account Balance | TF | Regime | Max Positions/Day | Positions/Signal |
+|----------------|----|--------|-------------------|-----------------|
+| ≤ $50 | M5 / M15 | Any | 4 | **2** |
+| ≤ $50 | H1 | Any | 2 | **2** |
+| > $50 | Any | Bull / Bear | 3 signals | **3** |
+| > $50 | Any | Chop | 2 signals | **3** |
 
-**Standard account guard:** When `--broker standard` is used with balance < $50, `pos_per_trade` is forced to 1 regardless of tier. One 0.01 standard lot on XAUUSD carries ~$48 notional value — running two simultaneously on a $15 account would exceed safe margin.
+Each signal opens `pos_per_trade` independent positions with separate TPs. The daily counter tracks **individual positions** — with `pos_per_trade=2` and `max=4`, that gives 2 signals per day on M5/M15 small accounts.
 
-M5 and M15 get a higher daily cap (4/day) because their higher bar frequency means more signal opportunities per session. H1 stays at 2/day.
+**Lot floor:** All positions are individually floored to **0.01 lots** regardless of what the 1% risk formula calculates. On a $15 account, `lot = (0.01 × 15) / sl_distance` typically computes to exactly 0.01 — the floor is a safety net, not a restriction.
+
+M5 and M15 get a higher cap (4 positions/day) because their higher bar frequency produces more signal opportunities per session. H1 stays at 2 positions/day.
 
 ---
 
@@ -552,13 +575,19 @@ M5 and M15 get a higher daily cap (4/day) because their higher bar frequency mea
 | Bars/day (annualization) | 288 | 96 | 24 |
 | HMM `n_states` search space | `{2, 4}` only | 3–4 | 3–4 |
 | Min OOS trades (optimizer) | 300 | 200 | 200 |
-| Max trades/day (≤ $50) | 4 | 4 | 2 |
-| TP1 multiplier (trending) | 0.8× SL | 1.0× SL | 1.5× SL |
-| TP2 multiplier (runner) | 1.5× SL | 2.0× SL | 3.0× SL |
-| Chop TP (single position) | 0.5× SL | 0.8× SL | 1.0× SL |
+| Positions/signal (≤ $50) | **2** | **2** | **2** |
+| Positions/signal (> $50) | **3** | **3** | **3** |
+| Max positions/day (≤ $50) | 4 | 4 | 2 |
 | SL ATR multiplier | 1.5× | 2.0× | 2.0× |
+| TP1 multiplier (trending) | 0.8× SL | 1.0× SL | 1.0× SL |
+| TP2 multiplier (runner) | 1.5× SL | 2.0× SL | 2.0× SL |
+| TP3 multiplier (growth only) | **3.0× SL** | — | — |
+| Chop TP (single, never fires) | 0.5× SL | 0.8× SL | 1.0× SL |
 | Profit guard trigger | 70% to TP1 | 70% to TP1 | 70% to TP1 |
 | Break-even after TP1 | Yes | Yes | Yes |
+| Fixed scalp target | **$4 USD default** | Off | Off |
+| Trailing guard activation | **$2 peak** | Off | Off |
+| Trailing guard drawdown | **50% of peak** | Off | Off |
 | Base deviation | 30 pts | 20 pts | 20 pts |
 | Spread viability guard | Yes (cent: M5 only, standard: all) | standard only | standard only |
 | 5-day readiness gate | Yes | No | No |
@@ -698,7 +727,7 @@ To use the EA:
 | `Order failed: retcode=10015` | Price moved past deviation window | Will retry next bar; elevated deviation auto-applies on high-vol |
 | `Insufficient margin` repeated | Account below safe minimum for lot | Top up account or check `--balance` value |
 | No signals firing — standard M5 | Default threshold too low (0.50) | Re-optimize with `--broker standard` to use the 0.55–0.60 range |
-| Double positions appearing | EA still attached to chart | Remove GoldRegimeX.mq5 EA from XAUUSD chart |
+| Double positions / "Open position — holding" with trades=0 | MQL5 EA running alongside Python bridge (same MAGIC_NUMBER) | Remove GoldRegimeX.mq5 EA from chart — the bridge now logs a `CONFLICT` warning at startup if it detects this |
 | Cent P&L logged as $0.00 | Exit deal not yet posted to MT5 history | Bridge waits up to 20 retries (~30s) — this is expected |
 | Telegram errors in log | Wrong token or no internet | Check `.env`; regenerate bot token via @BotFather if needed |
 
