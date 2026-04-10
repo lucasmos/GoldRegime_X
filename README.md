@@ -417,13 +417,13 @@ A trade fires when **all** of the following are true:
 |-----------|-----|------|
 | XGBoost probability | `prob > prob_threshold` | `prob < short_threshold` |
 | HMM regime (regime-aligned) | **Bull state (0) only** | **Bear state (1) only** |
-| Chop state (2) | Blocked — no signal ever | Blocked — no signal ever |
+| Chop state (2 or 3) | Blocked — no signal ever | Blocked — no signal ever |
 | Session limit | Under daily cap | Under daily cap |
 | No open position | No existing GRX position | No existing GRX position |
 | Margin check | Sufficient free margin | Sufficient free margin |
 | Spread viability | TP1 ≥ spread × ratio | TP1 ≥ spread × ratio |
 
-**Regime-aligned filter:** BUY signals only fire when the HMM is in Bull state. SELL signals only fire in Bear state. Chop state (sideways market) suppresses all signals regardless of XGBoost probability. This ensures the signal direction always agrees with the detected market regime.
+**Regime-aligned filter:** BUY signals only fire when the HMM is in Bull state. SELL signals only fire in Bear state. Any Chop state (2 or 3 — see State Labels below) suppresses all signals regardless of XGBoost probability. This ensures the signal direction always agrees with the detected market regime.
 
 **`prob_threshold` and `short_threshold` are tuned independently by Optuna** per broker and timeframe, then loaded automatically at live startup. The search ranges are:
 
@@ -749,8 +749,23 @@ To use the EA:
 
 These are hardcoded across all Python modules and the MQL5 EA — do not change:
 
-| Label | Integer | Meaning |
-|-------|---------|---------|
-| Bull | 0 | Trending upward — BUY signals eligible |
-| Bear | 1 | Trending downward — SELL signals eligible |
-| Chop | 2 | Sideways / low conviction — all signals suppressed |
+| Label | Integer | Applies when | Meaning |
+|-------|---------|-------------|---------|
+| Bull | 0 | Always | Highest mean log-return state — BUY signals eligible |
+| Bear | 1 | Always | Lowest mean log-return state — SELL signals eligible |
+| Chop | 2 | `n_states = 3` | Middle/sideways state — all signals suppressed |
+| Chop_Low | 2 | `n_states = 4` | Second-lowest mean return; slight bearish drift but not a clean Bear — signals suppressed |
+| Chop_High | 3 | `n_states = 4` | Second-highest mean return; slight bullish drift but not a clean Bull — signals suppressed |
+
+**Why two Chop states on M5 (`n_states = 4`)?**
+
+With four states the HMM can separate the messy middle into two sub-regimes. The naming is based purely on mean log-return rank:
+
+```
+sorted by mean return (low → high):
+  [Bear=1]  [Chop_Low=2]  [Chop_High=3]  [Bull=0]
+```
+
+Chop_Low typically appears during mild pullbacks or consolidation after a downward move. Chop_High appears during sideways drift after upward momentum. Both suppress signals — the division gives the HMM finer resolution when sorting out ambiguous bars, reducing mislabelling that would otherwise push bars into Bull or Bear incorrectly.
+
+During optimization and training logs, you will see these printed as `Chop_Low` and `Chop_High` in the transition matrix output. In the live log the bar status line shows `state=2` or `state=3`, both labelled `Chop` in the human-readable "No signal" message.
