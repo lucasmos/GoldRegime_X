@@ -89,13 +89,16 @@ def plot_regime_overlay(df, hmm_states, state_names, tf="H1", broker="headway_ce
     return str(save_path)
 
 
-def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", broker="headway_cent", save_path=None):
+def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", broker="headway_cent",
+                      prob_threshold=None, short_threshold=None, save_path=None):
     """Equity curve, drawdown, and signal markers with train/test split."""
     save_path = save_path or _tf_dir(tf, broker) / "2_equity_curve.png"
 
-    from src.backtester import compute_signals, compute_position_sizes
+    from src.backtester import compute_signals, compute_position_sizes, PROB_THRESHOLD
 
-    signals = compute_signals(probabilities, hmm_states)
+    _threshold = prob_threshold if prob_threshold is not None else PROB_THRESHOLD
+    signals = compute_signals(probabilities, hmm_states,
+                              threshold=_threshold, short_threshold=short_threshold)
     sizes = compute_position_sizes(signals, df["atr_normalized"].values)
 
     log_returns = df["log_return"].values
@@ -371,11 +374,13 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent", save_
 
 def generate_full_report(df, hmm_states, state_names, model_hmm,
                          X, probabilities, metrics, result, params=None,
-                         split_idx=None, tf="H1", broker="headway_cent"):
+                         split_idx=None, tf="H1", broker="headway_cent",
+                         prob_threshold=None, short_threshold=None):
     """Generate all 5 charts into reports/<TF>_<broker>/ and return list of file paths."""
     paths = []
     paths.append(plot_regime_overlay(df, hmm_states, state_names, tf=tf, broker=broker))
-    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx, tf=tf, broker=broker))
+    paths.append(plot_equity_curve(df, probabilities, hmm_states, split_idx=split_idx, tf=tf, broker=broker,
+                                   prob_threshold=prob_threshold, short_threshold=short_threshold))
     paths.append(plot_feature_analysis(X, hmm_states, metrics, tf=tf, broker=broker))
     paths.append(plot_transition_matrix(model_hmm, state_names, tf=tf, broker=broker))
     paths.append(plot_summary_dashboard(result, params or {}, tf=tf, broker=broker))
