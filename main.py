@@ -487,6 +487,8 @@ def cmd_report(args):
         df_aligned, states_aligned, state_names, model_hmm,
         X, probabilities, metrics, result, display_params,
         split_idx=split_idx, tf=tf, broker=broker,
+        prob_threshold=params.get("prob_threshold"),
+        short_threshold=params.get("short_threshold"),
     )
 
     print(f"\n=== Report Generated [{tf} / {broker}] ===")
