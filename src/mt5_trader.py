@@ -529,9 +529,15 @@ def compute_live_features(
         if usdchf_ret is None:
             usdchf_ret = _get_usdchf_fallback()
             logger.warning(
-                "USDCHF return unavailable — using last known value %.6f as fallback.",
+                "USDCHF live fetch failed — falling back to last value in "
+                "USDCHF_master.csv (%.6f).  This value is STALE (CSV ends "
+                "31/12/2025).  XGBoost is running on outdated USD-strength data. "
+                "Export a fresh USDCHF CSV from MT5 and run --mode consolidate "
+                "to restore live accuracy.",
                 usdchf_ret,
             )
+        else:
+            logger.debug("USDCHF live return: %.6f (source: MT5 bar)", usdchf_ret)
         feature_dict["usdchf_log_return"] = usdchf_ret
 
     features_df = pd.DataFrame([feature_dict])[feature_cols]
