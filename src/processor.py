@@ -116,17 +116,20 @@ def map_usdchf_to_bars(df_index: pd.DatetimeIndex, usdchf_df: pd.DataFrame) -> p
         series = series.ffill()
         return normalized.map(series)
     else:
-        # Intraday data — forward-fill onto bar timestamps directly.
-        # pandas 2.0 changed the default DatetimeIndex resolution from 'ns' to
-        # the inferred precision of the data ('s' for CSV reads, 'ns' for
-        # tz_localize(None) on UTC-aware MT5 sync indices).  A resolution
-        # mismatch causes reindex to return all-NaN even when timestamps align.
-        # Fix: cast idx to match series.index dtype before the reindex call.
+        # Intraday data — forward-fill onto bar timestamps.
+        # pandas 2.0 changed the default DatetimeIndex resolution: CSV reads
+        # produce 's' or 'us' while tz_localize(None) on a UTC-aware MT5 sync
+        # index gives 'ns'.  reindex silently returns all-NaN when the two sides
+        # have different resolutions.  Fix: normalise both to nanoseconds using
+        # the pandas-2.0 as_unit() API before calling reindex.
+        _series = series.copy()
         try:
-            idx = idx.astype(series.index.dtype)
-        except Exception:
-            pass
-        return series.reindex(idx, method="ffill")
+            _series.index = _series.index.as_unit("ns")
+            _idx = idx.as_unit("ns")
+        except AttributeError:
+            # pandas < 2.0 — all DatetimeIndexes are already 'ns', no-op
+            _idx = idx
+        return _series.reindex(_idx, method="ffill")
 
 
 # Legacy aliases — kept so old imports don't crash if any caller still uses them.
