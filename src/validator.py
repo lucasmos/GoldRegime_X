@@ -24,6 +24,7 @@ from src.logger import setup_logger
 from src.processor import (
     TF_CONFIG,
     USDCHF_MASTER_PATH,
+    _USDCHF_PATH_BY_TF,
     load_usdchf_data,
     map_usdchf_to_bars,
     compute_log_returns,
@@ -74,10 +75,25 @@ def _apply_features(
     df["rsi_slope"]      = df["rsi"].diff()
     df["atr_normalized"] = compute_atr(df)
 
-    # Mirror process_pipeline: add USDCHF if the master file exists
-    usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
+    # Mirror process_pipeline: add USDCHF if the matching TF master file exists
+    usdchf_path = _USDCHF_PATH_BY_TF.get(tf.upper(), USDCHF_MASTER_PATH)
+    usdchf_df = load_usdchf_data(usdchf_path)
     if usdchf_df is not None:
         df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
+
+    # Log NaN counts per column before dropping — helps diagnose alignment issues
+    nan_counts = df.isna().sum()
+    any_all_nan = nan_counts[nan_counts == len(df)]
+    if not any_all_nan.empty:
+        logger.warning(
+            "_apply_features [%s]: columns entirely NaN (will wipe all rows after dropna): %s",
+            tf, any_all_nan.index.tolist(),
+        )
+    else:
+        logger.debug(
+            "_apply_features [%s]: NaN counts before dropna: %s",
+            tf, nan_counts[nan_counts > 0].to_dict(),
+        )
 
     df.dropna(inplace=True)
     return df
