@@ -116,7 +116,16 @@ def map_usdchf_to_bars(df_index: pd.DatetimeIndex, usdchf_df: pd.DataFrame) -> p
         series = series.ffill()
         return normalized.map(series)
     else:
-        # Intraday data — forward-fill onto bar timestamps directly
+        # Intraday data — forward-fill onto bar timestamps directly.
+        # pandas 2.0 changed the default DatetimeIndex resolution from 'ns' to
+        # the inferred precision of the data ('s' for CSV reads, 'ns' for
+        # tz_localize(None) on UTC-aware MT5 sync indices).  A resolution
+        # mismatch causes reindex to return all-NaN even when timestamps align.
+        # Fix: cast idx to match series.index dtype before the reindex call.
+        try:
+            idx = idx.astype(series.index.dtype)
+        except Exception:
+            pass
         return series.reindex(idx, method="ffill")
 
 
