@@ -50,7 +50,7 @@ DD_HARD_LIMIT   = 0.15
 # slots.  At conservative prob thresholds (0.50–0.58) only 5–10% of days fire,
 # giving 50–150 OOS trades.  75 is a realistic floor that excludes near-zero
 # signal studies without discarding genuinely selective strategies.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 75}
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 40}
 MIN_OOS_TRADES  = 50   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
@@ -140,9 +140,9 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # optimizer to find high-frequency signals in the 0.50–0.55 window
         # for cent accounts.  Standard accounts have higher per-trade costs
         # so a more conservative range (0.55–0.60) ensures spread is covered.
-        # H1/M15: ceiling cut to 0.58 (was 0.65) — prevents ultra-conservative
-        # solutions that produce <5 live trades/quarter; short floor raised to
-        # 0.42 (was 0.35) for symmetric buy/sell sensitivity.
+        # H1/M15: wide range (0.50–0.85). Signal locking in the backtester ensures
+        # trades are counted per entry (not per active bar), so the Recovery Factor
+        # naturally penalises low-conviction overtrading without artificial caps.
         # short_threshold must stay below prob_threshold (no-trade zone must exist).
         if tf.upper() == "M5":
             if broker == "standard":
@@ -152,8 +152,10 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.53)
                 short_threshold = trial.suggest_float("short_threshold", 0.44, 0.50)
         else:
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.58)
-            short_threshold = trial.suggest_float("short_threshold", 0.42, 0.50)
+            # H1/M15: wide range — Recovery Factor scoring penalises low-conviction
+            # overtrading naturally now that trade counting uses entries (not active bars).
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.50, 0.85)
+            short_threshold = trial.suggest_float("short_threshold", 0.15, 0.50)
 
         # Guard: thresholds must not overlap — a crossover means every bar gets
         # both a BUY and SELL signal simultaneously, which is nonsensical.
@@ -178,7 +180,10 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 10.0, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-        n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
+        # H1: cap n_estimators at 150 — more trees memorise per-bar noise on hourly data.
+        n_estimators     = (trial.suggest_int("n_estimators",  50, 150, step=50)
+                            if tf.upper() == "H1"
+                            else trial.suggest_int("n_estimators", 100, 500, step=50))
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         gamma            = trial.suggest_float("gamma",     0.01, 5.0,  log=True)
@@ -247,7 +252,8 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             # Score on OOS only to prevent IS data leakage
             if split_idx and "oos_sharpe_ratio" in result:
-                if result.get("oos_n_trades", 0) < min_oos_trades:
+                oos_n = result.get("oos_n_trades", 0)
+                if oos_n < min_oos_trades:
                     return -10.0
                 oos_result = {
                     "recovery_factor": result.get("oos_recovery_factor", 0.0),

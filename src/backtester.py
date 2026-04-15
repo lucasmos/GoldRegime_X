@@ -119,10 +119,23 @@ def apply_session_limits(
 
 
 def compute_trade_costs(signals: np.ndarray, broker: str = "standard") -> np.ndarray:
-    """Apply spread + commission cost to every active trade (BUY or SELL)."""
+    """Apply spread + commission only at position transitions (entry / exit / reversal).
+
+    A transition is any bar where the signal changes from the previous bar:
+      0 → ±1   = entry (1× cost)
+      ±1 → 0   = exit  (1× cost)
+      +1 → −1  = simultaneous exit + entry (2× cost)
+
+    Holding bars (same non-zero signal as previous) incur no additional cost,
+    matching live MT5 behaviour where a held position has no per-bar charge.
+    """
     config = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"])
     cost_per_trade = config["spread_frac"] + config["commission_frac"]
-    return np.abs(signals) * cost_per_trade   # cost is always positive
+    prev = np.concatenate([[0], signals[:-1]])
+    changed = signals != prev                              # any transition
+    reversal = changed & (signals != 0) & (prev != 0)     # direction flip = 2 costs
+    cost_mult = changed.astype(float) + reversal.astype(float)   # 1 or 2
+    return cost_mult * cost_per_trade
 
 
 def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
@@ -136,23 +149,31 @@ def _compute_metrics(strategy_returns, signals, tf: str = "H1"):
     drawdowns   = running_max - cumulative
     max_dd      = float(np.max(drawdowns)) if len(drawdowns) > 0 else 0.0
 
-    # Count both BUY (+1) and SELL (-1) as active trades
-    active         = np.abs(signals) == 1
-    active_returns = strategy_returns[active[:len(strategy_returns)]]
-    n_trades       = int(np.sum(active))
-    win_rate       = (float(np.sum(active_returns > 0) / len(active_returns))
-                      if len(active_returns) > 0 else 0.0)
-    total_return   = float(np.exp(np.sum(strategy_returns)) - 1)
+    # Count entries (signal transitions to non-zero) — matches live behaviour where
+    # a held position is ONE trade until direction changes or the bar exits.
+    prev_s   = np.concatenate([[0], signals[:-1]])
+    is_entry = (signals != 0) & (signals != prev_s)
+    n_trades = int(np.sum(is_entry))
 
-    # Recovery Factor = Net Profit / Max Drawdown.
-    # Rewards strategies that achieve high return relative to worst trough —
-    # safer than raw Sharpe for small accounts where a single DD event is fatal.
-    # Capped at 20 to prevent extreme low-DD outliers from distorting Optuna's
-    # surrogate model.
+    # Win rate computed per trade (entry-to-exit P&L), not per active bar.
+    # Assign each position bar to its originating trade via cumsum of entries,
+    # then sum strategy_returns within each trade to determine wins vs losses.
+    if n_trades > 0:
+        trade_idx = np.cumsum(is_entry)  # 0 before first entry, then 1, 2, …
+        in_trade  = signals != 0
+        per_trade = np.bincount(trade_idx[in_trade],
+                                weights=strategy_returns[in_trade],
+                                minlength=n_trades + 1)[1:]  # drop index-0 bucket
+        win_rate = float(np.sum(per_trade > 0) / n_trades)
+    else:
+        win_rate = 0.0
+
+    total_return = float(np.exp(np.sum(strategy_returns)) - 1)
+
     if max_dd > 0:
         recovery_factor = float(min(total_return / max_dd, 20.0))
     elif total_return > 0:
-        recovery_factor = 20.0   # no drawdown, positive return → best possible
+        recovery_factor = 20.0
     else:
         recovery_factor = 0.0
 
