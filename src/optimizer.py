@@ -50,8 +50,8 @@ DD_HARD_LIMIT   = 0.15
 # slots.  At conservative prob thresholds (0.50–0.58) only 5–10% of days fire,
 # giving 50–150 OOS trades.  75 is a realistic floor that excludes near-zero
 # signal studies without discarding genuinely selective strategies.
-MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 100, "M15": 40, "H1": 15}
-MIN_OOS_TRADES  = 15   # fallback for unknown TFs
+MIN_OOS_TRADES_BY_TF: dict[str, int] = {"M5": 300, "M15": 200, "H1": 75}
+MIN_OOS_TRADES  = 75   # fallback for unknown TFs
 RAM_HIGH_PCT    = 90    # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30    # seconds to sleep when RAM is low
 
