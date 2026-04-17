@@ -1228,7 +1228,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 # how close they are to an entry without needing to do the maths.
                 # Positive = would have fired in that direction; negative = still needs to move.
                 logger.info(
-                    "  Distance → BUY: %+.3f  |  SELL: %+.3f",
+                    "  Distance -> BUY: %+.3f  |  SELL: %+.3f",
                     prob - prob_threshold,    # positive means prob already > buy hurdle
                     short_threshold - prob,   # positive means prob already < sell hurdle
                 )
