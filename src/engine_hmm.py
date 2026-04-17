@@ -81,11 +81,11 @@ def _log_transition_matrix(model: GaussianHMM, state_names: dict):
                 state_names.get(i, str(i)), model.transmat_[i, i],
             )
 
-    logger.info("State means (kalman_return, volatility):")
+    logger.info("State means (kalman_return, volatility, rsi_slope):")
     for i in range(n):
         logger.info(
-            "  %s: return=%.6f, vol=%.6f",
-            state_names.get(i, str(i)), model.means_[i, 0], model.means_[i, 1],
+            "  %s: return=%.6f, vol=%.6f, rsi_slope=%.6f",
+            state_names.get(i, str(i)), model.means_[i, 0], model.means_[i, 1], model.means_[i, 2],
         )
 
 
@@ -96,7 +96,7 @@ def fit_hmm(
     random_state: int = 42,
     tf: str = "H1",
 ):
-    X = df[["kalman_return", "volatility"]].values
+    X = df[["kalman_return", "volatility", "rsi_slope"]].values
     model = GaussianHMM(
         n_components=n_states,
         covariance_type="full",
@@ -131,7 +131,7 @@ def fit_hmm(
 
 
 def predict_states(model: GaussianHMM, df: pd.DataFrame) -> np.ndarray:
-    X = df[["kalman_return", "volatility"]].values
+    X = df[["kalman_return", "volatility", "rsi_slope"]].values
     raw = model.predict(X)
     mean_returns = model.means_[:, 0]
     sorted_idx = np.argsort(mean_returns)
