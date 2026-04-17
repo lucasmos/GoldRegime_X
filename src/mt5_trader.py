@@ -134,9 +134,13 @@ def _get_tf_map() -> dict:
 
 
 def _tp_multipliers(tf: str, hmm_state: int) -> list[float]:
-    """Return the TP multiplier list for this TF and HMM state."""
+    """Return the TP multiplier list for this TF and HMM state.
+
+    Any Chop state (2 or 3 in 4-state model) uses the tighter chop TPs —
+    this covers both trend-regime and mean-reversion trades that open in Chop.
+    """
     cfg = TF_TP_CONFIG.get(tf.upper(), TF_TP_CONFIG["H1"])
-    return cfg["chop"] if hmm_state == CHOP_STATE else cfg["trending"]
+    return cfg["chop"] if hmm_state >= CHOP_STATE else cfg["trending"]
 
 
 def _normalise_balance(raw_balance: float, broker: str) -> float:
@@ -857,6 +861,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     signal_tracker = {"tickets": [], "entry_price": 0.0,
                       "direction": None, "tp1_hit": False,
                       "tp1_level": None, "guard_hit": False,
+                      "signal_type": None,
                       "atr_price": 0.0}   # cached price-denom ATR for between-bar trail
     # Per-ticket ATR trail state: {ticket: {"activated": bool, "partial_done": bool, "current_sl": float}}
     atr_state_tracker: dict = {}
@@ -1109,11 +1114,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                     signal_tracker["tp1_hit"] = True
                     for ticket in active:
                         _move_sl_to_breakeven(ticket, signal_tracker["entry_price"], mt5)
-                # Regime shifted to Chop while runner active → close immediately
-                if hmm_state == CHOP_STATE and active:
+                # Regime shifted to Chop while a TREND runner is active → close immediately.
+                # Mean-reversion positions stay open in Chop; close them if state breaks out.
+                if signal_tracker.get("signal_type") == "trend" and hmm_state == CHOP_STATE and active:
                     for ticket in active:
                         _close_position(ticket, mt5)
-                    logger.info("Runner(s) closed: Chop state shift while position open.")
+                    logger.info("Trend runner(s) closed: regime shifted to Chop.")
+                    active = []
+                elif signal_tracker.get("signal_type") == "mean_reversion" and hmm_state != CHOP_STATE and active:
+                    for ticket in active:
+                        _close_position(ticket, mt5, comment="GRX_close_mr_breakout")
+                    logger.info("MR position(s) closed: Chop ended, regime broke out to state %d.", hmm_state)
                     active = []
                 signal_tracker["tickets"] = active
 
@@ -1126,23 +1137,48 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
 
-            # ── 9. Signal routing — regime-aligned (Bull→BUY, Bear→SELL) ──
-            # Mirrors compute_signals() in backtester exactly.
-            # Chop generates no signal regardless of probability.
+            # ── 9. Signal routing — mirrors compute_signals() in backtester ──
+            # Trend regime: trade WITH model conviction (Bull→BUY, Bear→SELL).
+            # Mean Reversion regime: trade AGAINST extremes in Chop states.
+            is_chop = (hmm_state >= CHOP_STATE)
+            mr_buy_threshold  = short_threshold - 0.10
+            mr_sell_threshold = prob_threshold  + 0.10
+
             if prob > prob_threshold and hmm_state == BULL_STATE:
-                direction  = "BUY"
-                order_type = mt5.ORDER_TYPE_BUY
+                direction   = "BUY"
+                order_type  = mt5.ORDER_TYPE_BUY
+                signal_type = "trend"
             elif prob < short_threshold and hmm_state == BEAR_STATE:
-                direction  = "SELL"
-                order_type = mt5.ORDER_TYPE_SELL
+                direction   = "SELL"
+                order_type  = mt5.ORDER_TYPE_SELL
+                signal_type = "trend"
+            elif is_chop and prob < mr_buy_threshold:
+                direction   = "BUY"
+                order_type  = mt5.ORDER_TYPE_BUY
+                signal_type = "mean_reversion"
+                logger.info(
+                    "[MEAN REVERSION SIGNAL] BUY — Chop state=%d  prob=%.3f < %.3f (mr_buy ceiling)",
+                    hmm_state, prob, mr_buy_threshold,
+                )
+            elif is_chop and prob > mr_sell_threshold:
+                direction   = "SELL"
+                order_type  = mt5.ORDER_TYPE_SELL
+                signal_type = "mean_reversion"
+                logger.info(
+                    "[MEAN REVERSION SIGNAL] SELL — Chop state=%d  prob=%.3f > %.3f (mr_sell floor)",
+                    hmm_state, prob, mr_sell_threshold,
+                )
             else:
                 # Explain exactly why no signal fired
                 if hmm_state == BULL_STATE:
                     reason = f"Bull state but prob={prob:.3f} not >{prob_threshold:.3f}"
                 elif hmm_state == BEAR_STATE:
                     reason = f"Bear state but prob={prob:.3f} not <{short_threshold:.3f}"
+                elif is_chop:
+                    reason = (f"Chop state={hmm_state} — prob={prob:.3f} not extreme enough "
+                              f"(MR-BUY<{mr_buy_threshold:.3f} or MR-SELL>{mr_sell_threshold:.3f})")
                 else:
-                    reason = f"Chop state — no signal regardless of prob"
+                    reason = f"state={hmm_state} prob={prob:.3f}"
                 logger.info("No signal (%s).", reason)
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
@@ -1214,7 +1250,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # ── 13. Send order(s) with state-aware staged TPs ─────────────
             signal_tracker = {"tickets": [], "entry_price": entry_price,
                               "direction": direction, "tp1_hit": False,
-                              "tp1_level": tp_levels[0], "guard_hit": False}
+                              "tp1_level": tp_levels[0], "guard_hit": False,
+                              "signal_type": signal_type}
             peak_pnl_tracker = {}
             logger.info(
                 "SIGNAL %s | state=%d | prob=%.3f | lots=%s | sl=%.2f | tp=%s | dev=%d",
@@ -1248,10 +1285,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             # Send one Telegram message per signal summarising all filled positions
             if signal_tracker["tickets"]:
                 _emoji  = "🟢" if direction == "BUY" else "🔴"
+                _tag    = "📐 MEAN REVERSION" if signal_type == "mean_reversion" else "📈 TREND"
                 _tp_str = " / ".join(f"{t:.2f}" for t in tp_levels)
                 _tix    = "  ".join(f"#{t}" for t in signal_tracker["tickets"])
                 send_telegram_msg(
-                    f"{_emoji} <b>Trade opened</b> [{tf}]\n"
+                    f"{_emoji} <b>Trade opened</b> [{tf}]  {_tag}\n"
                     f"<b>{direction}</b>  Regime: <b>{state_lbl}</b>  Prob: <b>{prob:.3f}</b>\n"
                     f"Lots: <b>{'+'.join(f'{l:.2f}' for l in forced_lots[:pos_per_trade])}</b>  "
                     f"SL: <b>{sl_price:.2f}</b>  TP: <b>{_tp_str}</b>\n"

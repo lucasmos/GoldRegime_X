@@ -65,21 +65,37 @@ def compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD,
                     short_threshold=None):
     """Generate directional signals: 1=BUY, -1=SELL, 0=no trade.
 
-    Regime-aligned rules (applied consistently in backtester and live trader):
+    Two-regime signal logic:
+
+    Trend regime (Bull=0 / Bear=1) — trade WITH the model's conviction:
       BUY  when prob > threshold        AND state == Bull
       SELL when prob < short_threshold  AND state == Bear
-      Chop state generates no signals regardless of probability.
+
+    Mean Reversion regime (Chop=2/3) — trade AGAINST extreme readings,
+    betting price will snap back to the local mean ("Snap-Back" logic):
+      BUY  when prob < (short_threshold - 0.10)  AND state is Chop
+      SELL when prob > (threshold + 0.10)         AND state is Chop
 
     ``short_threshold`` defaults to ``1 - threshold`` when not supplied.
     Note: short_threshold must be < threshold; Optuna penalises crossovers.
+    Trend and MR signals are mutually exclusive (different state conditions).
     """
     if short_threshold is None:
         short_threshold = 1.0 - threshold
+
     bull_regime = (hmm_states == BULL_STATE)
     bear_regime = (hmm_states == BEAR_STATE)
+    chop_regime = (hmm_states >= CHOP_STATE)   # state 2 or 3
+
+    # Trend signals (regime-aligned)
     buy  = ((probabilities > threshold)       & bull_regime).astype(int)
     sell = ((probabilities < short_threshold) & bear_regime).astype(int)
-    return buy - sell   # 1=BUY, -1=SELL, 0=hold
+
+    # Mean reversion signals (Chop snap-back)
+    mr_buy  = ((probabilities < (short_threshold - 0.10)) & chop_regime).astype(int)
+    mr_sell = ((probabilities > (threshold + 0.10))       & chop_regime).astype(int)
+
+    return (buy - sell + mr_buy - mr_sell).clip(-1, 1)
 
 
 def compute_position_sizes(

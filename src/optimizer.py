@@ -190,14 +190,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
 
             # ── HMM quality gate ─────────────────────────────────────────────
             # Reject trials where any state has low self-transition probability.
-            # Persistence < 0.72 means the state flips very frequently (e.g.
+            # Persistence < 0.65 means the state flips very frequently (e.g.
             # Bull↔Chop oscillating with identical means, 49K+ transitions).
-            # Threshold relaxed from 0.80 → 0.72 to allow more active regime
-            # detection while still blocking the most degenerate configurations.
+            # Threshold relaxed from 0.72 → 0.65 so the HMM can react faster
+            # to new directional data while still blocking degenerate configs.
             _min_persist = min(_hmm.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.72:
+            if _min_persist < 0.65:
                 logger.warning(
-                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.72) "
+                    "Trial %d: degenerate HMM (min state persistence=%.4f < 0.65) "
                     "— penalising.",
                     trial.number, _min_persist,
                 )
