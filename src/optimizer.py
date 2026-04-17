@@ -143,9 +143,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.70)
             short_threshold = trial.suggest_float("short_threshold", 0.28, 0.48)
         elif tf.upper() == "H1":
-            # Swing: wider range gives Optuna room to find active-participation solutions
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.72)
-            short_threshold = trial.suggest_float("short_threshold", 0.28, 0.45)
+            # Swing: tighter conviction thresholds reduce OOS noise trades.
+            # With the 3-feature normalised HMM, true Bull/Bear moves produce
+            # high-confidence probabilities.  Raising the floor (0.65) forces
+            # the model to wait for fully-developed directional bars rather
+            # than fading ambiguous ones on an hourly candle.
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.65, 0.80)
+            short_threshold = trial.suggest_float("short_threshold", 0.20, 0.35)
         else:
             # M15 — intermediate between M5 scalp and H1 swing
             prob_threshold  = trial.suggest_float("prob_threshold",  0.55, 0.75)
@@ -168,7 +172,10 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         elif tf.upper() == "H1":
             max_depth        = trial.suggest_int("max_depth", 3, 6)
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
-            min_child_weight = trial.suggest_int("min_child_weight", 15, 30)
+            # Higher floor (20→50) forces XGBoost to require more bars in each
+            # leaf — prevents fitting to rare H1 regimes that appear in IS but
+            # not in OOS, which was the root cause of OOS FloatDD 10.7%.
+            min_child_weight = trial.suggest_int("min_child_weight", 20, 50)
         else:
             max_depth        = trial.suggest_int("max_depth", 3, 6)
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
@@ -273,6 +280,13 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     "expected_payoff":       result.get("oos_expected_payoff", 0.0),
                 }
                 score = _score_result(oos_result, tier, broker, tf)
+
+                # H1 Drawdown Guard: a 5% floating DD on an hourly model
+                # typically means a runaway multi-day trend against a Mean
+                # Reversion position — a structural failure, not just noise.
+                # Half the score to strongly bias Optuna toward low-DD H1 solutions.
+                if tf.upper() == "H1" and oos_fdd > 0.05:
+                    score *= 0.5
 
                 # Progressive trade penalty — low-count solutions score at 10%
                 # so Optuna learns to explore higher-density regions without
