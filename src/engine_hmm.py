@@ -3,6 +3,7 @@ import pandas as pd
 import joblib
 from pathlib import Path
 from hmmlearn.hmm import GaussianHMM
+from sklearn.preprocessing import StandardScaler
 from src.logger import setup_logger, log_regime_transition
 
 logger = setup_logger(__name__)
@@ -81,7 +82,7 @@ def _log_transition_matrix(model: GaussianHMM, state_names: dict):
                 state_names.get(i, str(i)), model.transmat_[i, i],
             )
 
-    logger.info("State means (kalman_return, volatility, rsi_slope):")
+    logger.info("State means (scaled: kalman_return, volatility, rsi_slope):")
     for i in range(n):
         logger.info(
             "  %s: return=%.6f, vol=%.6f, rsi_slope=%.6f",
@@ -96,7 +97,16 @@ def fit_hmm(
     random_state: int = 42,
     tf: str = "H1",
 ):
-    X = df[["kalman_return", "volatility", "rsi_slope"]].values
+    X_raw = df[["kalman_return", "volatility", "rsi_slope"]].values
+    # Normalise all three features to zero mean / unit variance so that
+    # rsi_slope (typical range ±5) cannot dominate the regime classification
+    # over kalman_return (typical range ±0.003) and volatility (±0.001).
+    # Without scaling the HMM clusters on the highest-variance signal alone,
+    # producing an extreme Bear state (rsi_slope -1.07) that only fires when
+    # the market is already crashing — the move is usually exhausted by the
+    # time the H1 bar closes.  StandardScaler ensures equal contribution.
+    obs_scaler = StandardScaler()
+    X = obs_scaler.fit_transform(X_raw)
     model = GaussianHMM(
         n_components=n_states,
         covariance_type="full",
@@ -105,6 +115,10 @@ def fit_hmm(
         verbose=False,
     )
     model.fit(X)
+    # Persist the scaler as an attribute so predict_states can reuse it.
+    # joblib.dump preserves custom attributes, so save_model/load_model
+    # transparently round-trips this without any API changes.
+    model._obs_scaler = obs_scaler
 
     # ── HMM Persistence Boost ─────────────────────────────────────────────────
     # Add a TF-specific value to each diagonal of the transition matrix, then
@@ -131,7 +145,12 @@ def fit_hmm(
 
 
 def predict_states(model: GaussianHMM, df: pd.DataFrame) -> np.ndarray:
-    X = df[["kalman_return", "volatility", "rsi_slope"]].values
+    X_raw = df[["kalman_return", "volatility", "rsi_slope"]].values
+    # Reuse the scaler fitted during training so the live/validation observation
+    # space matches the space the HMM was fitted on.  Old models without this
+    # attribute degrade gracefully (no scaling applied).
+    scaler = getattr(model, "_obs_scaler", None)
+    X = scaler.transform(X_raw) if scaler is not None else X_raw
     raw = model.predict(X)
     mean_returns = model.means_[:, 0]
     sorted_idx = np.argsort(mean_returns)
