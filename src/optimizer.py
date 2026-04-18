@@ -92,15 +92,17 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
     tier = _get_tier(balance)
 
     def objective(trial: optuna.Trial) -> float:
-        # obs_cov floor per TF — prevents degenerate Kalman configs where
-        # Bull/Chop collapse to identical states and fire 49K-500K transitions.
-        # M5: floor=1.0 (5-min noise needs high obs_cov to separate states).
-        # H1/M15: floor=0.5 (sub-hourly bars still degenerate below this threshold).
-        # Other TFs: 0.1 (full range).
-        # obs_cov range: 0.5–5.0 for all TFs.  Values < 0.5 cause non-positive-
-        # definite covariance errors in ~70-75 % of trials; the persistence and
-        # vol-ratio guards catch the remaining bad trials in the 0.5–1.0 region.
-        obs_cov = trial.suggest_float("obs_cov", 0.5, 5.0, log=True)
+        # obs_cov controls Kalman filter responsiveness (lower = trusts measurements
+        # more = faster regime tracking).  M5 uses a wider lower range (0.05) so
+        # Optuna can find highly-responsive configs that catch 5-min micro-regime
+        # shifts before they reverse.  The 0.5 floor on H1/M15 prevents degenerate
+        # covariance errors that occur at low obs_cov on smoother hourly bars.
+        # The persistence (<0.65) and vol-ratio (>10) guards catch any remaining
+        # degenerate HMMs that slip through at low obs_cov.
+        if tf.upper() == "M5":
+            obs_cov = trial.suggest_float("obs_cov", 0.05, 5.0, log=True)
+        else:
+            obs_cov = trial.suggest_float("obs_cov", 0.5,  5.0, log=True)
         # M5 Kalman is calibrated for 5-min noise; H1/M15 have smoother signals
         # so trans_cov above 0.03 tends to produce chaotic Bull/Chop oscillation
         # (49K+ transitions, identical state means) that the persistence guard
@@ -322,6 +324,23 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                         score *= 0.5
                     elif oos_n > 300:
                         score *= 1.2
+
+                # IS/OOS Sharpe ratio constraint — discard trials where the model
+                # generalises poorly (IS Sharpe >> OOS Sharpe).  A ratio < 0.35
+                # means the model fitted IS noise; the edge evaporates in OOS.
+                # Only applied when IS Sharpe is meaningfully positive (> 0.1) to
+                # avoid false-positive rejections on flat IS periods.
+                is_sharpe  = result.get("is_sharpe_ratio",  result.get("sharpe_ratio", 0.0))
+                oos_sharpe = result.get("oos_sharpe_ratio", 0.0)
+                if is_sharpe > 0.1:
+                    generalization_ratio = oos_sharpe / is_sharpe
+                    if generalization_ratio < 0.35:
+                        logger.warning(
+                            "Trial %d: IS/OOS Sharpe ratio=%.2f < 0.35 "
+                            "(IS=%.3f OOS=%.3f) — overfitting, penalising.",
+                            trial.number, generalization_ratio, is_sharpe, oos_sharpe,
+                        )
+                        return -50.0
             else:
                 score = _score_result(result, tier, broker, tf)
 

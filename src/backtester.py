@@ -13,12 +13,13 @@ ANNUALIZATION_FACTORS = {
 ANNUALIZATION_FACTOR = ANNUALIZATION_FACTORS["H1"]   # default
 
 # Minimum ATR/spread ratio required before a signal is allowed through.
-# M5: 7.0× — mean-reversion trades on 5-min bars must have enough volatility
-#     to decisively crush the spread; filters out quiet night-session noise
-#     where MR has lower edge and costs consume most of the move.
+# M5: 4.5× — filters the worst noise bars (ATR < $1.80 on $2000 gold) while
+#     keeping the bulk of mean-reversion opportunities.  The previous 7.0×
+#     threshold matched avg_efficiency 4-6× seen in most trials, blocking
+#     the majority of valid M5 signals and starving the Activity Bonus.
 # H1/M15/default: 1.25× — standard threshold that blocks only the most
 #     illiquid bars while leaving the majority of trend sessions open.
-TF_MIN_EFFICIENCY = {"M5": 7.0}
+TF_MIN_EFFICIENCY = {"M5": 4.5}
 
 RISK_PER_TRADE = 0.01
 PROB_THRESHOLD = 0.65
