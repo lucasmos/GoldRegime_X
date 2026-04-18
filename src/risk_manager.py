@@ -1,3 +1,5 @@
+import time
+
 from src.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -62,18 +64,35 @@ class AdaptiveRiskManager:
 
     > $50 USD  — growth account:
         • pos_per_trade : 3  (staged TPs across three independent positions)
+
+    Consecutive Loss Guard
+    ──────────────────────
+    ``MAX_STREAK`` consecutive losing trades triggers a ``LOCKOUT_HOURS``
+    cooldown during which ``can_trade()`` returns False.  This prevents
+    "Death by a Thousand Cuts" on M5 where the bot might enter several bad
+    mean-reversion trades in a row during a trending breakout.
+
+    Note: AdaptiveRiskManager is re-instantiated each bar in the live loop
+    for balance drift tracking.  To preserve streak state across bars, the
+    caller should pass ``consecutive_losses=`` and ``streak_locked_until=``
+    from the previous instance, or keep a single persistent ARM per session.
     """
 
-    CHOP_STATE = 2
+    CHOP_STATE    = 2
+    MAX_STREAK    = 3         # consecutive losses before lockout
+    LOCKOUT_HOURS = 4.0       # hours to pause trading after streak triggers
 
-    def __init__(self, balance: float, tf: str = "H1", broker: str = "headway_cent"):
+    def __init__(self, balance: float, tf: str = "H1", broker: str = "headway_cent",
+                 consecutive_losses: int = 0, streak_locked_until: float = 0.0):
         self.balance = max(float(balance), MIN_CAPITAL_USD)
         self.tf      = tf.upper()
         self.broker  = broker
+        self.consecutive_losses = consecutive_losses
+        self._streak_locked_until = streak_locked_until if streak_locked_until > 0 else None
         tier = "small" if self.balance <= SMALL_ACCOUNT_THRESHOLD else "growth"
         logger.debug(
-            "AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s broker=%s",
-            self.balance, tier, self.tf, self.broker,
+            "AdaptiveRiskManager: balance=$%.2f tier=%s tf=%s broker=%s streak=%d",
+            self.balance, tier, self.tf, self.broker, self.consecutive_losses,
         )
 
     @property
@@ -97,6 +116,61 @@ class AdaptiveRiskManager:
             return {"pos_per_trade": 2}
         return {"pos_per_trade": 3}
 
+    def can_trade(self) -> bool:
+        """Return False while the consecutive-loss streak lockout is active.
+
+        Called from the live loop before placing any new signal.  If the
+        lockout window has expired it resets automatically so no manual
+        intervention is required.
+        """
+        if self._streak_locked_until is not None:
+            if time.time() < self._streak_locked_until:
+                remaining = (self._streak_locked_until - time.time()) / 3600
+                logger.warning(
+                    "ConsecutiveLossGuard: trading locked for another %.1fh "
+                    "(streak=%d, max=%d).",
+                    remaining, self.consecutive_losses, self.MAX_STREAK,
+                )
+                return False
+            # Lockout window expired — reset
+            logger.info("ConsecutiveLossGuard: lockout expired — trading resumed.")
+            self._streak_locked_until = None
+            self.consecutive_losses   = 0
+        return True
+
+    def record_trade_result(self, won: bool) -> None:
+        """Update the consecutive-loss streak counter after each closed trade.
+
+        Args:
+            won: True if the trade closed profitable, False if it was a loss.
+
+        Behaviour:
+            - Win  → streak resets to 0.
+            - Loss → streak increments.  If it reaches ``MAX_STREAK``, trading
+              is locked for ``LOCKOUT_HOURS`` hours (``can_trade()`` returns
+              False) to let the market regime settle before re-entry.
+        """
+        if won:
+            if self.consecutive_losses > 0:
+                logger.debug(
+                    "ConsecutiveLossGuard: winning trade — resetting streak from %d.",
+                    self.consecutive_losses,
+                )
+            self.consecutive_losses = 0
+        else:
+            self.consecutive_losses += 1
+            logger.info(
+                "ConsecutiveLossGuard: losing trade recorded (streak=%d / max=%d).",
+                self.consecutive_losses, self.MAX_STREAK,
+            )
+            if self.consecutive_losses >= self.MAX_STREAK:
+                self._streak_locked_until = time.time() + self.LOCKOUT_HOURS * 3600
+                logger.warning(
+                    "ConsecutiveLossGuard: %d consecutive losses — "
+                    "locking trading for %.0fh.",
+                    self.consecutive_losses, self.LOCKOUT_HOURS,
+                )
+
     def calculate_lot_size(self, stop_loss_pips: float) -> float:
         """1% risk rule for Headway cent XAUUSD.
 
@@ -114,10 +188,12 @@ class AdaptiveRiskManager:
         return max(0.01, round(lot_size, 2))
 
     def __repr__(self) -> str:
-        tier = "small" if self.is_small_account else "growth"
+        tier   = "small" if self.is_small_account else "growth"
+        locked = self._streak_locked_until is not None and time.time() < self._streak_locked_until
         return (
             f"AdaptiveRiskManager(balance=${self.balance:.0f}, tier={tier}, "
-            f"broker={self.broker})"
+            f"broker={self.broker}, streak={self.consecutive_losses}/{self.MAX_STREAK}, "
+            f"locked={locked})"
         )
 
 
