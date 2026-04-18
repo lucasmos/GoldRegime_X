@@ -423,11 +423,13 @@ def plot_summary_dashboard(result, params, tf="H1", broker="headway_cent",
                 transform=ax.transAxes, va="top", color="#c0392b")
         y -= 0.06
         oos_fdd = result.get("oos_floating_max_drawdown", result.get("oos_max_drawdown", 0.0))
+        oos_fdd_usd = oos_fdd * account_size
         oos_data = [
-            ("Sharpe",   f"{result['oos_sharpe_ratio']:.3f}"),
-            ("Max DD",   f"{oos_fdd*100:.1f}%  (~${oos_fdd*account_size:.2f})"),
-            ("Win Rate", f"{result['oos_win_rate']*100:.1f}%"),
-            ("Trades",   f"{result['oos_n_trades']}"),
+            ("Sharpe",           f"{result['oos_sharpe_ratio']:.3f}"),
+            ("Max DD",           f"{oos_fdd*100:.1f}%"),
+            ("Max Monetary Risk",f"${oos_fdd_usd:.2f} USD"),
+            ("Win Rate",         f"{result['oos_win_rate']*100:.1f}%"),
+            ("Trades",           f"{result['oos_n_trades']}"),
         ]
         for label, value in oos_data:
             ax.text(0.07, y, label, fontsize=10, transform=ax.transAxes, va="top",

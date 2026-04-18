@@ -149,8 +149,8 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         # short_threshold is symmetric: short = 1 - prob (≈ same conviction for SELL).
         if tf.upper() == "M5":
             # Scalp: lower hurdle, high-frequency positive-expectancy clusters
-            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.70)
-            short_threshold = trial.suggest_float("short_threshold", 0.28, 0.48)
+            prob_threshold  = trial.suggest_float("prob_threshold",  0.52, 0.65)
+            short_threshold = trial.suggest_float("short_threshold", 0.30, 0.48)
         elif tf.upper() == "H1":
             # Swing: tighter conviction thresholds reduce OOS noise trades.
             # With the 3-feature normalised HMM, true Bull/Bear moves produce
@@ -311,6 +311,17 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_payoff_usd = oos_result["expected_payoff"] * balance
                 if oos_payoff_usd < PAYOFF_FLOOR_USD:
                     score *= 0.1
+
+                # Activity Bonus (M5 only) — penalise solutions that "hide"
+                # drawdown by barely trading, and reward genuinely high-frequency
+                # configs that prove robustness across many market opportunities.
+                # < 150 trades: extra 50% cut on top of the progressive 10% penalty.
+                # > 300 trades: 20% bonus — pushes Optuna toward the M5 "heartbeat".
+                if tf.upper() == "M5":
+                    if oos_n < 150:
+                        score *= 0.5
+                    elif oos_n > 300:
+                        score *= 1.2
             else:
                 score = _score_result(result, tier, broker, tf)
 

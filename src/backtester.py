@@ -12,6 +12,14 @@ ANNUALIZATION_FACTORS = {
 }
 ANNUALIZATION_FACTOR = ANNUALIZATION_FACTORS["H1"]   # default
 
+# Minimum ATR/spread ratio required before a signal is allowed through.
+# M5: 7.0× — mean-reversion trades on 5-min bars must have enough volatility
+#     to decisively crush the spread; filters out quiet night-session noise
+#     where MR has lower edge and costs consume most of the move.
+# H1/M15/default: 1.25× — standard threshold that blocks only the most
+#     illiquid bars while leaving the majority of trend sessions open.
+TF_MIN_EFFICIENCY = {"M5": 7.0}
+
 RISK_PER_TRADE = 0.01
 PROB_THRESHOLD = 0.65
 BULL_STATE     = 0     # HMM Bull regime
@@ -328,11 +336,14 @@ def vectorized_backtest(
         short_threshold=short_threshold,   # None → symmetric default inside
     )
 
-    # Spread-Aware Adaptive Filter: suppress signals where ATR / spread < 1.25.
-    # Threshold lowered from 1.8 → 1.25 to allow standard market conditions
-    # while still blocking dead sessions where spread consumes >80% of the move.
+    # Spread-Aware Adaptive Filter: suppress signals where ATR / spread is below
+    # the TF-specific minimum efficiency threshold.
+    # M5: 7.0× — ensures MR trades only fire when volatility comfortably exceeds
+    #     the spread, filtering expensive noise in quiet night sessions.
+    # H1/M15: 1.25× — allows standard market conditions while blocking dead sessions.
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
-    _er_mask     = (atr_norm / _spread_frac) >= 1.25
+    _min_eff     = TF_MIN_EFFICIENCY.get(tf.upper(), 1.25)
+    _er_mask     = (atr_norm / _spread_frac) >= _min_eff
     signals = np.where(_er_mask, raw_signals, 0)
 
     # Determine pos_per_trade from the adaptive risk manager
