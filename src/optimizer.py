@@ -41,7 +41,10 @@ def _study_db(broker: str) -> str:
     return f"sqlite:///models/study_{broker}.db"
 
 # Hard floors applied before scoring — prevent degenerate or blow-up trials.
-MIN_OOS_TRADES  = 5      # absolute hard floor — prevents 0-trade degenerate scores
+# TF-specific hard floor: trials below these counts return -50.0 immediately.
+# They produce statistically meaningless RF/PF ratios (10 trades → RF=20 by chance)
+# and pollute the surrogate model, biasing future sampling toward "tiny trade" configs.
+MIN_OOS_TRADES_HARD = {"M5": 50, "M15": 20, "H1": 10}
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
 PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
@@ -74,9 +77,10 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
     pf          = result.get("profit_factor", 1.0)
 
     if floating_dd <= 0:
-        rf = 50.0 if net_profit > 0 else 0.0
+        rf = 5.0 if net_profit > 0 else 0.0
     else:
-        rf = min(net_profit / floating_dd, 50.0)
+        rf = min(net_profit / floating_dd, 5.0)   # cap at 5 — max contribution 2.0
+    pf = min(pf, 3.0)                              # cap at 3 — max contribution 0.9
 
     score = float((rf * 0.4) + (pf * 0.3) + (sharpe * 0.3))
 
@@ -271,9 +275,14 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 oos_fdd = result.get("oos_floating_max_drawdown",
                                      result.get("oos_max_drawdown", 0.0))
 
-                # Absolute hard floor — truly degenerate trials with no signal
-                if oos_n < MIN_OOS_TRADES:
-                    return -10.0
+                # Absolute hard floor — statistically meaningless trials with too few
+                # OOS trades produce artefact RF/PF ratios (e.g. 8 trades → RF=20)
+                # that permanently bias the surrogate toward "tiny trade" configs.
+                # Return -50.0 (not -10.0) so these trials are clearly dead in the
+                # surrogate's landscape rather than marginally below average.
+                _hard_floor = MIN_OOS_TRADES_HARD.get(tf.upper(), 10)
+                if oos_n < _hard_floor:
+                    return -50.0
 
                 # Safety floor — 20% floating DD is terminal for a $15 account
                 if oos_fdd > MAX_FLOAT_DD:
