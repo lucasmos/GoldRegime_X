@@ -121,15 +121,41 @@ class SignalEvaluator:
         }
         return bull, bear, chop
 
+    def _calculate_tiered_override(self, prob_buy: float) -> float:
+        """Amount to reduce the Z-Score requirement based on XGBoost conviction.
+
+        Stronger conviction (probability further from 0.50) → larger reduction.
+        Only applied to Bull/Bear trend signals; MR (Chop) is unaffected.
+        The effective cutoff is always clamped to a minimum of 1.0 by callers.
+
+        Returns:
+            float: Reduction to subtract from the Z cutoff (0.0 to 1.0).
+        """
+        extremity = abs(prob_buy - 0.50)
+        if extremity >= 0.10:    # prob ≤ 0.40 or ≥ 0.60 — very strong conviction
+            return 1.0
+        elif extremity >= 0.07:  # prob ≤ 0.43 or ≥ 0.57 — strong
+            return 0.5
+        elif extremity >= 0.04:  # prob ≤ 0.46 or ≥ 0.54 — moderate
+            return 0.25
+        return 0.0
+
     # ── Backtester / Optimiser interface ────────────────────────────────────
 
     def evaluate_signal_fast(
         self,
-        prob_buy:   float,
-        hmm_state:  int,
+        prob_buy:    float,
+        hmm_state:   int,
         gmm_cluster: int = 1,
+        use_tiered:  bool = False,
     ) -> Tuple[Optional[str], float]:
         """Fast, gate-free evaluation for vectorised backtesting.
+
+        Args:
+            use_tiered: When True, reduce Bull/Bear Z cutoff by conviction
+                        strength (see :meth:`_calculate_tiered_override`).
+                        MR (Chop) cutoffs are never modified.  The effective
+                        cutoff floor is 1.0.
 
         Returns:
             ``(signal_or_None, z_score)`` — signal is one of
@@ -137,6 +163,13 @@ class SignalEvaluator:
         """
         z = self.calculate_z_score(prob_buy, hmm_state)
         bull_cut, bear_cut, chop_cuts = self._vol_adjusted_cutoffs(gmm_cluster)
+
+        if use_tiered and hmm_state in (0, 1):
+            reduction = self._calculate_tiered_override(prob_buy)
+            if hmm_state == 0:
+                bull_cut = max(1.0, bull_cut - reduction)
+            else:
+                bear_cut = min(-1.0, bear_cut + reduction)
 
         if hmm_state == 0:
             return ("BUY", z) if z > bull_cut else (None, z)
@@ -323,12 +356,13 @@ class SignalEvaluator:
 
     def evaluate_signal(
         self,
-        prob_buy:         float,
-        hmm_state:        int,
-        gmm_cluster:      int,
-        stability:        Dict[str, Any],
-        bb_position:      float = 0.5,
-        transition_prob:  Optional[float] = None,
+        prob_buy:        float,
+        hmm_state:       int,
+        gmm_cluster:     int,
+        stability:       Dict[str, Any],
+        bb_position:     float = 0.5,
+        transition_prob: Optional[float] = None,
+        use_tiered:      bool = False,
     ) -> Dict[str, Any]:
         """Full evaluation with all live safety gates.
 
@@ -340,6 +374,9 @@ class SignalEvaluator:
                              bars, regime changes, etc.
             bb_position:     Price position within Bollinger Bands (0=lower, 1=upper).
             transition_prob: HMM self-transition probability P(stay in current state).
+            use_tiered:      When True, apply tiered Z-Score conviction override to
+                             Bull/Bear trend signals.  MR (Chop) signals are unaffected.
+                             The effective Z cutoff floor is 1.0.
         Returns:
             ``{"signal", "confidence", "reason", "gate_results", "confidence_level"}``
         """
@@ -372,6 +409,20 @@ class SignalEvaluator:
             exited_from_state=exited_from,
         )
         result["confidence_level"] = req["confidence_level"]
+
+        # ── Tiered Z-Score override (Bull/Bear only) ───────────────────────
+        # If use_tiered, reduce req["min_z_score"] based on XGBoost conviction.
+        # Only clears a Z-based block — bar-count blocks are never overridden.
+        if use_tiered and hmm_state in (0, 1):
+            reduction = self._calculate_tiered_override(prob_buy)
+            if reduction > 0:
+                new_min_z = max(1.0, req["min_z_score"] - reduction)
+                req["min_z_score"] = new_min_z
+                if req["blocked_reason"]:
+                    if hmm_state == 0 and z >= new_min_z:
+                        req["blocked_reason"] = None
+                    elif hmm_state == 1 and z <= -new_min_z:
+                        req["blocked_reason"] = None
 
         if req["blocked_reason"]:
             result["reason"] = req["blocked_reason"]

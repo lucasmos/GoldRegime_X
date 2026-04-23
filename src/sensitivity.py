@@ -33,6 +33,7 @@ def run_sensitivity(
     regime_stats: dict,
     z_range: np.ndarray | None = None,
     output_dir: str = "reports",
+    use_tiered: bool = False,
 ) -> pd.DataFrame:
     """Test a range of Bull/Bear Z-Score cutoffs and return a results DataFrame.
 
@@ -63,7 +64,10 @@ def run_sensitivity(
     _tf_ovr = _TF_CUTOFF_OVERRIDES.get(tf.upper(), {})
     current_z = abs(_tf_ovr.get("Z_CUTOFF_BULL", _DEFAULT_CONFIG["Z_CUTOFF_BULL"]))
 
-    logger.info("Sensitivity analysis [%s/%s] balance=$%.0f", tf, broker, balance)
+    logger.info(
+        "Sensitivity analysis [%s/%s] balance=$%.0f  mode=%s",
+        tf, broker, balance, "TIERED" if use_tiered else "STANDARD",
+    )
     logger.info("  Current Z cutoff: ±%.2f", current_z)
     logger.info("  Testing range: %s", [round(float(z), 2) for z in z_range])
     logger.info("  Bars in dataset: %d  (split_idx=%d)", len(df_aligned), split_idx)
@@ -81,6 +85,7 @@ def run_sensitivity(
             tf=tf,
             regime_stats=regime_stats,
             evaluator_config=cfg_override,
+            use_tiered=use_tiered,
         )
 
         # Prefer OOS metrics when available, fall back to full-period
@@ -116,17 +121,18 @@ def run_sensitivity(
     if len(df_res) > 0 and df_res["oos_sharpe"].max() > 0:
         df_res.loc[df_res["oos_sharpe"].idxmax(), "is_best"] = True
 
-    _print_table(df_res, tf, broker)
-    _save_results(df_res, tf, broker, output_dir)
+    _print_table(df_res, tf, broker, use_tiered=use_tiered)
+    _save_results(df_res, tf, broker, output_dir, use_tiered=use_tiered)
     return df_res
 
 
 # ── Internal helpers ──────────────────────────────────────────────────────────
 
-def _print_table(df_res: pd.DataFrame, tf: str, broker: str) -> None:
+def _print_table(df_res: pd.DataFrame, tf: str, broker: str, use_tiered: bool = False) -> None:
+    mode_label = " [TIERED]" if use_tiered else ""
     rule = "=" * 84
     print(f"\n{rule}")
-    print(f"  Z-Score Sensitivity Analysis — {tf} / {broker}")
+    print(f"  Z-Score Sensitivity Analysis — {tf} / {broker}{mode_label}")
     print(rule)
     print(f"{'Z Cut':>8} {'Trades':>8} {'Win%':>7} {'Sharpe':>8} "
           f"{'MaxDD%':>8} {'PF':>6} {'RF':>7} {'Ret%':>8}  Note")
@@ -149,11 +155,12 @@ def _print_table(df_res: pd.DataFrame, tf: str, broker: str) -> None:
     print(f"{rule}\n")
 
 
-def _save_results(df_res: pd.DataFrame, tf: str, broker: str, output_dir: str) -> None:
+def _save_results(df_res: pd.DataFrame, tf: str, broker: str, output_dir: str, use_tiered: bool = False) -> None:
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    suffix = "_tiered" if use_tiered else ""
 
-    csv_path = out / f"sensitivity_{tf}_{broker}.csv"
+    csv_path = out / f"sensitivity_{tf}_{broker}{suffix}.csv"
     df_res.to_csv(csv_path, index=False)
     logger.info("Sensitivity CSV: %s", csv_path)
 
@@ -162,11 +169,12 @@ def _save_results(df_res: pd.DataFrame, tf: str, broker: str, output_dir: str) -
     summary = {
         "tf":          tf,
         "broker":      broker,
+        "mode":        "tiered" if use_tiered else "standard",
         "current_z":   float(curr_row["z_cutoff"].values[0]) if not curr_row.empty else None,
         "best_z":      float(best_row["z_cutoff"].values[0]) if not best_row.empty else None,
         "best_sharpe": float(best_row["oos_sharpe"].values[0]) if not best_row.empty else None,
         "results":     df_res.to_dict(orient="records"),
     }
-    json_path = out / f"sensitivity_{tf}_{broker}.json"
+    json_path = out / f"sensitivity_{tf}_{broker}{suffix}.json"
     json_path.write_text(json.dumps(summary, indent=2))
     logger.info("Sensitivity JSON: %s", json_path)

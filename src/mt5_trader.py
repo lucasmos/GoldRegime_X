@@ -879,6 +879,7 @@ def run_live_loop(
     broker: str      = "headway_cent",
     account_size: float = None,
     profit_target: float = None,
+    use_tiered: bool = False,
 ) -> None:
     """Connect to MT5 and run the signal → order loop until interrupted.
 
@@ -893,6 +894,9 @@ def run_live_loop(
         profit_target: Close early when floating P&L reaches this USD amount.
                        Defaults to PROFIT_ACTIVATION_USD for all TFs (legacy param,
                        other TFs.  Pass 0 to disable on M5 explicitly.
+        use_tiered:    When True, pass tiered Z-Score override to SignalEvaluator
+                       so strong XGBoost conviction can reduce the Z cutoff
+                       (floor 1.0).  MR signals are unaffected.
     """
     import MetaTrader5 as mt5
     from src.mt5_sync import connect_mt5, disconnect_mt5
@@ -901,14 +905,15 @@ def run_live_loop(
         raise ConnectionError("Could not connect to MT5 terminal.")
 
     try:
-        _run_loop_inner(tf, broker, account_size, mt5, profit_target)
+        _run_loop_inner(tf, broker, account_size, mt5, profit_target, use_tiered=use_tiered)
     finally:
         disconnect_mt5()
         logger.info("Live loop terminated.  MT5 disconnected.")
 
 
 def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
-                    profit_target: float = None) -> None:
+                    profit_target: float = None,
+                    use_tiered: bool = False) -> None:
     """Inner loop extracted to allow clean finally / disconnect in run_live_loop."""
     tf_mt5 = _get_tf_map()[tf.upper()]
 
@@ -1318,6 +1323,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 stability=_stability,
                 bb_position=_bb_pos,
                 transition_prob=_t_prob,
+                use_tiered=use_tiered,
             )
             _sig_str = _sig_eval["signal"]
 
