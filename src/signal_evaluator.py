@@ -51,8 +51,8 @@ _TF_CUTOFF_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "MIN_CHOP_BARS_FOR_MR": 2,
     },
     "M15": {
-        "Z_CUTOFF_BULL":     2.3,
-        "Z_CUTOFF_BEAR":    -2.3,
+        "Z_CUTOFF_BULL":     2.0,
+        "Z_CUTOFF_BEAR":    -2.0,
         "Z_CUTOFF_CHOP_MR": {2: 3.0, 3: 3.5},
         "MIN_CHOP_BARS_FOR_MR": 3,
     },
