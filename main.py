@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-from src.logger import setup_logger
+from src.logger import setup_logger, reconfigure_for_tf
 from src.processor import process_pipeline, TF_CONFIG, PROCESSED_PATH, save_feature_scaler, load_feature_scaler
 from src.engine_hmm import fit_hmm, save_model as save_hmm, load_model as load_hmm, get_model_path as hmm_model_path
 from src.engine_xgb import (
@@ -192,6 +192,7 @@ def cmd_wfa(args):
     balance = _resolve_balance(args)
     broker  = args.broker
     tf      = args.tf.upper()
+    reconfigure_for_tf(tf)
 
     # TF-specific defaults (calendar days) — tuned to each bar frequency
     _wfa_defaults = {"H1": (365, 90), "M15": (180, 60), "M5": (90, 30)}
@@ -336,6 +337,7 @@ def cmd_process(args):
         if tf not in TF_CONFIG:
             logger.error("Unknown timeframe '%s'. Valid: %s", tf, list(TF_CONFIG))
             continue
+        reconfigure_for_tf(tf)
         try:
             df = process_pipeline(save=True, tf=tf, save_models=True, broker=args.broker)
             logger.info(
@@ -351,6 +353,7 @@ def cmd_optimize(args):
     broker = args.broker
     tfs = [t.strip().upper() for t in args.tf.split(",")]
     for tf in tfs:
+        reconfigure_for_tf(tf)
         logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
         study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
         print(f"\n=== Best Result [{tf}] ===")
@@ -378,6 +381,7 @@ def cmd_train(args):
     balance = _resolve_balance(args)
     broker = args.broker
     tf = args.tf.upper()
+    reconfigure_for_tf(tf)
 
     try:
         params = get_best_params(balance=balance, broker=broker, tf=tf)
@@ -457,6 +461,7 @@ def cmd_compare(args):
     results = {}
 
     for tf in tfs:
+        reconfigure_for_tf(tf)
         try:
             params = get_best_params(balance=balance, broker=broker, tf=tf)
         except Exception:
@@ -558,6 +563,7 @@ def cmd_sync_validate(args):
 
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
+    reconfigure_for_tf(tf)
 
     logger.info("Syncing MT5 data [%s] period=%s ...", tf, args.period)
     try:
@@ -636,6 +642,7 @@ def cmd_live(args):
 
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
+    reconfigure_for_tf(tf)
 
     if not _check_m5_readiness(tf, args.broker):
         sys.exit(1)
@@ -665,6 +672,7 @@ def cmd_report(args):
     balance = _resolve_balance(args)
     broker = args.broker
     tf = args.tf.upper()
+    reconfigure_for_tf(tf)
 
     try:
         params = get_best_params(balance=balance, broker=broker, tf=tf)
