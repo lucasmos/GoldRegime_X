@@ -2,8 +2,22 @@ import io
 import logging
 import sys
 from pathlib import Path
+from typing import Optional
 
 LOG_DIR = Path("logs")
+
+# Loggers that always write to the main goldregimex.log (summaries + Telegram).
+# All other loggers are redirected to the TF-specific log by reconfigure_for_tf().
+_MAIN_LOG_NAMES = {"main", "notifier"}
+
+_fmt = logging.Formatter("[%(asctime)s %(levelname)s] %(name)s: %(message)s")
+
+
+def _make_file_handler(path: Path, level: int = logging.INFO) -> logging.FileHandler:
+    fh = logging.FileHandler(path, mode="a", encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(_fmt)
+    return fh
 
 
 def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
@@ -12,7 +26,6 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     if logger.handlers:
         return logger
     logger.setLevel(level)
-    fmt = logging.Formatter("[%(asctime)s %(levelname)s] %(name)s: %(message)s")
 
     # Build a UTF-8 stream for the console handler.
     # On Windows, sys.stderr defaults to cp1252 which can't encode emoji or
@@ -30,13 +43,58 @@ def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 
     sh = logging.StreamHandler(stream=_stream)
     sh.setLevel(level)
-    sh.setFormatter(fmt)
+    sh.setFormatter(_fmt)
     logger.addHandler(sh)
-    fh = logging.FileHandler(LOG_DIR / "goldregimex.log", mode="a", encoding="utf-8")
-    fh.setLevel(level)
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    if name in _MAIN_LOG_NAMES or _active_tf_handler is None:
+        # Main/notifier loggers and loggers created before any TF is set
+        # write to the main goldregimex.log.
+        logger.addHandler(_make_file_handler(LOG_DIR / "goldregimex.log", level))
+    else:
+        # Logger created after reconfigure_for_tf() — write to TF log only.
+        logger.addHandler(_active_tf_handler)
     return logger
+
+
+def reconfigure_for_tf(tf: str, level: int = logging.INFO) -> None:
+    """Redirect all non-main loggers to logs/goldregimex_{tf}.log.
+
+    Call this once at the start of any TF-specific command (optimize, train,
+    live, etc.) after the TF is known.  The ``main`` and ``notifier`` loggers
+    keep writing to ``goldregimex.log`` so summaries and Telegram messages are
+    always there.  Every other logger (src.*) switches to the TF file so
+    detailed output is isolated per timeframe.
+    """
+    LOG_DIR.mkdir(exist_ok=True)
+    tf_log_path = LOG_DIR / f"goldregimex_{tf.upper()}.log"
+
+    # One shared TF FileHandler for all redirected loggers.
+    tf_fh = _make_file_handler(tf_log_path, level)
+
+    # Iterate every logger that has already been instantiated.
+    manager = logging.Logger.manager
+    all_names = list(manager.loggerDict.keys())
+
+    for name in all_names:
+        if name in _MAIN_LOG_NAMES:
+            continue
+        lgr = logging.getLogger(name)
+        # Remove ALL existing FileHandlers (main log + any previous TF log).
+        # This ensures a clean switch when cycling through multiple TFs in one run.
+        to_remove = [h for h in list(lgr.handlers) if isinstance(h, logging.FileHandler)]
+        for h in to_remove:
+            h.close()
+            lgr.removeHandler(h)
+        lgr.addHandler(tf_fh)
+
+    # Ensure future loggers created during this run also write to the TF file.
+    # We do this by monkeypatching setup_logger's default file path for this process.
+    global _active_tf_handler
+    _active_tf_handler = tf_fh
+
+
+# Module-level slot for the active TF handler so setup_logger can pick it up
+# for loggers created *after* reconfigure_for_tf() is called.
+_active_tf_handler: Optional[logging.FileHandler] = None
 
 
 def log_regime_transition(logger, timestamp, old_state, new_state, state_names):
