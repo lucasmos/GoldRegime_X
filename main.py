@@ -633,7 +633,8 @@ def cmd_demo(args):
         tf, args.broker, balance,
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
-                  profit_target=getattr(args, "profit_target", None))
+                  profit_target=getattr(args, "profit_target", None),
+                  use_tiered=getattr(args, "tiered", False))
 
 
 def cmd_live(args):
@@ -665,7 +666,8 @@ def cmd_live(args):
         tf, args.broker, balance,
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
-                  profit_target=getattr(args, "profit_target", None))
+                  profit_target=getattr(args, "profit_target", None),
+                  use_tiered=getattr(args, "tiered", False))
 
 
 def cmd_report(args):
@@ -951,6 +953,7 @@ def cmd_sensitivity(args):
         states_aligned=states_aligned,
         split_idx=split_idx,
         regime_stats=metrics["regime_stats"],
+        use_tiered=getattr(args, "tiered", False),
     )
 
 
@@ -981,6 +984,9 @@ def main():
                         help="Lookback window for MT5 sync, e.g. '3m' '6m' '12m'.")
     parser.add_argument("--yes", action="store_true",
                         help="Skip the interactive live-account confirmation (used when launched as a subprocess).")
+    parser.add_argument("--tiered", action="store_true",
+                        help="Enable tiered Z-Score override: strong XGBoost conviction reduces the Z "
+                             "cutoff floor (min 1.0). Used with --mode sensitivity and --mode live/demo.")
     parser.add_argument("--profit_target",  type=float, default=None,
                         help="Quick-profit close threshold in USD.  M5 defaults to 4.0; "
                              "other TFs disabled unless set.  Pass 0 to disable on M5.")
