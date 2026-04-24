@@ -46,13 +46,13 @@ def _study_db(broker: str) -> str:
 # TF-specific hard floor: trials below these counts return -50.0 immediately.
 # They produce statistically meaningless RF/PF ratios (10 trades → RF=20 by chance)
 # and pollute the surrogate model, biasing future sampling toward "tiny trade" configs.
-MIN_OOS_TRADES_HARD = {"M5": 60, "M15": 30, "H1": 15}
+MIN_OOS_TRADES_HARD = {"M5": 60, "M15": 30, "H1": 20}
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
 PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
-TF_MIN_OOS_TRADES = {"H1": 15, "M15": 140, "M5": 350}
+TF_MIN_OOS_TRADES = {"H1": 25, "M15": 140, "M5": 350}
 
 
 def _get_tier(balance: float) -> str:
@@ -172,15 +172,6 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         gamma            = trial.suggest_float("gamma",     0.01, 0.5,  log=True)
-        # Z-Score cutoff — how many sigma above the IS regime mean the XGBoost
-        # probability must be before we fire a signal.  Lower values produce more
-        # signals (higher frequency, lower quality); higher values are more
-        # selective.  Range [1.0, 2.5]: Z=1.5 ≈ top 7% of probs, Z=2.5 ≈ top 0.6%.
-        # Symmetric: BEAR cutoff = -z_cutoff_bull.
-        if tf.upper() == "M5":
-            z_cutoff_bull = trial.suggest_float("z_cutoff_bull", 1.5, 3.0)
-        else:
-            z_cutoff_bull = trial.suggest_float("z_cutoff_bull", 1.0, 2.5)
 
         try:
             df = process_pipeline(
@@ -243,7 +234,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             regime_stats   = compute_regime_stats(models, thresholds, X_is, hmm_states_is)
             metrics["regime_stats"] = regime_stats
 
-            _eval_cfg = {"Z_CUTOFF_BULL": z_cutoff_bull, "Z_CUTOFF_BEAR": -z_cutoff_bull}
+            _eval_cfg = None   # Z cutoffs use hardcoded TF defaults from signal_evaluator.py
             result = vectorized_backtest(
                 df_aligned, probabilities, states_aligned,
                 split_idx=split_idx,
