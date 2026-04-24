@@ -1253,12 +1253,29 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                             "TIGHTENING Z" if _lstm_info["transition_risk"] > 0.5 else "watching",
                         )
                     if _lstm_info["transition_risk"] > 0.5:
-                        # Build a per-bar evaluator with tighter Z cutoffs (+0.5 on optimized base)
+                        # TIGHTEN — regime instability detected
                         from src.signal_evaluator import SignalEvaluator as _SE
                         _base_cut = _z_cut if _z_cut else 2.5
                         _active_evaluator = _SE(
                             regime_stats, tf=tf,
                             config={"Z_CUTOFF_BULL": _base_cut + 0.5, "Z_CUTOFF_BEAR": -(_base_cut + 0.5)},
+                        )
+                        logger.info(
+                            "LSTM: HIGH transition_risk=%.2f — Z tightened to ±%.1f",
+                            _lstm_info["transition_risk"], _base_cut + 0.5,
+                        )
+                    elif _lstm_info.get("agreement") and _lstm_info.get("lstm_confidence", 0.0) > 0.85:
+                        # RELAX — LSTM strongly agrees with HMM; lower bar for entry
+                        from src.signal_evaluator import SignalEvaluator as _SE
+                        _base_cut = _z_cut if _z_cut else 2.5
+                        _relaxed  = max(1.0, _base_cut - 0.3)
+                        _active_evaluator = _SE(
+                            regime_stats, tf=tf,
+                            config={"Z_CUTOFF_BULL": _relaxed, "Z_CUTOFF_BEAR": -_relaxed},
+                        )
+                        logger.info(
+                            "LSTM: strong agreement conf=%.2f — Z relaxed to ±%.1f",
+                            _lstm_info["lstm_confidence"], _relaxed,
                         )
                 except Exception as _lstm_exc:
                     logger.debug("LSTM ensemble failed: %s", _lstm_exc)
