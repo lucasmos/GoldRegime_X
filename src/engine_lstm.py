@@ -243,11 +243,13 @@ class LSTMRegimeClassifier:
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
-    def predict_proba(self, df_recent: pd.DataFrame) -> Dict[int, float]:
+    def predict_proba(self, df_recent: pd.DataFrame) -> Optional[Dict[int, float]]:
         """Return state probability dict from recent bars.
 
         Needs at least ``sequence_length`` rows; pads with zeros if fewer.
-        Returns uniform distribution on error (graceful degradation).
+        Returns None when the model output is collapsed (range < 0.05) —
+        callers should treat None as "LSTM unreliable, use HMM only".
+        Returns uniform distribution on unexpected error.
         """
         if self._model is None:
             return {s: 1.0 / self.n_states for s in range(self.n_states)}
@@ -268,14 +270,26 @@ class LSTMRegimeClassifier:
             feat = feat[-self.sequence_length:].astype(np.float32)
 
             probs = self._model.predict(feat[np.newaxis], verbose=0)[0]
+
+            # Detect collapsed model — output range near zero means all classes
+            # are equally likely, which is indistinguishable from random.
+            if float(probs.max() - probs.min()) < 0.05:
+                logger.warning(
+                    "[LSTM COLLAPSED] probs=%s — near-uniform output, model unreliable. "
+                    "Retrain with --mode train_lstm.", probs,
+                )
+                return None
+
             return {int(i): float(probs[i]) for i in range(self.n_states)}
 
         except Exception as exc:
             logger.debug("LSTM predict_proba error: %s", exc)
             return {s: 1.0 / self.n_states for s in range(self.n_states)}
 
-    def predict_state(self, df_recent: pd.DataFrame) -> int:
+    def predict_state(self, df_recent: pd.DataFrame) -> Optional[int]:
         probs = self.predict_proba(df_recent)
+        if probs is None:
+            return None
         return max(probs, key=probs.get)
 
     def ensemble_predict(
@@ -296,18 +310,39 @@ class LSTMRegimeClassifier:
             hmm_state       int
             ensemble_state  int
             lstm_probs      dict
+            lstm_status     str    — 'OK' | 'COLLAPSED'
         """
-        lstm_probs      = self.predict_proba(df_recent)
+        lstm_probs = self.predict_proba(df_recent)
+
+        # Collapsed LSTM — return HMM-only fallback with zero influence
+        if lstm_probs is None:
+            return hmm_state, {
+                "agreement":       True,   # don't penalise HMM on broken LSTM
+                "lstm_confidence": 0.0,
+                "transition_risk": 0.0,    # never tighten Z on a broken model
+                "lstm_state":      hmm_state,
+                "hmm_state":       hmm_state,
+                "ensemble_state":  hmm_state,
+                "lstm_probs":      {},
+                "ensemble_scores": {s: 1.0 if s == hmm_state else 0.0 for s in range(self.n_states)},
+                "lstm_status":     "COLLAPSED",
+            }
+
         lstm_state      = max(lstm_probs, key=lstm_probs.get)
         lstm_confidence = lstm_probs[lstm_state]
         agreement       = (lstm_state == hmm_state)
 
-        if not agreement and lstm_confidence > 0.6:
+        # transition_risk: only meaningful when LSTM is CONFIDENT about a
+        # DIFFERENT state than HMM.  Agreement (or low confidence) → no risk.
+        if lstm_state != hmm_state and lstm_confidence > 0.50:
+            # LSTM disagrees AND is confident — genuine transition signal
             transition_risk = lstm_confidence
-        elif not agreement:
-            transition_risk = 0.3
+        elif lstm_state != hmm_state and lstm_confidence > 0.35:
+            # LSTM disagrees but uncertain — mild risk, won't reach 0.5 gate
+            transition_risk = 0.30
         else:
-            transition_risk = max(0.0, 1.0 - lstm_confidence)
+            # Agreement, or LSTM not confident enough to matter
+            transition_risk = 0.0
 
         ensemble_scores = {}
         for s in range(self.n_states):
@@ -319,13 +354,15 @@ class LSTMRegimeClassifier:
         ensemble_state = max(ensemble_scores, key=ensemble_scores.get)
 
         info = {
-            "agreement":        agreement,
-            "lstm_confidence":  lstm_confidence,
-            "transition_risk":  transition_risk,
-            "lstm_state":       lstm_state,
-            "hmm_state":        hmm_state,
-            "ensemble_state":   ensemble_state,
-            "lstm_probs":       lstm_probs,
+            "agreement":       agreement,
+            "lstm_confidence": lstm_confidence,
+            "transition_risk": transition_risk,
+            "lstm_state":      lstm_state,
+            "hmm_state":       hmm_state,
+            "ensemble_state":  ensemble_state,
+            "lstm_probs":      lstm_probs,
+            "ensemble_scores": ensemble_scores,
+            "lstm_status":     "OK",
         }
         return ensemble_state, info
 
