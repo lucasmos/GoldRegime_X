@@ -172,6 +172,15 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         gamma            = trial.suggest_float("gamma",     0.01, 0.5,  log=True)
+        # Z-Score cutoff — how many sigma above the IS regime mean the XGBoost
+        # probability must be before we fire a signal.  Lower values produce more
+        # signals (higher frequency, lower quality); higher values are more
+        # selective.  Range [1.0, 2.5]: Z=1.5 ≈ top 7% of probs, Z=2.5 ≈ top 0.6%.
+        # Symmetric: BEAR cutoff = -z_cutoff_bull.
+        if tf.upper() == "M5":
+            z_cutoff_bull = trial.suggest_float("z_cutoff_bull", 1.5, 3.0)
+        else:
+            z_cutoff_bull = trial.suggest_float("z_cutoff_bull", 1.0, 2.5)
 
         try:
             df = process_pipeline(
@@ -234,6 +243,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             regime_stats   = compute_regime_stats(models, thresholds, X_is, hmm_states_is)
             metrics["regime_stats"] = regime_stats
 
+            _eval_cfg = {"Z_CUTOFF_BULL": z_cutoff_bull, "Z_CUTOFF_BEAR": -z_cutoff_bull}
             result = vectorized_backtest(
                 df_aligned, probabilities, states_aligned,
                 split_idx=split_idx,
@@ -241,6 +251,7 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 broker=broker,
                 tf=tf,
                 regime_stats=regime_stats,
+                evaluator_config=_eval_cfg,
             )
 
             # Score on OOS only to prevent IS data leakage

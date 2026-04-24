@@ -123,6 +123,8 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     _X_is = X.iloc[:split_idx] if split_idx else X
     _hs_is = states_aligned[:len(_X_is)]
     metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, _X_is, _hs_is)
+    _z = params.get("z_cutoff_bull")
+    _eval_cfg = {"Z_CUTOFF_BULL": _z, "Z_CUTOFF_BEAR": -_z} if _z else None
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx,
@@ -130,6 +132,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         broker=broker,
         tf=tf,
         regime_stats=metrics["regime_stats"],
+        evaluator_config=_eval_cfg,
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -749,6 +752,8 @@ def cmd_report(args):
         df_aligned, probabilities, states_aligned,
         split_idx=split_idx, account_size=balance, broker=broker, tf=tf,
         regime_stats=metrics.get("regime_stats"),
+        evaluator_config=({"Z_CUTOFF_BULL": params["z_cutoff_bull"], "Z_CUTOFF_BEAR": -params["z_cutoff_bull"]}
+                          if params.get("z_cutoff_bull") else None),
     )
 
     arm = AdaptiveRiskManager(balance, broker=broker)
@@ -872,70 +877,55 @@ def cmd_listen(args):
 
 
 def cmd_train_lstm(args):
-    """Train the LSTM context model on the processed feature DataFrame.
+    """Train the LSTM regime classifier.
 
-    Loads existing processed parquet from disk (run --mode process first).
-    Optionally adds hmm_state from the saved HMM model so the LSTM can see
-    regime context during training.
-
-    After training, re-run --mode train to rebuild the XGBoost ensemble with
-    lstm_ctx_0..3 features included in the feature matrix.
+    Requires an existing HMM model (run --mode train first) to generate the
+    state labels that the LSTM learns to predict.  Once trained the LSTM is
+    ensembled with the HMM at inference time to provide early transition
+    detection and adaptive Z-Score tightening.
 
     Usage:
         python main.py --mode train_lstm --tf H1 --broker headway_cent --epochs 100
     """
-    from src.engine_lstm import LSTMContextModel, get_lstm_path
-    import pandas as pd
+    from src.engine_lstm import LSTMRegimeClassifier, get_lstm_dir
+    from src.processor import load_data_with_hmm_labels
 
     tf     = args.tf.upper()
     broker = args.broker
     epochs = getattr(args, "epochs", 100)
+    seq_len = getattr(args, "lstm_seq_len", 100)
     reconfigure_for_tf(tf)
 
-    cfg = TF_CONFIG.get(tf)
-    if cfg is None:
-        print(f"ERROR: Unknown timeframe '{tf}'.")
-        sys.exit(1)
-
-    parquet_path = cfg["processed_path"]
-    if not parquet_path.exists():
-        print(
-            f"\nERROR: Processed parquet not found at {parquet_path}.\n"
-            f"Run  python main.py --mode process --tf {tf}  first."
-        )
-        sys.exit(1)
-
-    logger.info("Loading processed data from %s", parquet_path)
-    df = pd.read_parquet(parquet_path)
-    logger.info("Loaded %d rows for LSTM training.", len(df))
-
-    # Optionally enrich with HMM states so LSTM can see regime labels
-    _hmm_path = hmm_model_path(tf, broker)
-    if not _hmm_path.exists():
-        from src.engine_hmm import MODEL_PATH as _hmm_generic
-        _hmm_path = _hmm_generic
     try:
-        _hmm = load_hmm(_hmm_path)
-        from src.engine_hmm import predict_states
-        df["hmm_state"] = predict_states(_hmm, df)
-        logger.info("HMM states added to LSTM training data (%s).", _hmm_path)
-    except Exception as _hmm_exc:
-        logger.info(
-            "HMM model not found or predict failed (%s) — training without hmm_state.", _hmm_exc
-        )
+        df = load_data_with_hmm_labels(tf, broker)
+    except FileNotFoundError as exc:
+        print(f"\nERROR: {exc}\n")
+        sys.exit(1)
 
-    model = LSTMContextModel()
-    model.fit(df, epochs=epochs)
+    n_states = int(df["hmm_state"].nunique())
+    logger.info(
+        "Training LSTM regime classifier [%s/%s] — %d states  %d bars",
+        tf, broker, n_states, len(df),
+    )
 
-    save_path = get_lstm_path(tf, broker)
-    model.save(save_path)
+    lstm = LSTMRegimeClassifier(sequence_length=seq_len, n_states=n_states)
+    lstm.fit(df, tf=tf, epochs=epochs)
 
-    # Report context quality so we can verify the model actually learned something
-    model.log_context_quality(df)
+    save_dir = get_lstm_dir(tf, broker)
+    lstm.save(save_dir)
 
-    print(f"\n  LSTM context model saved: {save_path}")
-    print(f"  Re-run --mode train --tf {tf} --broker {broker} to rebuild")
-    print(f"  XGBoost with lstm_ctx_0..3 in the feature matrix.\n")
+    # Quick sanity check on the most recent bars
+    recent = df.iloc[-seq_len - 50:]
+    probs  = lstm.predict_proba(recent)
+    pred   = max(probs, key=probs.get)
+    actual = int(df["hmm_state"].iloc[-1])
+    logger.info(
+        "Quick test — last bar: LSTM=%d (%.0f%%)  HMM=%d",
+        pred, probs[pred] * 100, actual,
+    )
+
+    print(f"\n  LSTM regime classifier saved: {save_dir}")
+    print(f"  Run --mode demo/live to use ensemble regime detection.\n")
 
 
 
@@ -1068,6 +1058,8 @@ def main():
                         help="WFA OOS step size in calendar days (default: H1=90, M15=60, M5=30).")
     parser.add_argument("--epochs",     type=int, default=100,
                         help="LSTM training epochs for --mode train_lstm (default 100).")
+    parser.add_argument("--lstm_seq_len", type=int, default=100,
+                        help="LSTM sequence length in bars for --mode train_lstm (default 100).")
 
     args = parser.parse_args()
     {
