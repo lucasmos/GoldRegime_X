@@ -38,7 +38,7 @@ from src.processor import (
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH, STATE_NAMES_2, STATE_NAMES_3, STATE_NAMES_4
 from src.engine_xgb import (
     load_xgb_ensemble, get_predictions_ensemble, assign_vol_bucket, FEATURE_COLS,
-    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH, LSTM_CONTEXT_COLS,
+    get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
 from src.signal_evaluator import SignalEvaluator
@@ -641,7 +641,6 @@ def compute_live_features(
     mt5=None,
     tf: str = "H1",
     broker: str = "headway_cent",
-    lstm_model=None,
 ):
     """Build the current-bar feature vector for XGBoost ensemble inference.
 
@@ -702,25 +701,6 @@ def compute_live_features(
             logger.warning("GMM model missing for [%s/%s] — using cluster=0", tf, broker)
             feature_dict["gmm_vol_cluster"] = 0.0
 
-    # ── LSTM context features (lstm_ctx_0..3) ────────────────────────────────
-    # Inject when the ensemble was trained with LSTM context columns.
-    # Falls back to 0.0 per-column when the LSTM model file is absent.
-    _lstm_cols_needed = [c for c in LSTM_CONTEXT_COLS if c in feature_cols]
-    if _lstm_cols_needed:
-        if lstm_model is not None:
-            # Pass the raw live df as DataFrame so predict_context derives
-            # rsi_normalized / volume_ratio / bb_position automatically
-            _ctx = lstm_model.predict_context(df)
-        else:
-            _ctx = np.zeros(len(LSTM_CONTEXT_COLS), dtype=np.float32)
-            logger.debug(
-                "LSTM context model absent — setting lstm_ctx features to 0.0 "
-                "for this bar.  Train with --mode train_lstm to enable."
-            )
-        for i, col in enumerate(LSTM_CONTEXT_COLS):
-            if col in feature_cols:
-                feature_dict[col] = float(_ctx[i])
-
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 
     # Apply the 10-year feature scaler so live values match the training distribution
@@ -744,7 +724,8 @@ def compute_live_features(
     atr_price   = atr_normalized * float(df["Close"].iloc[-1])
     # Return raw (pre-scaler) atr_normalized separately so the live ER filter
     # can compare it against spread_frac without using the scaled value.
-    return features_df, current_state, atr_price, atr_normalized
+    # raw_df is the full live DataFrame (200 bars) passed to the LSTM classifier.
+    return features_df, current_state, atr_price, atr_normalized, df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -972,18 +953,35 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
         raise FileNotFoundError("XGB ensemble model not found. Run --mode train first.")
 
     # Load regime statistics and build the adaptive signal evaluator
-    regime_stats     = xgb_meta.get("regime_stats", {})
-    signal_evaluator = SignalEvaluator(regime_stats, tf=tf)
+    regime_stats = xgb_meta.get("regime_stats", {})
 
-    # Load optional LSTM context model — gracefully absent before train_lstm is run
-    from src.engine_lstm import load_lstm_model as _load_lstm
-    lstm_model = _load_lstm(tf, broker)
-    if lstm_model is not None:
-        logger.info("LSTM context model loaded for [%s/%s].", tf, broker)
+    # Resolve Kalman params and Z-cutoff from Optuna study or TF defaults
+    try:
+        from src.optimizer import get_best_params
+        params    = get_best_params(balance=account_size, broker=broker, tf=tf)
+        obs_cov   = params.get("obs_cov")
+        trans_cov = params.get("trans_cov")
+    except Exception:
+        params    = {}
+        obs_cov   = None
+        trans_cov = None
+
+    _z_cut = params.get("z_cutoff_bull")
+    _eval_cfg = {"Z_CUTOFF_BULL": _z_cut, "Z_CUTOFF_BEAR": -_z_cut} if _z_cut else None
+    signal_evaluator = SignalEvaluator(regime_stats, tf=tf, config=_eval_cfg)
+
+    # Load optional LSTM regime classifier — absent until --mode train_lstm is run
+    from src.engine_lstm import load_lstm_classifier as _load_lstm_clf
+    lstm_classifier = _load_lstm_clf(tf, broker)
+    if lstm_classifier is not None:
+        logger.info(
+            "LSTM regime classifier loaded [%s/%s] — n_states=%d.",
+            tf, broker, lstm_classifier.n_states,
+        )
     else:
         logger.info(
-            "LSTM context model not found for [%s/%s] — context features = 0. "
-            "Run --mode train_lstm to enable.",
+            "LSTM regime classifier not found [%s/%s] — running HMM-only. "
+            "Run --mode train_lstm to enable ensemble regime detection.",
             tf, broker,
         )
     if regime_stats:
@@ -1000,17 +998,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             "No regime_stats found in model — fixed-threshold fallback active. "
             "Re-train to enable Z-Score calibration."
         )
-
-    # Resolve Kalman params from Optuna study or TF defaults
-    try:
-        from src.optimizer import get_best_params
-        params    = get_best_params(balance=account_size, broker=broker, tf=tf)
-        obs_cov   = params.get("obs_cov")
-        trans_cov = params.get("trans_cov")
-    except Exception:
-        params    = {}
-        obs_cov   = None
-        trans_cov = None
 
     cfg_tf    = TF_CONFIG[tf.upper()]
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
@@ -1235,12 +1222,46 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             arm = AdaptiveRiskManager(account_size, tf=tf, broker=broker)
 
             # ── 4. Compute live features + probability ────────────────────
-            features_df, hmm_state, atr_price, raw_atr_norm = compute_live_features(
+            features_df, hmm_state, atr_price, raw_atr_norm, live_df = compute_live_features(
                 DEFAULT_SYMBOL, tf_mt5, model_hmm, obs_cov, trans_cov,
                 feature_cols=feature_cols, mt5=mt5, tf=tf, broker=broker,
-                lstm_model=lstm_model,
             )
             signal_tracker["atr_price"] = atr_price   # cache for between-bar ATR trail
+
+            # ── 4a. LSTM ensemble + transition risk ───────────────────────
+            # If the LSTM classifier is loaded, ensemble its prediction with
+            # the HMM state.  High transition_risk (>0.5) means the LSTM is
+            # confident the regime is changing — Z cutoffs are tightened to
+            # avoid entering signals into an unstable regime.
+            _lstm_ensemble_info = None
+            _active_evaluator   = signal_evaluator   # default: no LSTM adjustment
+            if lstm_classifier is not None:
+                try:
+                    _ens_state, _lstm_info = lstm_classifier.ensemble_predict(
+                        df_recent=live_df,
+                        hmm_state=hmm_state,
+                        lstm_weight=0.3,
+                    )
+                    _lstm_ensemble_info = _lstm_info
+                    if not _lstm_info["agreement"]:
+                        logger.info(
+                            "[LSTM] HMM=%d vs LSTM=%d (conf=%.2f, risk=%.2f) — %s",
+                            hmm_state,
+                            _lstm_info["lstm_state"],
+                            _lstm_info["lstm_confidence"],
+                            _lstm_info["transition_risk"],
+                            "TIGHTENING Z" if _lstm_info["transition_risk"] > 0.5 else "watching",
+                        )
+                    if _lstm_info["transition_risk"] > 0.5:
+                        # Build a per-bar evaluator with tighter Z cutoffs (+0.5 on optimized base)
+                        from src.signal_evaluator import SignalEvaluator as _SE
+                        _base_cut = _z_cut if _z_cut else 2.5
+                        _active_evaluator = _SE(
+                            regime_stats, tf=tf,
+                            config={"Z_CUTOFF_BULL": _base_cut + 0.5, "Z_CUTOFF_BEAR": -(_base_cut + 0.5)},
+                        )
+                except Exception as _lstm_exc:
+                    logger.debug("LSTM ensemble failed: %s", _lstm_exc)
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob        = float(_probs[0])
             gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
@@ -1349,7 +1370,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             _t_prob     = _get_transition_prob(model_hmm, hmm_state)
             _bb_pos     = _calculate_bb_position(np.array(close_prices_cache))
             _gmc        = gmm_cluster if gmm_cluster >= 0 else 1
-            _sig_eval   = signal_evaluator.evaluate_signal(
+            _sig_eval   = _active_evaluator.evaluate_signal(
                 prob_buy=prob,
                 hmm_state=hmm_state,
                 gmm_cluster=_gmc,

@@ -426,3 +426,55 @@ def process_pipeline(
         logger.info("Saved processed data to %s", out_path)
 
     return df
+
+
+def load_data_with_hmm_labels(tf: str, broker: str = "headway_cent") -> pd.DataFrame:
+    """Load processed parquet and attach HMM state labels.
+
+    Loads the saved HMM model for the given TF/broker and adds a
+    ``hmm_state`` column so the LSTM regime classifier has targets to
+    train on.
+
+    Raises:
+        FileNotFoundError: if the processed parquet or HMM model are missing.
+    """
+    tf  = tf.upper()
+    cfg = TF_CONFIG.get(tf)
+    if cfg is None:
+        raise ValueError(f"Unknown timeframe '{tf}'")
+
+    parquet_path = cfg["processed_path"]
+    if not parquet_path.exists():
+        raise FileNotFoundError(
+            f"Processed parquet not found at {parquet_path}. "
+            f"Run  python main.py --mode process --tf {tf}  first."
+        )
+
+    df = pd.read_parquet(parquet_path)
+    logger.info("Loaded processed data: %d rows [%s]", len(df), tf)
+
+    if "hmm_state" in df.columns:
+        logger.info("hmm_state already present in parquet — skipping HMM predict.")
+        return df
+
+    from src.engine_hmm import load_model as _load_hmm, predict_states, get_model_path, fit_hmm
+
+    hmm_path = get_model_path(tf, broker)
+    if hmm_path.exists():
+        hmm_model = _load_hmm(hmm_path)
+        logger.info("HMM model loaded from %s.", hmm_path)
+    else:
+        logger.warning(
+            "HMM model not found at %s — fitting a fresh HMM with default params "
+            "(%s n_states=%d) for LSTM label generation.  "
+            "Run --mode train --tf %s --broker %s for optimised labels.",
+            hmm_path, tf, TF_CONFIG[tf]["n_states_default"], tf, broker,
+        )
+        n_states = TF_CONFIG[tf]["n_states_default"]
+        hmm_model, _, _ = fit_hmm(df, n_states=n_states)
+
+    df["hmm_state"] = predict_states(hmm_model, df)
+    logger.info("HMM states added: %s", dict(
+        pd.Series(df["hmm_state"]).value_counts().sort_index()
+    ))
+    return df

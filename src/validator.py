@@ -205,6 +205,8 @@ def run_validation(
     _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 
     # Backtest the full synced window — no IS/OOS split
+    _z = params.get("z_cutoff_bull")
+    _eval_cfg = {"Z_CUTOFF_BULL": _z, "Z_CUTOFF_BEAR": -_z} if _z else None
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
         split_idx=None,
@@ -212,6 +214,7 @@ def run_validation(
         broker=broker,
         tf=tf,
         regime_stats=xgb_meta.get("regime_stats"),
+        evaluator_config=_eval_cfg,
     )
 
     sharpe   = result["sharpe_ratio"]

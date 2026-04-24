@@ -66,10 +66,6 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
             cols.append(c)
     if USDCHF_FEATURE in df.columns and df[USDCHF_FEATURE].notna().mean() > 0.5:
         cols.append(USDCHF_FEATURE)
-    # LSTM context features — added when the context model was run during processing
-    for c in LSTM_CONTEXT_COLS:
-        if c in df.columns and df[c].notna().mean() > 0.5:
-            cols.append(c)
     return cols
 
 
