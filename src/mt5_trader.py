@@ -1003,6 +1003,29 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     obs_cov   = obs_cov   if obs_cov   is not None else cfg_tf["obs_cov_default"]
     trans_cov = trans_cov if trans_cov is not None else cfg_tf["trans_cov_default"]
 
+    # ── LSTM startup health check ──────────────────────────────────────────
+    if lstm_classifier is not None:
+        try:
+            _hc_df = _build_live_df(DEFAULT_SYMBOL, tf_mt5, 150, obs_cov, trans_cov)
+            _hc_probs = lstm_classifier.predict_proba(_hc_df)
+            if _hc_probs is None:
+                logger.warning(
+                    "[LSTM HEALTH] FAILED — collapsed output on startup warmup data. "
+                    "Running HMM-only. Retrain with --mode train_lstm."
+                )
+                lstm_classifier = None
+            else:
+                _hc_max = max(_hc_probs.values())
+                logger.info("[LSTM HEALTH] OK — max confidence: %.2f", _hc_max)
+                if _hc_max < 0.30:
+                    logger.warning(
+                        "[LSTM HEALTH] LOW CONFIDENCE (%.2f) — LSTM may not add reliable signal. "
+                        "Consider retraining.", _hc_max,
+                    )
+        except Exception as _hc_exc:
+            logger.warning("[LSTM HEALTH] ERROR — %s — running HMM-only.", _hc_exc)
+            lstm_classifier = None
+
     # Session state (persists across bars within a day)
     last_bar_time = None
     current_day   = None
@@ -1243,7 +1266,13 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         lstm_weight=0.3,
                     )
                     _lstm_ensemble_info = _lstm_info
-                    if not _lstm_info["agreement"]:
+                    if _lstm_info.get("lstm_status") == "COLLAPSED":
+                        logger.warning(
+                            "[LSTM] Collapsed output detected mid-session — "
+                            "disabling LSTM for the rest of this session. Retrain recommended."
+                        )
+                        lstm_classifier = None
+                    elif not _lstm_info["agreement"]:
                         logger.info(
                             "[LSTM] HMM=%d vs LSTM=%d (conf=%.2f, risk=%.2f) — %s",
                             hmm_state,
@@ -1251,6 +1280,12 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                             _lstm_info["lstm_confidence"],
                             _lstm_info["transition_risk"],
                             "TIGHTENING Z" if _lstm_info["transition_risk"] > 0.5 else "watching",
+                        )
+                    else:
+                        logger.debug(
+                            "[LSTM] HMM=%d LSTM=%d agree (conf=%.2f, risk=%.2f)",
+                            hmm_state, _lstm_info["lstm_state"],
+                            _lstm_info["lstm_confidence"], _lstm_info["transition_risk"],
                         )
                     if _lstm_info["transition_risk"] > 0.5:
                         # TIGHTEN — regime instability detected
