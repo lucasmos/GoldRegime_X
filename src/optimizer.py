@@ -46,7 +46,7 @@ def _study_db(broker: str) -> str:
 # TF-specific hard floor: trials below these counts return -50.0 immediately.
 # They produce statistically meaningless RF/PF ratios (10 trades → RF=20 by chance)
 # and pollute the surrogate model, biasing future sampling toward "tiny trade" configs.
-MIN_OOS_TRADES_HARD = {"M5": 60, "M15": 30, "H1": 20}
+MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 30, "H1": 20}
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
 PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
