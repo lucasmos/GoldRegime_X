@@ -59,9 +59,13 @@ _TF_CUTOFF_OVERRIDES: Dict[str, Dict[str, Any]] = {
     "M5": {
         "Z_CUTOFF_BULL":     2.5,
         "Z_CUTOFF_BEAR":    -2.5,
-        "Z_CUTOFF_CHOP_MR": {2: 3.2, 3: 3.7},
+        # Calibrated to M5 Chop state probability distribution:
+        # state 2 mean≈0.483 std≈0.025 → max achievable Z ≈ 1.5
+        # state 3 mean≈0.494 std≈0.028 → max achievable Z ≈ 1.5
+        # Previous values {2:3.2, 3:3.7} were never reachable — MR never fired.
+        "Z_CUTOFF_CHOP_MR": {2: 1.2, 3: 1.5},
         "HIGH_VOL_ADJUSTMENT": 0.4,
-        "MIN_CHOP_BARS_FOR_MR": 4,
+        "MIN_CHOP_BARS_FOR_MR": 2,
     },
 }
 

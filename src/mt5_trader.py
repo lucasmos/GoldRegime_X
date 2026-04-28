@@ -1289,7 +1289,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 try:
                     _tcn_mult = tcn_classifier.predict_confidence(live_df)
                     if _tcn_mult is not None:
-                        _base_cut    = _z_cut if _z_cut else 2.5
+                        # Use the evaluator's already-configured TF-specific Z cutoff
+                        # as the base (respects _TF_CUTOFF_OVERRIDES + any Optuna tune).
+                        _base_cut = signal_evaluator.config["Z_CUTOFF_BULL"]
                         _eff_cut     = _base_cut * _tcn_mult
                         from src.signal_evaluator import SignalEvaluator as _SE
                         _active_evaluator = _SE(
