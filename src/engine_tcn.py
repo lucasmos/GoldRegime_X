@@ -15,9 +15,10 @@ Architecture:
     4 × dilated causal Conv1D layers (dilation 1, 2, 4, 8)
     GlobalAveragePooling → Dense(32) → sigmoid output
 
-Training target (profit-based):
-    1 if the next bar's direction matches the current HMM regime
-    0 otherwise
+Training target (regime-persistence):
+    1 if the HMM regime at (current_bar + forward_window) matches the current
+    regime — i.e. the regime is stable and the signal should be trusted.
+    0 if the regime has changed — i.e. the signal should be treated cautiously.
 """
 
 import gc
@@ -44,54 +45,29 @@ TCN_BASE_DIR  = Path("models/tcn")
 
 _INPUT_COLUMNS = [
     "log_return",
+    "kalman_return",
     "volatility",
-    "rsi_normalized",
+    "rsi",
+    "rsi_slope",
     "atr_normalized",
-    "volume_ratio",
-    "bb_position",
     "gmm_vol_cluster",
-    "dist_from_sma50",
+    "usdchf_log_return",
 ]
 
 
 # ── Feature helpers ────────────────────────────────────────────────────────────
 
 def _add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Compute TCN-specific derived columns on a copy of df.
+    """Ensure all _INPUT_COLUMNS are present on a copy of *df*.
 
-    Mirrors the identical helper that was previously in engine_lstm.py.
-    ``live_df`` from ``compute_live_features`` carries the raw OHLCV + computed
-    base columns; this function fills the remaining TCN input columns.
+    All eight input columns are native outputs of the processor pipeline
+    (log_return, kalman_return, volatility, rsi, rsi_slope, atr_normalized,
+    gmm_vol_cluster).  The only one that may be absent is usdchf_log_return
+    when the USDCHF master file was not available — fill with 0.0 in that case.
     """
     df = df.copy()
-
-    if "rsi" in df.columns:
-        df["rsi_normalized"] = df["rsi"] / 100.0
-    else:
-        df["rsi_normalized"] = 0.5
-
-    if "Volume" in df.columns:
-        vol_ma = df["Volume"].rolling(20, min_periods=1).mean()
-        df["volume_ratio"] = (
-            df["Volume"] / vol_ma.replace(0, np.nan).fillna(1)
-        ).clip(0.1, 5.0)
-    else:
-        df["volume_ratio"] = 1.0
-
-    if "Close" in df.columns:
-        ma     = df["Close"].rolling(20, min_periods=1).mean()
-        std    = df["Close"].rolling(20, min_periods=1).std().fillna(0)
-        bb_rng = (4 * std).replace(0, np.nan)
-        df["bb_position"] = (
-            (df["Close"] - (ma - 2 * std)) / bb_rng
-        ).clip(0, 1).fillna(0.5)
-
-        sma50 = df["Close"].rolling(50, min_periods=1).mean()
-        df["dist_from_sma50"] = ((df["Close"] - sma50) / sma50).fillna(0.0)
-    else:
-        df["bb_position"]    = 0.5
-        df["dist_from_sma50"] = 0.0
-
+    if "usdchf_log_return" not in df.columns:
+        df["usdchf_log_return"] = 0.0
     return df
 
 
@@ -191,80 +167,49 @@ class SignalConfidenceTCN:
         returns_series: pd.Series,
         forward_window: int = 5,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """Build (X, y) training pairs using forward-window trade outcomes.
+        """Build (X, y) training pairs using regime-persistence targets.
 
-        Target = 1 if a trade entered at the current bar (following the HMM
-        regime direction) would be profitable over the next *forward_window* bars.
+        Target = 1 if the HMM regime at bar (seq_end + forward_window) is the
+        same as the regime at bar seq_end (current decision point).
+
+        This maps directly to the TCN's output purpose:
+            multiplier < 1.0  (high confidence) → regime persists
+            multiplier > 1.0  (low confidence)  → regime is about to change
+
+        Regime persistence is a clean, learnable signal because:
+          - HMM self-transition probs are ≥ 0.65 by construction (optimizer gate)
+          - Sequential feature patterns (RSI trends, vol changes) genuinely
+            predict impending regime transitions
+          - Unlike raw price direction, state labels are deterministic not noisy
 
         Typical forward windows by TF:
-            H1:  5 bars  (~5 hours)
+            H1:  5 bars  (~5 hours  — half a trading session)
             M15: 12 bars (~3 hours)
             M5:  24 bars (~2 hours)
-
-        This produces a realistic, learnable target rather than single-bar
-        noise which has a ~50% accuracy ceiling.
         """
         feature_cols = [c for c in _INPUT_COLUMNS if c in features_df.columns]
-        if "Close" not in features_df.columns:
-            logger.warning(
-                "prepare_sequences: 'Close' column missing — "
-                "falling back to single-bar log-return targets."
-            )
-            # Fallback: original single-bar target
-            X, y = [], []
-            for i in range(len(features_df) - self.seq_len - 1):
-                seq           = features_df[feature_cols].iloc[i : i + self.seq_len].values
-                current_state = int(hmm_states.iloc[i + self.seq_len])
-                next_return   = float(returns_series.iloc[i + self.seq_len + 1])
-                if current_state == 0:
-                    target = 1 if next_return > 0 else 0
-                elif current_state == 1:
-                    target = 1 if next_return < 0 else 0
-                else:
-                    target = 1 if abs(next_return) < 0.003 else 0
-                X.append(seq)
-                y.append(target)
-            return np.array(X, dtype=np.float32), np.array(y, dtype=np.int32)
-
-        logger.info("Preparing sequences  forward_window=%d…", forward_window)
+        n = len(features_df)
+        _ = returns_series  # kept for API compatibility; not used with persistence target
         X: list = []
         y: list = []
-        skipped_neutral = 0
-        skipped_edge    = 0
+        skipped_edge = 0
 
-        close_arr = features_df["Close"].values
-        n = len(features_df)
+        logger.info("Preparing sequences  forward_window=%d…", forward_window)
 
         for i in range(n - self.seq_len - forward_window):
-            seq_end       = i + self.seq_len
-            current_state = int(hmm_states.iloc[seq_end])
+            seq_end = i + self.seq_len
 
             seq = features_df[feature_cols].iloc[i : seq_end].values
             if np.any(np.isnan(seq)) or np.any(np.isinf(seq)):
                 skipped_edge += 1
                 continue
 
-            # Forward return from the bar where the trade decision is made
-            entry_price   = close_arr[seq_end]
-            exit_price    = close_arr[seq_end + forward_window]
-            if entry_price == 0:
-                skipped_edge += 1
-                continue
-            fwd_return = (exit_price - entry_price) / entry_price
+            current_state = int(hmm_states.iloc[seq_end])
+            future_state  = int(hmm_states.iloc[seq_end + forward_window])
 
-            if current_state == 0:       # Bull → long
-                target = 1 if fwd_return >  0.001 else 0
-            elif current_state == 1:     # Bear → short
-                target = 1 if fwd_return < -0.001 else 0
-            else:                        # Chop → mean-reversion
-                bb_pos = features_df["bb_position"].iloc[seq_end]
-                if bb_pos < 0.30:        # near lower band — expect bounce
-                    target = 1 if fwd_return >  0.0005 else 0
-                elif bb_pos > 0.70:      # near upper band — expect fade
-                    target = 1 if fwd_return < -0.0005 else 0
-                else:
-                    skipped_neutral += 1
-                    continue
+            # 1 = regime persists (confidence high → relax Z cutoff)
+            # 0 = regime changes  (confidence low  → tighten Z cutoff)
+            target = 1 if future_state == current_state else 0
 
             X.append(seq)
             y.append(target)
@@ -272,27 +217,25 @@ class SignalConfidenceTCN:
         X_arr = np.array(X, dtype=np.float32)
         y_arr = np.array(y, dtype=np.int32)
 
-        n_total = len(y_arr)
-        n_pos   = int(np.sum(y_arr == 1))
-        n_neg   = n_total - n_pos
-        ratio   = max(n_pos, n_neg) / max(min(n_pos, n_neg), 1)
+        n_total  = len(y_arr)
+        n_stable = int(np.sum(y_arr == 1))
+        n_change = n_total - n_stable
+        ratio    = max(n_stable, n_change) / max(min(n_stable, n_change), 1)
 
         logger.info(
-            "Sequences prepared: %d samples  "
-            "(skipped %d neutral, %d edge)",
-            n_total, skipped_neutral, skipped_edge,
+            "Sequences prepared: %d samples  (skipped %d edge cases)",
+            n_total, skipped_edge,
         )
         logger.info(
-            "  Profitable: %d (%.1f%%)  Unprofitable: %d (%.1f%%)  "
+            "  Regime stable: %d (%.1f%%)  Regime changes: %d (%.1f%%)  "
             "Ratio: %.2f:1",
-            n_pos, 100 * n_pos / max(n_total, 1),
-            n_neg, 100 * n_neg / max(n_total, 1),
+            n_stable, 100 * n_stable / max(n_total, 1),
+            n_change, 100 * n_change / max(n_total, 1),
             ratio,
         )
-        if ratio > 3.0:
+        if ratio > 4.0:
             logger.warning(
-                "Severe class imbalance (%.1f:1) — consider adjusting "
-                "forward_window", ratio
+                "High class imbalance (%.1f:1) — class weights will compensate", ratio
             )
         return X_arr, y_arr
 
@@ -313,14 +256,16 @@ class SignalConfidenceTCN:
         # Ensure derived feature columns exist before building sequences
         features_df = _add_derived_features(features_df)
 
-        # Auto-select forward window based on approximate TF (by data size)
+        # Auto-select forward window based on approximate TF (by data size).
+        # Regime persistence windows: long enough to filter noise,
+        # short enough that the current feature sequence still has predictive power.
         n_bars = len(features_df)
         if n_bars > 200_000:          # M5
-            forward_window = 24
+            forward_window = 24       # ~2 hours
         elif n_bars > 80_000:         # M15
-            forward_window = 12
+            forward_window = 12       # ~3 hours
         else:                         # H1
-            forward_window = 5
+            forward_window = 5        # ~5 hours (half a session)
 
         logger.info("TCN training — %d bars  forward_window=%d", n_bars, forward_window)
 
@@ -387,11 +332,11 @@ class SignalConfidenceTCN:
         best_train_acc = float(history.history.get("accuracy", [0.5])[best_epoch - 1])
         baseline       = float(max(y.mean(), 1.0 - y.mean()))
 
-        logger.info("TCN training complete:")
+        logger.info("TCN training complete (regime-persistence target):")
         logger.info("  Best epoch:   %d", best_epoch)
         logger.info("  Train acc:    %.4f (%.1f%%)", best_train_acc, best_train_acc * 100)
         logger.info("  Val acc:      %.4f (%.1f%%)", best_val_acc,   best_val_acc   * 100)
-        logger.info("  Baseline:     %.4f (%.1f%%)", baseline,       baseline       * 100)
+        logger.info("  Baseline:     %.4f (%.1f%%) (majority class)", baseline, baseline * 100)
         logger.info(
             "  Improvement: %+.1f%% over baseline",
             (best_val_acc / baseline - 1) * 100,
@@ -408,8 +353,16 @@ class SignalConfidenceTCN:
         epochs: int       = 20,
         recent_years: int = 2,
     ):
-        """Fine-tune on recent data at a reduced learning rate."""
-        from sklearn.utils.class_weight import compute_class_weight
+        """Fine-tune on recent data at a reduced learning rate.
+
+        Recompiles the optimizer at a lower LR to reset Adam's momentum/variance
+        accumulators — prevents catastrophic forgetting on the first gradient step.
+        Class weights are intentionally omitted: the model already learned the base
+        distribution during full training; fine-tuning only needs to adapt, not
+        re-balance the output distribution.
+        """
+        from keras.optimizers import Adam
+        from keras.callbacks import EarlyStopping
 
         features_df = _add_derived_features(features_df)
         if recent_years:
@@ -439,18 +392,28 @@ class SignalConfidenceTCN:
             X.reshape(-1, X.shape[-1])
         ).reshape(X.shape).astype(np.float32)
 
-        unique_classes    = np.unique(y)
-        class_weights     = compute_class_weight("balanced", classes=unique_classes, y=y)
-        class_weight_dict = {int(c): float(w) for c, w in zip(unique_classes, class_weights)}
+        # Recompile with fresh Adam at low LR — resets momentum/variance accumulators
+        self.model.compile(
+            optimizer=Adam(learning_rate=1e-4),
+            loss="binary_crossentropy",
+            metrics=["accuracy"],
+        )
 
-        self.model.optimizer.learning_rate.assign(1e-4)
+        callbacks = [
+            EarlyStopping(
+                monitor="val_loss",
+                patience=5,
+                restore_best_weights=True,
+                min_delta=0.002,
+            ),
+        ]
 
         self.model.fit(
             X_scaled, y,
             epochs=epochs,
             batch_size=64,
             validation_split=0.2,
-            class_weight=class_weight_dict,
+            callbacks=callbacks,
             verbose=1,
         )
 

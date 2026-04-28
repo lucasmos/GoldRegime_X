@@ -114,22 +114,34 @@ class TCNMaintenanceScheduler:
     # ── Retraining ────────────────────────────────────────────────────────────
 
     def trigger_retraining(self, tf: str) -> bool:
-        """Launch TCN fine-tune for *tf* as a non-blocking background process."""
-        # TF-specific epoch counts — H1 benefits from more epochs due to less data
-        tf_epochs = {"H1": 30, "M15": 20, "M5": 15}
-        epochs = tf_epochs.get(tf.upper(), 20)
+        """Launch TCN retraining for *tf* as a non-blocking background process.
+
+        Uses fine-tune mode (low LR, recent 2 years) when a model already exists;
+        falls back to a full train when the model is missing so the subprocess
+        doesn't immediately fail with "No existing TCN model to fine-tune".
+        """
+        model_dir = Path(f"models/tcn/{tf.upper()}_{self.broker}")
+        model_exists = (model_dir / "tcn_confidence_model.keras").exists()
+
+        # TF-specific epoch counts
+        if model_exists:
+            tf_epochs = {"H1": 30, "M15": 20, "M5": 15}
+        else:
+            # Full train needs more epochs
+            tf_epochs = {"H1": 100, "M15": 100, "M5": 80}
+        epochs = tf_epochs.get(tf.upper(), 80)
 
         cmd = [
             sys.executable, "main.py",
-            "--mode",         "train_tcn",
-            "--tf",           tf.upper(),
-            "--broker",       self.broker,
-            "--balance",      str(self.balance),
-            "--epochs",       str(epochs),
-            "--fine_tune",
-            "--recent_years", "2",
-            "--temperature",  "1.5",
+            "--mode",        "train_tcn",
+            "--tf",          tf.upper(),
+            "--broker",      self.broker,
+            "--balance",     str(self.balance),
+            "--epochs",      str(epochs),
+            "--temperature", "1.5",
         ]
+        if model_exists:
+            cmd += ["--fine_tune", "--recent_years", "2"]
         logger.info("Auto-retraining TCN [%s]: %s", tf, " ".join(cmd))
         try:
             subprocess.Popen(

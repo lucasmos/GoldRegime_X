@@ -1099,6 +1099,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             len(_ea_conflict), magic,
         )
 
+    # Pre-seed the Bollinger Band close-price cache from MT5 history so BB
+    # is live from bar 1 instead of returning the neutral 0.5 fallback for
+    # the first 20 hours of every session.
+    try:
+        _seed_rates = mt5.copy_rates_from_pos(DEFAULT_SYMBOL, tf_mt5, 1, 50)
+        if _seed_rates is not None and len(_seed_rates) > 0:
+            close_prices_cache = [float(r["close"]) for r in _seed_rates]
+            logger.info("BB cache pre-seeded: %d historical closes loaded.", len(close_prices_cache))
+    except Exception as _seed_exc:
+        logger.debug("BB cache pre-seed failed (non-critical): %s", _seed_exc)
+
     while True:
         try:
             # ── 1. Daily reset at UTC midnight ────────────────────────────
