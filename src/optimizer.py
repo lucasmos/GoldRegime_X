@@ -147,15 +147,15 @@ def compute_purged_ts_score(
                 hmm_transmat=model_is.transmat_,
             )
 
-            fold_n = fold_result.get("oos_n_trades", 0)
+            fold_n = fold_result.get("n_trades", 0)
             _hard_floor = max(MIN_OOS_TRADES_HARD.get(tf.upper(), 10) // 3, 5)
             if fold_n < _hard_floor:
                 fold_scores.append(None)
                 continue
 
-            rf = min(fold_result.get("oos_recovery_factor", 0.0), 5.0)
-            pf = min(fold_result.get("oos_profit_factor", 0.0), 3.0)
-            sharpe = fold_result.get("oos_sharpe_ratio", 0.0)
+            rf = min(fold_result.get("recovery_factor", 0.0), 5.0)
+            pf = min(fold_result.get("profit_factor", 1.0), 3.0)
+            sharpe = fold_result.get("sharpe_ratio", 0.0)
             fold_scores.append(float(rf * 0.4 + pf * 0.3 + sharpe * 0.3))
 
         except Exception as exc:
