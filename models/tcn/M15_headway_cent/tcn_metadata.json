@@ -1,7 +1,0 @@
-{
-  "seq_len": 80,
-  "n_features": 8,
-  "n_states": 4,
-  "temperature": 1.5,
-  "trained_at": "2026-04-28T05:29:48.748388+00:00"
-}

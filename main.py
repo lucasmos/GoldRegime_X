@@ -638,6 +638,9 @@ def cmd_demo(args):
     )
     run_live_loop(tf=tf, broker=args.broker, account_size=balance,
                   profit_target=getattr(args, "profit_target", None))
+
+
+def cmd_live(args):
     """Connect to MT5 live account and start the live signal execution loop."""
     from src.mt5_trader import run_live_loop
 
