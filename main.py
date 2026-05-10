@@ -6,6 +6,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+# Force UTF-8 output on Windows so emoji/em-dash in log lines don't crash the terminal
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Load .env for Telegram credentials (silently ignored if python-dotenv not installed)
 try:
     from dotenv import load_dotenv
@@ -576,9 +582,9 @@ def cmd_sync_validate(args):
         f" | Total Payout: {_payout}"
     )
     if _eff < 1.2:
-        print("  ⚠️  WARNING: Low Market Efficiency — Spread is eating your edge.")
+        print("  [!] WARNING: Low Market Efficiency — Spread is eating your edge.")
     if _cost_e < 0.50:
-        print(f"  ⚠️  WARNING: Broker is consuming >{(1-_cost_e)*100:.0f}% of gross profit.")
+        print(f"  [!] WARNING: Broker is consuming >{(1-_cost_e)*100:.0f}% of gross profit.")
     print(f"  Sharpe: {result['sharpe']:.3f} | Trades: {result['n_trades']} | WR: {result['win_rate']*100:.1f}%")
     print(f"  Status: {result['status'].upper()}")
     print(f"  {result['message']}")
