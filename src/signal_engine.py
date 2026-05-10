@@ -19,7 +19,10 @@ MIN_CHOP_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 # FIRST bar of any regime change → 1-bar trades → spread dominates → WR ~25%.
 MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
 
-# XGBoost probability threshold for trend and MR entries
+# XGBoost probability threshold for trend and MR entries.
+# Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
+# direction), so only the highest-confidence bars have real signal.  Allowing
+# lower thresholds floods the engine with noise trades and destroys performance.
 ENTRY_PROB    = {"H1": 0.58, "M15": 0.55, "M5": 0.52}
 MR_ENTRY_PROB = {"H1": 0.55, "M15": 0.52, "M5": 0.50}
 

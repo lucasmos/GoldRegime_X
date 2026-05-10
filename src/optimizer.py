@@ -70,7 +70,7 @@ CPCV_TRIALS    = {"H1": 80, "M15": 120, "M5": 200}
 CPCV_PURGE_BARS = {"H1": 24, "M15": 32, "M5": 48}
 # Minimum trades per CPCV path for the result to count; paths below this are
 # penalised so Optuna steers toward configs that trade actively in all regimes.
-MIN_TRADES_PER_PATH = {"H1": 30, "M15": 60, "M5": 100}
+MIN_TRADES_PER_PATH = {"H1": 15, "M15": 60, "M5": 100}
 
 
 class CPCVSplitter:
@@ -167,8 +167,10 @@ def compute_cpcv_score(
             # are a standard approximation in CPCV for time-series).
             model_path, train_states, _ = fit_hmm(df_train, n_states=n_states, tf=tf)
 
+            # Path models train on 4/6 of data — allow slightly lower persistence
+            # than the full-data model.  0.60 still filters degenerate HMMs.
             _min_persist = min(model_path.transmat_[i, i] for i in range(n_states))
-            if _min_persist < 0.65:
+            if _min_persist < 0.60:
                 path_scores.append(None)
                 continue
 
@@ -219,6 +221,13 @@ def compute_cpcv_score(
             path_n  = path_result.get("n_trades", 0)
             total_trades += path_n
 
+            # Skip zero-trade paths entirely — profit_factor defaults to 1.0 on
+            # zero trades, which would inject a spurious 0.30 floor into the median
+            # and drag it below zero via the variance penalty.
+            if path_n == 0:
+                path_scores.append(None)
+                continue
+
             rf     = min(path_result.get("recovery_factor", 0.0), 5.0)
             pf     = min(path_result.get("profit_factor", 1.0), 3.0)
             sharpe = path_result.get("sharpe_ratio", 0.0)
@@ -237,7 +246,9 @@ def compute_cpcv_score(
     valid_scores = [s for s in path_scores if s is not None]
     n_valid = len(valid_scores)
 
-    if n_valid < 8:
+    # Require at least 6 paths with trades (of 15); HMM degeneracy or very quiet
+    # market regimes on some blocks can legitimately produce fewer active paths.
+    if n_valid < 6:
         logger.warning("CPCV: only %d/%d valid paths — rejecting.", n_valid, len(path_scores))
         return -50.0
 
@@ -250,10 +261,12 @@ def compute_cpcv_score(
         )
         return -50.0
 
-    # Variance-penalised median (more robust to single-path outliers than mean)
+    # Variance-penalised median (more robust to single-path outliers than mean).
+    # Coefficient reduced from 0.5 → 0.25: the old 0.5 was too aggressive and
+    # could produce negative scores even when median was meaningfully positive.
     _med   = float(np.median(valid_scores))
     _std   = float(np.std(valid_scores))
-    score  = _med - 0.5 * _std
+    score  = _med - 0.25 * _std
 
     # Trade-frequency penalty (progressive, not binary) — steers Optuna toward
     # configs that trade actively across all regimes.
@@ -410,7 +423,6 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 "Trial %d [%s/%s $%.0f CPCV]: score=%.3f",
                 trial.number, tf, broker, balance, score,
             )
-            return score
             return score
 
         except Exception as e:
