@@ -127,7 +127,7 @@ def _read_asset_csv(f: Path) -> pd.DataFrame | None:
             return None
 
         # Normal file with header row — try several date formats
-        for fmt in ["%m/%d/%Y", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d", None]:
+        for fmt in ["%m/%d/%Y", "%d/%m/%Y %H:%M", "%d/%m/%Y", "%Y.%m.%d %H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d", None]:
             try:
                 kwargs: dict = dict(sep=sep, parse_dates=["Date"])
                 if fmt:
