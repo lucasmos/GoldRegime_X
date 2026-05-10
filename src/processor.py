@@ -233,7 +233,8 @@ def map_asset_to_bars(
     df_index: pd.DatetimeIndex,
     asset_df: pd.DataFrame,
     col_name: str,
-) -> pd.Series:
+    return_raw: bool = False,
+) -> "pd.Series | tuple[pd.Series, pd.Series]":
     """Align any asset log-return series onto XAUUSD bar timestamps.
 
     Generic version of the old ``map_usdchf_to_bars``.  Handles both daily
@@ -241,12 +242,17 @@ def map_asset_to_bars(
     (intraday).
 
     Args:
-        df_index:  DatetimeIndex of XAUUSD bars to align onto.
-        asset_df:  Single-column DataFrame from ``load_asset_data``.
-        col_name:  Column name in *asset_df* (e.g. ``"xagusd_log_return"``).
+        df_index:   DatetimeIndex of XAUUSD bars to align onto.
+        asset_df:   Single-column DataFrame from ``load_asset_data``.
+        col_name:   Column name in *asset_df* (e.g. ``"xagusd_log_return"``).
+        return_raw: When True, return ``(ffilled_series, raw_before_ffill)``.
+                    The raw series has NaN wherever the asset had no bar at that
+                    timestamp — use it for staleness counting.  Default False
+                    returns only the ffilled series (backwards-compatible).
 
     Returns:
-        pd.Series indexed by *df_index* with name *col_name*.
+        Single ffilled Series (return_raw=False) or
+        tuple (ffilled_series, raw_series) (return_raw=True).
     """
     series = asset_df[col_name].copy()
     idx = df_index.tz_localize(None) if df_index.tz is not None else df_index
@@ -262,7 +268,10 @@ def map_asset_to_bars(
             )
             series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
         series = series.ffill()
-        return pd.Series(normalized.map(series).values, index=df_index, name=col_name)
+        result = pd.Series(normalized.map(series).values, index=df_index, name=col_name)
+        if return_raw:
+            return result, result  # daily: no intrabar gaps, staleness always 0
+        return result
     else:
         _series = series.copy()
         try:
@@ -270,8 +279,13 @@ def map_asset_to_bars(
             _idx = idx.as_unit("ns")
         except AttributeError:
             _idx = idx
-        values = _series.reindex(_idx, method="ffill")
-        return pd.Series(values.values, index=df_index, name=col_name)
+        raw     = _series.reindex(_idx)          # NaN where asset has no bar
+        ffilled = raw.ffill()
+        raw_out   = pd.Series(raw.values,    index=df_index, name=col_name)
+        ffill_out = pd.Series(ffilled.values, index=df_index, name=col_name)
+        if return_raw:
+            return ffill_out, raw_out
+        return ffill_out
 
 
 def _compute_staleness(raw_series: pd.Series, col_name: str) -> pd.Series:
@@ -517,9 +531,9 @@ def process_pipeline(
         path      = path_by_tf.get(tf, path_by_tf.get("H1"))
         asset_df  = load_asset_data(path, col_name)
         if asset_df is not None:
-            raw_series  = map_asset_to_bars(df.index, asset_df, col_name)
+            ffilled_series, raw_series = map_asset_to_bars(df.index, asset_df, col_name, return_raw=True)
             df[f"{asset_key}_staleness"] = _compute_staleness(raw_series, col_name)
-            df[col_name] = raw_series
+            df[col_name] = ffilled_series
             n_valid = df[col_name].notna().sum()
             logger.info(
                 "%s [%s] merged: %d non-null %s values.",
