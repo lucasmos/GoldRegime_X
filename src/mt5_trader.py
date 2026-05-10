@@ -25,6 +25,8 @@ from src.processor import (
     TF_CONFIG,
     USDCHF_MASTER_PATH,
     load_usdchf_data,
+    load_asset_data,
+    _EXTERNAL_ASSET_PATHS,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
@@ -167,24 +169,28 @@ def calculate_tp_sl(
 
 # Lazy MT5 timeframe map
 
-# ── USDCHF fallback cache ─────────────────────────────────────────────────────
-# When the live USDCHF bar fetch fails (e.g. symbol not subscribed), carry the
-# last known return from the master CSV — far better than assuming 0.0.
-_USDCHF_FALLBACK_CACHE: float | None = None
+# ── External asset fallback cache ─────────────────────────────────────────────
+# When a live MT5 bar fetch fails (e.g. symbol not subscribed), carry the last
+# known log return from the master CSV.  Keyed by "{col_name}_{tf}".
+_ASSET_FALLBACK_CACHE: dict[str, float] = {}
 
-def _get_usdchf_fallback() -> float:
-    """Return the last known USDCHF log return from the master CSV (cached)."""
-    global _USDCHF_FALLBACK_CACHE
-    if _USDCHF_FALLBACK_CACHE is None:
+def _get_asset_fallback(col_name: str, tf: str = "H1") -> float:
+    """Return the last known log return from the master CSV for *col_name* (cached)."""
+    key = f"{col_name}_{tf}"
+    if key not in _ASSET_FALLBACK_CACHE:
+        asset_key = col_name.replace("_log_return", "")
+        path_by_tf = _EXTERNAL_ASSET_PATHS.get(asset_key, {})
+        path = path_by_tf.get(tf.upper())
         try:
-            usdchf_df = load_usdchf_data(USDCHF_MASTER_PATH)
-            if usdchf_df is not None:
-                _USDCHF_FALLBACK_CACHE = float(usdchf_df["usdchf_log_return"].dropna().iloc[-1])
-            else:
-                _USDCHF_FALLBACK_CACHE = 0.0
+            if path and path.exists():
+                asset_df = load_asset_data(path, col_name)
+                if asset_df is not None and not asset_df.empty:
+                    _ASSET_FALLBACK_CACHE[key] = float(asset_df[col_name].dropna().iloc[-1])
+                    return _ASSET_FALLBACK_CACHE[key]
         except Exception:
-            _USDCHF_FALLBACK_CACHE = 0.0
-    return _USDCHF_FALLBACK_CACHE
+            pass
+        _ASSET_FALLBACK_CACHE[key] = 0.0
+    return _ASSET_FALLBACK_CACHE[key]
 _MT5_TF_MAP: dict | None = None
 
 
@@ -317,14 +323,13 @@ def check_margin(symbol: str, lot: float, order_type: int, price: float) -> bool
 # Signal derivation
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _fetch_usdchf_log_return(tf_mt5: int, mt5) -> float | None:
-    """Fetch the most recently completed USDCHF bar log return for live inference.
+def _fetch_asset_log_return(symbol: str, tf_mt5: int, mt5) -> float | None:
+    """Fetch the most recently completed bar log return for *symbol* from MT5.
 
-    USDCHF is always available on Headway as a standard Forex pair — unlike
-    DXY/USDX which many brokers don't carry.  Returns ``None`` only if the
-    data call fails (symbol not subscribed, no recent bars, etc.).
+    Works for any symbol available on the broker (USDCHF, XAGUSD, US500, etc.).
+    Returns ``None`` only if the data call fails (symbol not subscribed, etc.).
     """
-    rates = mt5.copy_rates_from_pos("USDCHF", tf_mt5, 1, 3)   # 3 completed bars
+    rates = mt5.copy_rates_from_pos(symbol, tf_mt5, 1, 3)   # 3 completed bars
     if rates is None or len(rates) < 2:
         return None
     closes = [r["close"] for r in rates]
@@ -735,11 +740,11 @@ def compute_live_features(
 
     if "usdchf_log_return" in feature_cols:
         if mt5 is not None:
-            usdchf_ret = _fetch_usdchf_log_return(tf_mt5, mt5)
+            usdchf_ret = _fetch_asset_log_return("USDCHF", tf_mt5, mt5)
         else:
             usdchf_ret = None
         if usdchf_ret is None:
-            usdchf_ret = _get_usdchf_fallback()
+            usdchf_ret = _get_asset_fallback("usdchf_log_return", tf)
             logger.warning(
                 "USDCHF live fetch failed — falling back to last value in "
                 "USDCHF_master.csv (%.6f).  This value is STALE (CSV ends "
@@ -751,6 +756,27 @@ def compute_live_features(
         else:
             logger.debug("USDCHF live return: %.6f (source: MT5 bar)", usdchf_ret)
         feature_dict["usdchf_log_return"] = usdchf_ret
+
+    # ── Additional external assets (XAGUSD, XTIUSD, US500, USDJPY) ───────────
+    _OTHER_ASSET_COLS = {
+        "xagusd_log_return": "XAGUSD",
+        "xtiusd_log_return": "XTIUSD",
+        "us500_log_return":  "US500",
+        "usdjpy_log_return": "USDJPY",
+    }
+    for col_name, symbol in _OTHER_ASSET_COLS.items():
+        if col_name not in feature_cols:
+            continue
+        ret = _fetch_asset_log_return(symbol, tf_mt5, mt5) if mt5 is not None else None
+        if ret is None:
+            ret = _get_asset_fallback(col_name, tf)
+            logger.warning(
+                "%s live fetch failed — using fallback %.6f from master CSV.",
+                symbol, ret,
+            )
+        else:
+            logger.debug("%s live return: %.6f", symbol, ret)
+        feature_dict[col_name] = ret
 
     if "gmm_vol_cluster" in feature_cols:
         try:

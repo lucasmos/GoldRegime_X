@@ -21,6 +21,7 @@ from itertools import combinations
 
 import numpy as np
 import optuna
+from sklearn.model_selection import TimeSeriesSplit
 
 from src.processor import process_pipeline
 from src.engine_hmm import fit_hmm, predict_states
@@ -52,12 +53,30 @@ def _study_db(broker: str) -> str:
 # and pollute the surrogate model, biasing future sampling toward "tiny trade" configs.
 MIN_OOS_TRADES_HARD = {"M5": 120, "M15": 30, "H1": 20}
 MAX_FLOAT_DD    = 0.20   # 20% floating drawdown hard cap — terminal for $15 account
+CPCV_MAX_FLOAT_DD = 0.20 # 20% cap for CPCV paths (2/5 of data — single volatile chunk can exceed 20%)
 PAYOFF_FLOOR_USD = 0.035 # $0.035 minimum average edge per trade — covers spread + gives real alpha
 RAM_HIGH_PCT    = 90     # pause new trials when used RAM exceeds this %
 RAM_PAUSE_SEC   = 30     # seconds to sleep when RAM is low
 # TF-specific progressive penalty thresholds — trades below these earn score × 0.1
 TF_MIN_OOS_TRADES = {"H1": 25, "M15": 140, "M5": 350}
 
+# ── Rolling Walk-Forward Optimization parameters ──────────────────────────────
+# IS_BARS:      In-sample window (1 year of bars per TF).
+# OOS_BARS:     Out-of-sample segment (90 days per TF).
+# EMBARGO_BARS: Gap between IS end and OOS start (1 day of bars per TF).
+# STEP_BARS:    Slide amount per iteration (= OOS_BARS for non-overlapping OOS).
+# Expected windows for 10-year H1 dataset (~58K bars):
+#   (58406 − 8760) / 2160 ≈ 23 rolling windows
+WFO_PARAMS = {
+    "H1":  {"is_bars": 8760,   "oos_bars": 2160,  "embargo_bars": 24,  "step_bars": 2160},
+    "M15": {"is_bars": 35040,  "oos_bars": 8640,  "embargo_bars": 96,  "step_bars": 8640},
+    "M5":  {"is_bars": 105120, "oos_bars": 25920, "embargo_bars": 288, "step_bars": 25920},
+}
+# Outer Optuna trial counts for WFO (each trial runs all WFO windows).
+# Lower than CPCV because each WFO trial is computationally heavier.
+WFO_TRIALS = {"H1": 50, "M15": 80, "M5": 100}
+
+# Retained for legacy reference / compare runs — new code uses WFO
 # ── CPCV parameters ──────────────────────────────────────────────────────────
 # N_SPLITS: number of time-ordered folds.
 # N_TEST_SPLITS: folds forming each OOS test path (López de Prado recommends k=2).
@@ -341,11 +360,14 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
 
 
 def _make_cpcv_paths(n: int, n_splits: int, n_test_splits: int):
-    """Return a list of (train_indices, test_indices) tuples for CPCV.
+    """Return a list of (train_indices, test_indices, test_fold_arrays) tuples for CPCV.
 
     Each element is one backtest *path*.  train_indices is the union of all
     non-test fold bar positions (embargo applied later by the caller).
     test_indices is the union of the n_test_splits test fold bar positions.
+    test_fold_arrays is the list of individual per-fold index arrays so the caller
+    can apply embargo around EACH fold boundary independently (required for
+    non-contiguous test-fold combinations such as folds 0+4).
 
     For n_splits=5, n_test_splits=2 this produces C(5,2)=10 paths.
     """
@@ -358,11 +380,12 @@ def _make_cpcv_paths(n: int, n_splits: int, n_test_splits: int):
 
     paths = []
     for test_combo in itertools.combinations(range(n_splits), n_test_splits):
-        test_folds  = set(test_combo)
-        train_folds = [i for i in range(n_splits) if i not in test_folds]
-        test_idx    = np.concatenate([folds[i] for i in sorted(test_combo)])
-        train_idx   = np.concatenate([folds[i] for i in train_folds])
-        paths.append((train_idx, test_idx))
+        test_folds        = set(test_combo)
+        train_folds       = [i for i in range(n_splits) if i not in test_folds]
+        test_idx          = np.concatenate([folds[i] for i in sorted(test_combo)])
+        train_idx         = np.concatenate([folds[i] for i in train_folds])
+        individual_folds  = [folds[i] for i in sorted(test_combo)]
+        paths.append((train_idx, test_idx, individual_folds))
 
     return paths
 
@@ -377,6 +400,7 @@ def _run_cpcv(
     n_splits: int,
     n_test_splits: int,
     embargo_bars: int,
+    hmm_transmat: np.ndarray = None,
 ) -> dict:
     """Run CPCV and return aggregate statistics across all backtest paths.
 
@@ -411,19 +435,24 @@ def _run_cpcv(
     n_valid_paths = 0
     min_trades    = MIN_OOS_TRADES_HARD.get(tf.upper(), 10)
 
-    for train_raw, test_raw in paths:
+    for train_raw, test_raw, test_fold_arrays in paths:
         if len(test_raw) == 0 or len(train_raw) == 0:
             continue
 
-        test_start = int(test_raw[0])
-        test_end   = int(test_raw[-1])
-
-        # Purge: remove train bars within embargo_bars of EITHER edge of the
-        # test window.  Eliminates both look-ahead and look-back contamination.
-        purged_train = train_raw[
-            (train_raw < test_start - embargo_bars) |
-            (train_raw > test_end   + embargo_bars)
-        ]
+        # Purge training bars near EACH individual test-fold boundary.
+        # Span-based purge (test_raw[0]…test_raw[-1]) falsely eliminates ALL
+        # training data for non-contiguous combos like folds (0, 4) because the
+        # span covers the entire dataset.  Per-fold boundary purge keeps every
+        # training bar that is outside the embargo window of every test fold.
+        purged_train_mask = np.ones(len(train_raw), dtype=bool)
+        for fold_arr in test_fold_arrays:
+            fold_start = int(fold_arr[0])
+            fold_end   = int(fold_arr[-1])
+            purged_train_mask &= (
+                (train_raw < fold_start - embargo_bars) |
+                (train_raw > fold_end   + embargo_bars)
+            )
+        purged_train = train_raw[purged_train_mask]
 
         if len(purged_train) < 500:
             continue
@@ -479,6 +508,7 @@ def _run_cpcv(
                 account_size=balance,
                 broker=broker,
                 tf=tf,
+                hmm_transmat=hmm_transmat,
                 regime_stats=regime_stats_path,
             )
         except Exception as exc:
@@ -489,7 +519,7 @@ def _run_cpcv(
         fdd      = result_path.get("floating_max_drawdown",
                                    result_path.get("max_drawdown", 0.0))
 
-        if n_trades < min_trades or fdd > MAX_FLOAT_DD:
+        if n_trades < min_trades or fdd > CPCV_MAX_FLOAT_DD:
             path_scores.append(-50.0)
             path_sharpes.append(result_path.get("sharpe_ratio", -10.0))
             path_trades.append(n_trades)
@@ -535,10 +565,204 @@ def _run_cpcv(
     }
 
 
+def _run_wfo(
+    df,
+    states: np.ndarray,
+    tf: str,
+    balance: float,
+    broker: str,
+    xgb_kwargs: dict,
+    is_bars: int,
+    oos_bars: int,
+    embargo_bars: int,
+    step_bars: int,
+    hmm_transmat: np.ndarray = None,
+) -> dict:
+    """Rolling Walk-Forward Optimization — evaluate hyperparams across time windows.
+
+    For each non-overlapping OOS window (slides by *step_bars* until data runs out):
+      1. IS = [start … start+is_bars);  OOS = [start+is_bars+embargo … +oos_bars)
+      2. TimeSeriesSplit(n_splits=2) on IS data for within-IS consistency check.
+      3. Train final XGBoost ensemble on full IS, backtest OOS, score with Complex Criterion.
+      4. Window score = OOS Complex Criterion; penalise if IS CV is inconsistent.
+
+    The HMM is fitted ONCE per trial on the full dataset (passed as *states*)
+    so every window gets coherent regime labels without refitting the HMM
+    per window (which would multiply wall time by the number of windows).
+
+    Returns dict with keys:
+        wfo_score       — variance-penalised median OOS Complex Criterion
+        n_windows       — total windows attempted
+        n_valid_windows — windows with enough OOS trades (not penalised)
+        median_trades   — median OOS trade count
+        std_sharpe      — std of OOS Sharpe (consistency diagnostic)
+        window_scores   — list of per-window OOS Complex Criterion scores
+        wfe_ratio       — mean(OOS Sharpe) / mean(IS CV Sharpe) [walk-forward efficiency]
+    """
+    n = len(df)
+    X_full, y_full, df_aligned, _ = prepare_features(df, states, tf=tf)
+    states_aligned = states[df.index.isin(df_aligned.index)]
+    aligned_idx    = df_aligned.index
+
+    window_scores:   list[float] = []
+    window_sharpes:  list[float] = []
+    is_cv_sharpes:   list[float] = []
+    window_trades:   list[int]   = []
+    n_valid_windows: int         = 0
+    min_trades_hard  = MIN_OOS_TRADES_HARD.get(tf.upper(), 10)
+
+    start = 0
+    while start + is_bars + oos_bars + embargo_bars <= n:
+        is_end     = start + is_bars
+        oos_start  = is_end + embargo_bars
+        oos_end    = oos_start + oos_bars
+
+        # Map integer positions → timestamps via the full (unfiltered) df index
+        is_ts  = df.index[start:is_end]
+        oos_ts = df.index[oos_start:min(oos_end, n)]
+
+        if len(oos_ts) < oos_bars // 2:
+            break  # not enough OOS bars left
+
+        X_is  = X_full[X_full.index.isin(is_ts)]
+        y_is  = y_full[y_full.index.isin(is_ts)]
+        X_oos = X_full[X_full.index.isin(oos_ts)]
+
+        if len(X_is) < 500 or len(X_oos) < 50:
+            start += step_bars
+            continue
+
+        # ── Inner IS cross-validation (2 folds) for consistency check ────────
+        tscv = TimeSeriesSplit(n_splits=2)
+        _cv_sharpes: list[float] = []
+        for _train_idx, _val_idx in tscv.split(X_is):
+            X_cv_train = X_is.iloc[_train_idx]
+            y_cv_train = y_is.iloc[_train_idx]
+            X_cv_val   = X_is.iloc[_val_idx]
+            if len(X_cv_train) < 200 or len(X_cv_val) < 50:
+                continue
+            try:
+                _models, _thresh, _ = train_xgb_ensemble(
+                    X_cv_train, y_cv_train, train_ratio=1.0, **xgb_kwargs
+                )
+                _, _probs = get_predictions_ensemble(_models, _thresh, X_cv_val)
+                _val_ts    = X_cv_val.index
+                _val_df    = df_aligned[aligned_idx.isin(_val_ts)]
+                _val_st    = states_aligned[aligned_idx.isin(_val_ts)]
+                if len(_val_df) < 20:
+                    continue
+                _cv_res = vectorized_backtest(
+                    _val_df, _probs, _val_st,
+                    split_idx=None, account_size=balance, broker=broker, tf=tf,
+                    hmm_transmat=hmm_transmat,
+                )
+                _cv_sharpes.append(_cv_res.get("sharpe_ratio", 0.0))
+            except Exception:
+                pass
+
+        mean_cv_sharpe = float(np.mean(_cv_sharpes)) if _cv_sharpes else 0.0
+        is_cv_sharpes.append(mean_cv_sharpe)
+
+        # ── Final model on full IS + OOS backtest ─────────────────────────────
+        try:
+            models_w, thresh_w, _ = train_xgb_ensemble(
+                X_is, y_is, train_ratio=1.0, **xgb_kwargs
+            )
+        except Exception as exc:
+            logger.debug("WFO window train failed: %s", exc)
+            start += step_bars
+            continue
+
+        _, probs_oos = get_predictions_ensemble(models_w, thresh_w, X_oos)
+
+        oos_df = df_aligned[aligned_idx.isin(oos_ts)]
+        oos_st = states_aligned[aligned_idx.isin(oos_ts)]
+
+        if len(oos_df) < 20 or len(probs_oos) != len(oos_df):
+            start += step_bars
+            continue
+
+        try:
+            oos_result = vectorized_backtest(
+                oos_df, probs_oos, oos_st,
+                split_idx=None, account_size=balance, broker=broker, tf=tf,
+                hmm_transmat=hmm_transmat,
+            )
+        except Exception as exc:
+            logger.debug("WFO window backtest failed: %s", exc)
+            start += step_bars
+            continue
+
+        n_trades = oos_result.get("n_trades", 0)
+        fdd      = oos_result.get("floating_max_drawdown",
+                                   oos_result.get("max_drawdown", 0.0))
+        oos_sharpe = oos_result.get("sharpe_ratio", 0.0)
+
+        if n_trades < min_trades_hard or fdd > CPCV_MAX_FLOAT_DD:
+            score = -50.0
+        else:
+            n_valid_windows += 1
+            score = _score_result(oos_result, broker=broker, tf=tf)
+            # Penalise when IS CV Sharpe is deeply negative (overfit to noise)
+            if mean_cv_sharpe < -1.0:
+                score *= 0.5
+
+        window_scores.append(score)
+        window_sharpes.append(oos_sharpe)
+        window_trades.append(n_trades)
+        logger.debug(
+            "WFO [%s] window start=%d: OOS_trades=%d OOS_Sharpe=%.3f "
+            "IS_CV_Sharpe=%.3f score=%.3f",
+            tf, start, n_trades, oos_sharpe, mean_cv_sharpe, score,
+        )
+        start += step_bars
+
+    if not window_scores:
+        return {
+            "wfo_score":        -100.0,
+            "n_windows":        0,
+            "n_valid_windows":  0,
+            "median_trades":    0,
+            "std_sharpe":       0.0,
+            "window_scores":    [],
+            "wfe_ratio":        0.0,
+        }
+
+    wfo_score     = float(np.median(window_scores)) - 0.25 * float(np.std(window_scores))
+    std_sharpe    = float(np.std(window_sharpes))
+    median_trades = int(np.median(window_trades))
+
+    mean_oos_sharpe = float(np.mean(window_sharpes))
+    mean_is_sharpe  = float(np.mean(is_cv_sharpes)) if is_cv_sharpes else 0.0
+    wfe_ratio = (mean_oos_sharpe / max(abs(mean_is_sharpe), 0.01)) if mean_is_sharpe != 0 else 0.0
+
+    # Consistency bonus when every valid window beats the floor
+    valid_sc = [s for s in window_scores if s > -50.0]
+    if valid_sc and all(s > 0.30 for s in valid_sc):
+        wfo_score *= 1.05
+
+    logger.info(
+        "WFO [%s]: %d/%d valid windows | median_trades=%d | "
+        "wfo_score=%.3f | std_sharpe=%.3f | WFE=%.2f | window_scores=%s",
+        tf, n_valid_windows, len(window_scores), median_trades,
+        wfo_score, std_sharpe, wfe_ratio,
+        [round(s, 3) for s in window_scores],
+    )
+    return {
+        "wfo_score":        wfo_score,
+        "n_windows":        len(window_scores),
+        "n_valid_windows":  n_valid_windows,
+        "median_trades":    median_trades,
+        "std_sharpe":       std_sharpe,
+        "window_scores":    window_scores,
+        "wfe_ratio":        wfe_ratio,
+    }
+
+
 def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H1"):
     """Return an Optuna objective function for the given account / TF context."""
-    tier     = _get_tier(balance)
-    cpcv_cfg = CPCV_PARAMS.get(tf.upper(), CPCV_PARAMS["H1"])
+    tier    = _get_tier(balance)
+    wfo_cfg = WFO_PARAMS.get(tf.upper(), WFO_PARAMS["H1"])
 
     def objective(trial: optuna.Trial) -> float:
         # obs_cov controls Kalman filter responsiveness (lower = trusts measurements
@@ -590,31 +814,39 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             n_states   = trial.suggest_int("n_states", 3, 4)
         # M5 uses shallower trees (2-3) to prevent IS memorisation across the
         # large bar count; heavier L1 reg (1-20) to sparsify feature weights.
-        # H1/M15: max_depth 3-6 allows the model to map complex HMM-state ×
-        # dollar-correlation interactions; reg_alpha capped at 1.2 (was 10.0)
-        # so the model can express real alpha without being choked by L1 sparsity.
+        # H1/M15: max_depth extended to [3,8] — best trial was hitting the old
+        # ceiling of 6, indicating Optuna needs headroom to explore 7-8.
+        # H1 n_estimators raised to [50,300] to match the lower learning_rate floor.
         if tf.upper() == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 3)
             reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 20.0, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
         elif tf.upper() == "H1":
-            max_depth        = trial.suggest_int("max_depth", 3, 6)
+            max_depth        = trial.suggest_int("max_depth", 3, 8)
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
-            # 5–25: enough regularisation to prevent H1 overfitting without
-            # collapsing XGB test accuracy to ~50% (random) as 20–50 did.
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
         else:
-            max_depth        = trial.suggest_int("max_depth", 3, 6)
+            max_depth        = trial.suggest_int("max_depth", 3, 8)
             reg_alpha        = trial.suggest_float("reg_alpha", 0.01, 1.2, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 15)
-        learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
-        # H1: cap n_estimators at 150 — more trees memorise per-bar noise on hourly data.
-        n_estimators     = (trial.suggest_int("n_estimators",  50, 150, step=50)
-                            if tf.upper() == "H1"
-                            else trial.suggest_int("n_estimators", 100, 500, step=50))
+        # H1: learning_rate floor lowered to 0.005 so Optuna can explore slow-
+        # learning deep trees without the 0.01 floor cutting off valid configs.
+        # H1: n_estimators ceiling raised to 300 — slow learning needs more trees.
+        if tf.upper() == "H1":
+            learning_rate = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
+            n_estimators  = trial.suggest_int("n_estimators", 50, 300, step=50)
+        elif tf.upper() == "M5":
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
+            n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50)
+        else:
+            learning_rate = trial.suggest_float("learning_rate", 0.01, 0.3, log=True)
+            n_estimators  = trial.suggest_int("n_estimators", 100, 500, step=50)
         subsample        = trial.suggest_float("subsample", 0.6, 1.0)
         colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
         gamma            = trial.suggest_float("gamma",     0.01, 0.5,  log=True)
+        # scale_pos_weight: handles class imbalance between Bull/Bear/Chop labels.
+        # H1 distribution is ~Bull 35%, Bear 30%, Chop 35% — slight imbalance.
+        scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5, 2.0, log=True)
 
         try:
             df = process_pipeline(
@@ -645,42 +877,45 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                 min_child_weight=min_child_weight,
                 gamma=gamma,
                 reg_alpha=reg_alpha,
+                scale_pos_weight=scale_pos_weight,
             )
 
-            # ── CPCV scoring ──────────────────────────────────────────────
-            cpcv_result = _run_cpcv(
+            # ── WFO scoring ───────────────────────────────────────────────
+            wfo_result = _run_wfo(
                 df=df,
                 states=states,
                 tf=tf,
                 balance=balance,
                 broker=broker,
                 xgb_kwargs=xgb_kwargs,
-                n_splits=cpcv_cfg["n_splits"],
-                n_test_splits=cpcv_cfg["n_test_splits"],
-                embargo_bars=cpcv_cfg["embargo_bars"],
+                is_bars=wfo_cfg["is_bars"],
+                oos_bars=wfo_cfg["oos_bars"],
+                embargo_bars=wfo_cfg["embargo_bars"],
+                step_bars=wfo_cfg["step_bars"],
+                hmm_transmat=model_full.transmat_,
             )
 
-            score         = cpcv_result["cpcv_score"]
-            n_valid_paths = cpcv_result["n_valid_paths"]
-            n_total_paths = cpcv_result["n_paths"]
-            std_sharpe    = cpcv_result["std_sharpe"]
-            median_trades = cpcv_result["median_trades"]
-            path_scores   = cpcv_result["path_scores"]
+            score           = wfo_result["wfo_score"]
+            n_valid_windows = wfo_result["n_valid_windows"]
+            n_total_windows = wfo_result["n_windows"]
+            std_sharpe      = wfo_result["std_sharpe"]
+            median_trades   = wfo_result["median_trades"]
+            window_scores   = wfo_result["window_scores"]
+            wfe_ratio       = wfo_result["wfe_ratio"]
 
             # ── Hard gates ────────────────────────────────────────────────
-            if n_valid_paths == 0:
+            if n_valid_windows == 0:
                 return -50.0
 
-            # If fewer than half the paths are valid, the config is regime-specific.
-            if n_valid_paths < n_total_paths // 2:
+            # If fewer than half the windows are valid, config is regime-specific.
+            if n_valid_windows < n_total_windows // 2:
                 score = min(score, -10.0)
 
             # High Sharpe std = strategy only works in some market regimes.
             if std_sharpe > 1.0:
                 score -= (std_sharpe - 1.0) * 0.3
 
-            # Progressive trade penalty — configs with too few median trades
-            # cannot produce reliable RF/PF estimates.
+            # Progressive trade penalty
             tf_floor = TF_MIN_OOS_TRADES.get(tf.upper(), 60)
             if median_trades < tf_floor:
                 score *= 0.1
@@ -693,12 +928,12 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
                     score *= 1.2
 
             logger.info(
-                "Trial %d [%s/%s $%.0f CPCV]: score=%.3f | valid=%d/%d | "
-                "std_sharpe=%.3f | median_trades=%d | path_scores=%s",
+                "Trial %d [%s/%s $%.0f WFO]: score=%.3f | valid=%d/%d | "
+                "std_sharpe=%.3f | median_trades=%d | WFE=%.2f | window_scores=%s",
                 trial.number, tf, broker, balance,
-                score, n_valid_paths, n_total_paths,
-                std_sharpe, median_trades,
-                [round(s, 3) for s in path_scores],
+                score, n_valid_windows, n_total_windows,
+                std_sharpe, median_trades, wfe_ratio,
+                [round(s, 3) for s in window_scores],
             )
             return score
 
@@ -806,10 +1041,10 @@ def run_optimization(
     tf: str         = "H1",
     n_jobs: int     = 1,
 ) -> optuna.Study:
-    """Run (or resume) an Optuna study using CPCV and return it when complete.
+    """Run (or resume) an Optuna study using Rolling WFO and return it when complete.
 
-    Each trial evaluates C(6,2)=15 train/test path combinations.  The study
-    persists to SQLite so interrupted runs resume safely from where they left off.
+    Each trial slides IS/OOS windows across the full dataset (non-overlapping OOS).
+    The study persists to SQLite so interrupted runs resume safely from where they left off.
 
     Args:
         n_trials: Total study target.  Optuna adds new trials on top of those
@@ -821,13 +1056,13 @@ def run_optimization(
     tier = _get_tier(balance)
     name = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
-    cpcv_cfg = CPCV_PARAMS.get(tf.upper(), CPCV_PARAMS["H1"])
+    wfo_cfg = WFO_PARAMS.get(tf.upper(), WFO_PARAMS["H1"])
 
-    # Apply TF-specific CPCV trial count when caller used the default 250
+    # Apply TF-specific WFO trial count when caller used the default 250
     if n_trials == 250:
-        n_trials = CPCV_TRIALS.get(tf.upper(), 80)
-    # Force sequential within each trial — 15 HMM+XGB fits per trial already
-    # saturates CPU cores; parallelism between trials causes contention.
+        n_trials = WFO_TRIALS.get(tf.upper(), 50)
+    # Force sequential within each trial — each WFO trial already runs many
+    # HMM+XGB windows; parallelism between trials causes core contention.
     n_jobs = 1
 
     os.makedirs("models", exist_ok=True)
@@ -854,18 +1089,14 @@ def run_optimization(
             f"Resuming from trial #{already_done + 1} — {remaining} remaining.\n"
         )
     else:
-        n_paths = len(list(itertools.combinations(
-            range(cpcv_cfg["n_splits"]), cpcv_cfg["n_test_splits"]
-        )))
         print(
-            f"\nStarting new CPCV study '{name}' — target {n_trials} trials.\n"
-            f"CPCV config [{tf}]: n_splits={cpcv_cfg['n_splits']} "
-            f"n_test_splits={cpcv_cfg['n_test_splits']} "
-            f"embargo={cpcv_cfg['embargo_bars']} bars "
-            f"→ {n_paths} backtest paths per trial.\n"
-            f"NOTE: each trial trains {n_paths} XGBoost ensembles — "
-            f"wall time is ~{n_paths}× longer per trial than single-split.\n"
-            f"Recommended trial counts for CPCV: H1=50, M15=80, M5=100.\n"
+            f"\nStarting new WFO study '{name}' — target {n_trials} trials.\n"
+            f"WFO config [{tf}]: IS={wfo_cfg['is_bars']} bars  "
+            f"OOS={wfo_cfg['oos_bars']} bars  "
+            f"embargo={wfo_cfg['embargo_bars']} bars  "
+            f"step={wfo_cfg['step_bars']} bars\n"
+            f"Recommended trial counts for WFO: H1={WFO_TRIALS['H1']}, "
+            f"M15={WFO_TRIALS['M15']}, M5={WFO_TRIALS['M5']}.\n"
         )
 
     if remaining == 0:
