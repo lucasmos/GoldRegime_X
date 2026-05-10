@@ -111,7 +111,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
     models_ensemble, thresholds, metrics = train_xgb_ensemble(
         X, y,
-        train_ratio=1.0,  # full-data training — CPCV validation happened in optimize step
+        train_ratio=1.0,  # full-data training — WFO validation happened in optimize step
         max_depth=params.get("max_depth", 4),
         learning_rate=params.get("learning_rate", 0.1),
         n_estimators=params.get("n_estimators", 200),
@@ -120,6 +120,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         min_child_weight=params.get("min_child_weight", 5),
         gamma=params.get("gamma", 1.0),
         reg_alpha=params.get("reg_alpha", 0.1),
+        scale_pos_weight=params.get("scale_pos_weight", 1.0),
     )
     _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
     states_aligned = states[df.index.isin(df_aligned.index)]
@@ -790,28 +791,29 @@ def cmd_guardian(args):
 
 
 def cmd_consolidate(args):
-    """Consolidate USDCHF CSV exports in data/raw/ into per-TF master files.
+    """Consolidate multi-asset CSV exports in data/raw/ into per-TF master files.
 
-    Produces:
-      data/processed/USDCHF_master.csv      (H1  — source: USDCHF_H1.csv)
-      data/processed/USDCHF_master_M15.csv  (M15 — source: USDCHF_M15_*.csv)
-      data/processed/USDCHF_master_M5.csv   (M5  — source: USDCHF_M5_*.csv)
+    Processes 5 assets × 3 timeframes = 15 master files in data/processed/.
+    Assets: USDCHF, XAGUSD, XTIUSD, US500, USDJPY.
+    Timeframes: H1, M15, M5.
     """
-    from src.data_consolidator import (
-        consolidate_usdchf,
-        consolidate_usdchf_m15,
-        consolidate_usdchf_m5,
-    )
-    for fn, label, out in [
-        (consolidate_usdchf,     "H1",  "data/processed/USDCHF_master.csv"),
-        (consolidate_usdchf_m15, "M15", "data/processed/USDCHF_master_M15.csv"),
-        (consolidate_usdchf_m5,  "M5",  "data/processed/USDCHF_master_M5.csv"),
-    ]:
-        result = fn()
-        if not result.empty:
-            print(f"  USDCHF {label}: {len(result)} rows → {out}")
-        else:
-            logger.warning("USDCHF %s consolidation produced no data — skipping.", label)
+    from src.data_consolidator import consolidate_asset, ASSET_CONFIGS
+
+    assets = list(ASSET_CONFIGS.keys())
+    tfs    = ["H1", "M15", "M5"]
+
+    n_ok = 0
+    for asset in assets:
+        for tf in tfs:
+            result = consolidate_asset(asset, tf)
+            if not result.empty:
+                out = ASSET_CONFIGS[asset][tf]["output"]
+                print(f"  {asset} {tf}: {len(result)} rows → data/processed/{out}")
+                n_ok += 1
+            else:
+                logger.warning("%s %s: no source files found — skipping.", asset, tf)
+
+    print(f"\nConsolidation complete: {n_ok}/{len(assets) * len(tfs)} master files produced.")
 
 
 def cmd_listen(args):

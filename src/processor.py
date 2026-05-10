@@ -51,7 +51,25 @@ def load_gmm_model(tf: str, broker: str = "headway_cent"):
 
 # XGBoost continuous feature columns that require StandardScaler normalization.
 # Discrete columns (hmm_state, gmm_vol_cluster) are intentionally excluded.
-CONTINUOUS_FEATURE_COLS = ["rsi_slope", "atr_normalized", "prev_log_return", "usdchf_log_return"]
+# All external asset log-return columns are included; prepare_features filters
+# dynamically to only those present in the DataFrame via get_continuous_cols().
+CONTINUOUS_FEATURE_COLS = [
+    "rsi_slope", "atr_normalized", "prev_log_return",
+    "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
+    "us500_log_return", "usdjpy_log_return", "synth_vix_zscore",
+]
+
+
+def get_continuous_cols(df: pd.DataFrame) -> list[str]:
+    """Return the subset of CONTINUOUS_FEATURE_COLS actually present in df.
+
+    Filters to columns that exist AND are >50% non-null so the scaler is
+    never fitted on a mostly-missing series.
+    """
+    return [
+        c for c in CONTINUOUS_FEATURE_COLS
+        if c in df.columns and df[c].notna().mean() > 0.5
+    ]
 
 
 def get_feature_scaler_path(tf: str, broker: str = "headway_cent") -> Path:
@@ -106,6 +124,43 @@ _USDCHF_PATH_BY_TF: dict[str, Path] = {
 # Legacy alias kept for any callers that still reference the old name directly.
 DXY_RAW_PATH = USDCHF_MASTER_PATH
 
+# ── New external asset master paths ──────────────────────────────────────────
+# Build these with:  python main.py --mode consolidate
+
+_XAGUSD_PATH_BY_TF: dict[str, Path] = {
+    "H1":  Path("data/processed/XAGUSD_master.csv"),
+    "M15": Path("data/processed/XAGUSD_master_M15.csv"),
+    "M5":  Path("data/processed/XAGUSD_master_M5.csv"),
+}
+
+_XTIUSD_PATH_BY_TF: dict[str, Path] = {
+    "H1":  Path("data/processed/XTIUSD_master.csv"),
+    "M15": Path("data/processed/XTIUSD_master_M15.csv"),
+    "M5":  Path("data/processed/XTIUSD_master_M5.csv"),
+}
+
+_US500_PATH_BY_TF: dict[str, Path] = {
+    "H1":  Path("data/processed/US500_master.csv"),
+    "M15": Path("data/processed/US500_master_M15.csv"),
+    "M5":  Path("data/processed/US500_master_M5.csv"),
+}
+
+_USDJPY_PATH_BY_TF: dict[str, Path] = {
+    "H1":  Path("data/processed/USDJPY_master.csv"),
+    "M15": Path("data/processed/USDJPY_master_M15.csv"),
+    "M5":  Path("data/processed/USDJPY_master_M5.csv"),
+}
+
+# Lookup table: asset_key → per-TF path dict
+# asset_key matches the log-return column name prefix (e.g. "usdchf" → "usdchf_log_return")
+_EXTERNAL_ASSET_PATHS: dict[str, dict[str, Path]] = {
+    "usdchf": _USDCHF_PATH_BY_TF,
+    "xagusd": _XAGUSD_PATH_BY_TF,
+    "xtiusd": _XTIUSD_PATH_BY_TF,
+    "us500":  _US500_PATH_BY_TF,
+    "usdjpy": _USDJPY_PATH_BY_TF,
+}
+
 TF_CONFIG = {
     "H1": {
         "raw_path":     Path("data/raw/XAU_1h_data.csv"),
@@ -150,6 +205,114 @@ def load_raw_data(path: Path = RAW_PATH) -> pd.DataFrame:
     return df
 
 
+def load_asset_data(path: Path, col_name: str) -> pd.DataFrame | None:
+    """Load any asset master CSV and compute its log-return column.
+
+    Generic version of the old ``load_usdchf_data``.  Returns a single-column
+    DataFrame with column *col_name* (e.g. ``"xagusd_log_return"``), or
+    ``None`` if the file does not exist — callers treat that as "feature not
+    available, degrade gracefully".
+
+    Args:
+        path:     Path to the processed master CSV (OHLCV, DatetimeIndex).
+        col_name: Name to assign to the computed log-return series.
+    """
+    if not path.exists():
+        return None
+    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    df.sort_index(inplace=True)
+    if "Close" not in df.columns:
+        logger.warning("Master file %s has no 'Close' column — skipping.", path.name)
+        return None
+    df[col_name] = np.log(df["Close"] / df["Close"].shift(1))
+    logger.info("Loaded %s master: %d rows from %s", col_name, len(df), path.name)
+    return df[[col_name]]
+
+
+def map_asset_to_bars(
+    df_index: pd.DatetimeIndex,
+    asset_df: pd.DataFrame,
+    col_name: str,
+) -> pd.Series:
+    """Align any asset log-return series onto XAUUSD bar timestamps.
+
+    Generic version of the old ``map_usdchf_to_bars``.  Handles both daily
+    and intraday source data via forward-fill (daily) or reindex+ffill
+    (intraday).
+
+    Args:
+        df_index:  DatetimeIndex of XAUUSD bars to align onto.
+        asset_df:  Single-column DataFrame from ``load_asset_data``.
+        col_name:  Column name in *asset_df* (e.g. ``"xagusd_log_return"``).
+
+    Returns:
+        pd.Series indexed by *df_index* with name *col_name*.
+    """
+    series = asset_df[col_name].copy()
+    idx = df_index.tz_localize(None) if df_index.tz is not None else df_index
+
+    is_daily = (series.index == series.index.normalize()).all()
+
+    if is_daily:
+        normalized = idx.normalize()
+        max_date = normalized.max()
+        if max_date > series.index.max():
+            extension = pd.date_range(
+                series.index.max() + pd.Timedelta(days=1), max_date, freq="D"
+            )
+            series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
+        series = series.ffill()
+        return pd.Series(normalized.map(series).values, index=df_index, name=col_name)
+    else:
+        _series = series.copy()
+        try:
+            _series.index = _series.index.as_unit("ns")
+            _idx = idx.as_unit("ns")
+        except AttributeError:
+            _idx = idx
+        values = _series.reindex(_idx, method="ffill")
+        return pd.Series(values.values, index=df_index, name=col_name)
+
+
+def _compute_staleness(raw_series: pd.Series, col_name: str) -> pd.Series:
+    """Count consecutive bars since the last non-NaN observation.
+
+    Call this BEFORE forward-filling *raw_series*.  The staleness counter
+    gives XGBoost a data-quality signal: 0 = live observation, N = N bars
+    of forward-fill (stale).
+
+    Returns a pd.Series of non-negative ints with name ``{col_name}_staleness``.
+    """
+    counter = 0
+    values = []
+    for v in raw_series:
+        if pd.notna(v):
+            counter = 0
+        else:
+            counter += 1
+        values.append(counter)
+    return pd.Series(values, index=raw_series.index, name=f"{col_name}_staleness")
+
+
+def compute_synth_vix(df: pd.DataFrame, period: int = 22) -> pd.Series:
+    """Williams VIX Fix — synthetic implied-volatility proxy from OHLC.
+
+    No external data required.  The VIX Fix approximates implied volatility
+    by measuring how far the recent low is from the rolling highest close:
+        vix_fix = (highest_close - Low) / highest_close × 100
+
+    The z-score normalises across market regimes so XGBoost sees a
+    stationary signal regardless of absolute price level.
+
+    Returns a pd.Series named ``"synth_vix_zscore"``.
+    """
+    highest_close = df["Close"].rolling(period).max()
+    vix_fix = (highest_close - df["Low"]) / highest_close * 100
+    mean = vix_fix.rolling(20).mean()
+    std  = vix_fix.rolling(20).std().replace(0, np.nan)
+    return ((vix_fix - mean) / std).rename("synth_vix_zscore")
+
+
 def load_usdchf_data(path: Path) -> pd.DataFrame | None:
     """Load the USDCHF master CSV and return a ``usdchf_log_return`` column.
 
@@ -159,56 +322,16 @@ def load_usdchf_data(path: Path) -> pd.DataFrame | None:
     Run ``python main.py --mode consolidate`` to build the master from MT5
     exports before training.
     """
-    if not path.exists():
-        return None
-    df = pd.read_csv(path, index_col="Date", parse_dates=True)
-    df.sort_index(inplace=True)
-    df["usdchf_log_return"] = np.log(df["Close"] / df["Close"].shift(1))
-    logger.info("Loaded USDCHF master: %d rows from %s", len(df), path)
-    return df[["usdchf_log_return"]]
+    return load_asset_data(path, "usdchf_log_return")
 
 
 def map_usdchf_to_bars(df_index: pd.DatetimeIndex, usdchf_df: pd.DataFrame) -> pd.Series:
     """Align USDCHF log returns onto XAUUSD bar timestamps.
 
-    Handles both daily USDCHF data (e.g. annual CSV exports) and intraday data
-    (e.g. direct M5 MT5 export):
-    - Daily: normalise each bar's timestamp to midnight and ffill by date.
-    - Intraday: reindex directly onto bar timestamps with ffill.
+    Thin wrapper around the generic ``map_asset_to_bars`` — kept for backwards
+    compatibility with callers that reference it directly.
     """
-    series = usdchf_df["usdchf_log_return"].copy()
-    # Strip timezone for tz-aware MT5 sync indices
-    idx = df_index.tz_localize(None) if df_index.tz is not None else df_index
-
-    # Detect daily vs intraday by checking whether all times are midnight
-    is_daily = (series.index == series.index.normalize()).all()
-
-    if is_daily:
-        # Daily data — map each intraday bar onto its calendar date
-        # Extend the series forward to cover any bars beyond the last date
-        normalized = idx.normalize()
-        max_date = normalized.max()
-        if max_date > series.index.max():
-            extension = pd.date_range(
-                series.index.max() + pd.Timedelta(days=1), max_date, freq="D"
-            )
-            series = pd.concat([series, pd.Series(series.iloc[-1], index=extension)])
-        series = series.ffill()
-        return pd.Series(normalized.map(series).values, index=df_index, name="usdchf_log_return")
-    else:
-        # Intraday data — forward-fill onto bar timestamps.
-        # Implementation note: we must return a Series indexed by the ORIGINAL
-        # df_index (tz-aware) not the tz-stripped idx, otherwise pandas 2.0
-        # realigns by index when the caller does df["usdchf_log_return"] = result
-        # and tz-aware vs tz-naive timestamps never match → all-NaN column.
-        _series = series.copy()
-        try:
-            _series.index = _series.index.as_unit("ns")
-            _idx = idx.as_unit("ns")
-        except AttributeError:
-            _idx = idx
-        values = _series.reindex(_idx, method="ffill")
-        return pd.Series(values.values, index=df_index, name="usdchf_log_return")
+    return map_asset_to_bars(df_index, usdchf_df, "usdchf_log_return")
 
 
 # Legacy aliases — kept so old imports don't crash if any caller still uses them.
@@ -385,26 +508,34 @@ def process_pipeline(
     else:
         df["gmm_vol_cluster"] = compute_gmm_vol_cluster(df["volatility"].values)
 
-    # ── Optional USDCHF cross-asset feature ─────────────────────────────────
-    # Each TF uses its own USDCHF master so bar frequencies stay in sync:
-    #   H1  → data/processed/USDCHF_master.csv
-    #   M15 → data/processed/USDCHF_master_M15.csv
-    #   M5  → data/processed/USDCHF_master_M5.csv
-    # Build all three with:  python main.py --mode consolidate
-    usdchf_path = _USDCHF_PATH_BY_TF.get(tf, USDCHF_MASTER_PATH)
-    usdchf_df = load_usdchf_data(usdchf_path)
-    if usdchf_df is not None:
-        df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
-        n_usdchf = df["usdchf_log_return"].notna().sum()
-        logger.info("USDCHF [%s] merged: %d non-null usdchf_log_return values.", tf, n_usdchf)
-    else:
-        logger.info(
-            "USDCHF master not found at %s — pipeline running with 4 base features. "
-            "Run  python main.py --mode consolidate  to enable the 5th feature.",
-            usdchf_path,
-        )
+    # ── External cross-asset features ────────────────────────────────────────
+    # Each asset uses the TF-matched master file so bar frequencies stay in sync.
+    # Assets whose master file is absent degrade gracefully (column simply absent).
+    # Build all masters with:  python main.py --mode consolidate
+    for asset_key, path_by_tf in _EXTERNAL_ASSET_PATHS.items():
+        col_name  = f"{asset_key}_log_return"
+        path      = path_by_tf.get(tf, path_by_tf.get("H1"))
+        asset_df  = load_asset_data(path, col_name)
+        if asset_df is not None:
+            raw_series  = map_asset_to_bars(df.index, asset_df, col_name)
+            df[f"{asset_key}_staleness"] = _compute_staleness(raw_series, col_name)
+            df[col_name] = raw_series
+            n_valid = df[col_name].notna().sum()
+            logger.info(
+                "%s [%s] merged: %d non-null %s values.",
+                asset_key.upper(), tf, n_valid, col_name,
+            )
+        else:
+            logger.debug(
+                "%s master not found at %s — pipeline running without %s feature. "
+                "Run  python main.py --mode consolidate  to enable it.",
+                asset_key.upper(), path, col_name,
+            )
 
     df.dropna(inplace=True)
+
+    # ── Synthetic VIX (Williams VIX Fix) ────────────────────────────────────
+    df["synth_vix_zscore"] = compute_synth_vix(df)
 
     # ── Optional LSTM context features (lstm_ctx_0..3) ───────────────────────
     # Only added when a trained LSTMContextModel is supplied.  If lstm_model is

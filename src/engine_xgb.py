@@ -17,7 +17,18 @@ ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 # Continuous features that are StandardScaler-normalized before XGBoost.
 # Discrete/categorical columns (hmm_state, gmm_vol_cluster) are excluded.
 # LSTM context columns (lstm_ctx_0..3) are tanh-activated [-1,1] — no scaling.
-_CONTINUOUS_COLS = ["rsi_slope", "atr_normalized", "prev_log_return", "usdchf_log_return"]
+# Staleness counters ({asset}_staleness) are integer counts — no scaling needed.
+_CONTINUOUS_COLS = [
+    "rsi_slope", "atr_normalized", "prev_log_return",
+    "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
+    "us500_log_return", "usdjpy_log_return", "synth_vix_zscore",
+]
+
+# All optional external-asset feature columns (log returns + synth_vix)
+_EXTERNAL_ASSETS = [
+    "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
+    "us500_log_return",  "usdjpy_log_return", "synth_vix_zscore",
+]
 
 # LSTM context feature columns added when a trained LSTM context model is present.
 LSTM_CONTEXT_COLS = [f"lstm_ctx_{i}" for i in range(4)]
@@ -53,9 +64,11 @@ TF_TRAIN_RATIO = {"H1": 0.70, "M15": 0.65, "M5": 0.65}
 def get_feature_cols(df: pd.DataFrame) -> list[str]:
     """Return the feature column list for this DataFrame.
 
-    Starts from FEATURE_COLS (which includes gmm_vol_cluster), then:
+    Starts from FEATURE_COLS (base set including gmm_vol_cluster), then:
     - Drops gmm_vol_cluster if not present (old parquet without GMM).
-    - Appends usdchf_log_return when present and >50% non-null.
+    - Appends any external asset log returns and synth_vix that are present
+      and >50% non-null (graceful degradation when masters are absent).
+    - Staleness counters ({asset}_staleness) are appended as integer features.
     """
     cols = []
     for c in FEATURE_COLS:
@@ -64,8 +77,14 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
                 cols.append(c)
         else:
             cols.append(c)
-    if USDCHF_FEATURE in df.columns and df[USDCHF_FEATURE].notna().mean() > 0.5:
-        cols.append(USDCHF_FEATURE)
+    # External asset log returns + synth_vix (ordered consistently)
+    for c in _EXTERNAL_ASSETS:
+        if c in df.columns and df[c].notna().mean() > 0.5:
+            cols.append(c)
+    # Staleness counters for any asset that is present (non-negative integers)
+    for c in sorted(df.columns):
+        if c.endswith("_staleness") and c not in cols:
+            cols.append(c)
     return cols
 
 
@@ -131,6 +150,7 @@ def train_xgb(
     gamma: float = 1.0,
     reg_alpha: float = 0.1,
     colsample_bytree: float = 0.8,
+    scale_pos_weight: float = 1.0,
     train_ratio: float = 0.8,
 ):
     split_idx = int(len(X) * train_ratio)
@@ -146,6 +166,7 @@ def train_xgb(
         gamma=gamma,
         reg_alpha=reg_alpha,
         colsample_bytree=colsample_bytree,
+        scale_pos_weight=scale_pos_weight,
         objective="binary:logistic",
         eval_metric="logloss",
         random_state=42,

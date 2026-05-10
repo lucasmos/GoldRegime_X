@@ -117,7 +117,7 @@ class WeeklyDataUpdater:
                 return None
 
             df = pd.DataFrame(rates)
-            df["time"] = pd.to_datetime(df["time"], unit="s", utc=True)
+            df["time"] = pd.to_datetime(df["time"], unit="s")
             df = (
                 df.rename(columns={
                     "time":        "Date",
