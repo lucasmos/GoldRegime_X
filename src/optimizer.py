@@ -627,7 +627,7 @@ def _run_wfo(
                   but the mode string is stored in the return dict for diagnostics.
 
     Returns dict with keys:
-        wfo_score       — variance-penalised median OOS Complex Criterion
+        wfo_score       — median OOS Complex Criterion − 0.20 × std (variance-penalised)
         n_windows       — total windows attempted
         n_valid_windows — windows with enough OOS trades (not penalised)
         median_trades   — median OOS trade count
@@ -884,10 +884,15 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             n_states = trial.suggest_categorical("n_states", [4])
         else:
             n_states   = trial.suggest_int("n_states", 3, 4)
-        # M5 uses shallower trees (2-4) to prevent IS memorisation across the
-        # large bar count; heavier L1 reg (1-30) to sparsify feature weights.
-        # H1/M15: max_depth lowered ceiling to 7 — depth-8 on H1/M15 overfits leaf splits.
-        # H1 n_estimators raised to [50,400] to match the lower learning_rate floor.
+        # M5 uses shallow trees (depth 2–4) to prevent IS memorisation across the
+        # very large bar count (~105K bars IS); min_child_weight≥5 prevents tiny
+        # leaf splits on noisy micro-regime boundaries; heavier L1/L2 reg to
+        # sparsify feature weights.  Allowing depth-4 gives Optuna room to fit
+        # 4-state regimes without forcing under-capacity at depth-3.
+        # H1/M15: max_depth ceiling lowered to 7 (was 8) — depth-8 trees on H1/M15
+        # consistently overfit leaf splits with the available bar counts.
+        # H1 min_child_weight floor raised to 5: H1 has fewer samples per node
+        # (fewer bars overall) so small MCW values produce trivially overfit leaves.
         if tf.upper() == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
             reg_alpha        = trial.suggest_float("reg_alpha", 1.0, 30.0, log=True)
@@ -903,11 +908,12 @@ def make_objective(balance: float = 15.0, broker: str = "standard", tf: str = "H
             reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 5.0, log=True)
             reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 15.0, log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
-        # H1: learning_rate floor lowered to 0.005 so Optuna can explore slow-
-        # learning deep trees without the 0.01 floor cutting off valid configs.
-        # H1: n_estimators ceiling raised to 400 — slow learning needs more trees.
-        # M15: learning_rate ceiling reduced to 0.2 (high lr + shallow = IS noise).
-        # M5: learning_rate ceiling reduced to 0.15; n_estimators floor raised to 200.
+        # H1: learning_rate floor lowered to 0.005 and ceiling to 0.15 so Optuna
+        # can explore slow-learning deep trees; n_estimators ceiling raised to 400
+        # to give slow-lr configs enough trees to converge.
+        # M15: ceiling reduced to 0.20 — high lr + shallow trees memorise IS noise.
+        # M5: ceiling reduced to 0.15 and floor raised to 200 estimators — slow lr
+        # needs more iterations to converge; high lr on M5's large dataset overfits.
         if tf.upper() == "H1":
             learning_rate = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
             n_estimators  = trial.suggest_int("n_estimators", 50, 400, step=50)
