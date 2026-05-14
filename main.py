@@ -29,7 +29,11 @@ from src.engine_xgb import (
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
 )
-from src.optimizer import run_optimization, get_best_params, _score_result as _calc_score
+from src.optimizer import (
+    run_optimization, get_best_params, _score_result as _calc_score,
+    extract_consensus_params, run_wfa as optimizer_run_wfa,
+    WFO_PARAMS, WFO_PARAMS_FAST,
+)
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
 from src.risk_manager import AdaptiveRiskManager
@@ -120,6 +124,7 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         min_child_weight=params.get("min_child_weight", 5),
         gamma=params.get("gamma", 1.0),
         reg_alpha=params.get("reg_alpha", 0.1),
+        reg_lambda=params.get("reg_lambda", 1.0),
         scale_pos_weight=params.get("scale_pos_weight", 1.0),
     )
     _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
@@ -177,158 +182,62 @@ def _check_model_staleness(tf: str, broker: str, args) -> None:
 
 
 def cmd_wfa(args):
-    """Walk-Forward Analysis: evaluate model consistency across rolling time windows.
+    """Walk-Forward Analysis: re-fit HMM+XGBoost on each rolling IS window.
 
-    Uses the globally-trained model's probability outputs (no per-window retraining)
-    to score IS + OOS Sharpe across every train_days/test_days window.  Prints a
-    per-window breakdown and the aggregate Walk-Forward Efficiency (WFE) ratio.
-
-    WFE target: > 50%.  A WFE of 60% means the model's OOS performance is 60% of
-    its IS performance — i.e. it generalises well rather than curve-fitting a few
-    favourable years.
+    Uses the best Optuna params from the study DB to run the same rolling
+    IS/OOS evaluation that scored those params during optimization.  Prints
+    per-window OOS diagnostics and the Walk-Forward Efficiency (WFE) ratio.
+    WFE target: > 0.50 (OOS performance is at least 50% of IS performance).
     """
-    from src.backtester import run_walk_forward
+    import pandas as pd
     from src.notifier import send_telegram_msg
 
-    balance = _resolve_balance(args)
-    broker  = args.broker
-    tf      = args.tf.upper()
+    balance  = _resolve_balance(args)
+    broker   = args.broker
+    tf       = args.tf.upper()
+    wfo_mode = "fast" if getattr(args, "fast_wfo", False) else "standard"
     reconfigure_for_tf(tf)
 
-    # TF-specific defaults (calendar days) — tuned to each bar frequency
-    _wfa_defaults = {"H1": (365, 90), "M15": (180, 60), "M5": (90, 30)}
-    default_train, default_test = _wfa_defaults.get(tf, (365, 90))
-    train_days = getattr(args, "train_days", None) or default_train
-    test_days  = getattr(args, "test_days",  None) or default_test
-
-    try:
-        params = get_best_params(balance=balance, broker=broker, tf=tf)
-        logger.info("WFA using Optuna params [%s/%s]: %s", tf, broker, params)
-    except Exception:
-        logger.warning("No Optuna study found for %s/%s — using defaults.", tf, broker)
-        params = {}
-
-    logger.info(
-        "Walk-Forward Analysis [%s/%s] balance=$%.0f  train=%dd  test=%dd",
-        tf, broker, balance, train_days, test_days,
-    )
-    print(f"\n=== Walk-Forward Analysis [{tf} / {broker}] ===")
-    print(f"  Train window : {train_days} days  |  Test step : {test_days} days")
-    print("  Loading full dataset...")
-
-    df = process_pipeline(
-        obs_cov=params.get("obs_cov"),
-        trans_cov=params.get("trans_cov"),
-        save=False,
-        tf=tf,
-    )
-
-    n_states = params.get("n_states", TF_CONFIG[tf].get("n_states_default", 3))
-    model_hmm, states, _ = fit_hmm(df, n_states=n_states)
-
-    _min_persist = min(model_hmm.transmat_[i, i] for i in range(model_hmm.n_components))
-    if _min_persist < 0.65:
-        print(
-            f"\nERROR: Degenerate HMM (min persistence={_min_persist:.4f}). "
-            "Run --mode optimize first to find stable Kalman parameters."
-        )
+    processed_path = TF_CONFIG[tf]["processed_path"]
+    if not processed_path.exists():
+        print(f"\nERROR: Run --mode process --tf {tf} first.")
         sys.exit(1)
 
-    X, y, df_aligned, _scaler = prepare_features(df, states, tf=tf)
-    _train_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
-    models_e, thresholds_e, metrics_e = train_xgb_ensemble(
-        X, y,
-        train_ratio      = _train_ratio,
-        max_depth        = params.get("max_depth", 4),
-        learning_rate    = params.get("learning_rate", 0.1),
-        n_estimators     = params.get("n_estimators", 200),
-        subsample        = params.get("subsample", 0.8),
-        colsample_bytree = params.get("colsample_bytree", 0.8),
-        min_child_weight = params.get("min_child_weight", 5),
-        gamma            = params.get("gamma", 1.0),
-        reg_alpha        = params.get("reg_alpha", 0.1),
-    )
-    _, probs    = get_predictions_ensemble(models_e, thresholds_e, X)
-    states_aln  = states[df.index.isin(df_aligned.index)]
-    _cmp_split  = metrics_e.get("split_idx") or int(len(X) * 0.70)
-    _X_is_cmp   = X.iloc[:_cmp_split]
-    _hs_is_cmp  = states_aln[:len(_X_is_cmp)]
-    _regime_stats_cmp = compute_regime_stats(models_e, thresholds_e, _X_is_cmp, _hs_is_cmp)
+    df = pd.read_parquet(processed_path)
+    print(f"\n=== Walk-Forward Analysis [{tf} / {broker}] (mode: {wfo_mode}) ===")
+    print(f"  Dataset: {len(df)} bars  ({df.index[0].date()} – {df.index[-1].date()})")
+    print("  Running rolling IS/OOS windows with best Optuna params...\n")
 
-    print(
-        f"  Dataset: {len(df_aligned)} bars  "
-        f"({df_aligned.index[0].date()} – {df_aligned.index[-1].date()})"
-    )
-    print("  Evaluating rolling windows (fixed model — no per-window retraining)...")
-
-    wfa = run_walk_forward(
-        df_aligned, probs, states_aln,
-        train_days    = train_days,
-        test_days     = test_days,
-        account_size  = balance,
-        broker        = broker,
-        tf            = tf,
-        regime_stats  = _regime_stats_cmp,
+    wfa = optimizer_run_wfa(
+        df=df, tf=tf, broker=broker,
+        account_size=balance, wfo_mode=wfo_mode,
     )
 
-    n_win       = wfa["n_windows"]
-    n_valid     = wfa.get("n_valid_windows", n_win)
-    wfe         = wfa["wfe_ratio"]
-    mean_is     = wfa["mean_is_sharpe"]
-    mean_oos    = wfa["mean_oos_sharpe"]
-    verdict     = "ROBUST ✅" if wfe >= 0.50 else "FRAGILE ⚠️ — consider re-optimising"
-    n_silent    = sum(1 for w in wfa["windows"] if w.get("oos_n_trades", 0) == 0)
+    n_win     = wfa["n_windows"]
+    n_valid   = wfa["n_valid_windows"]
+    wfe       = wfa["wfe_ratio"]
+    scores    = wfa["window_scores"]
+    verdict   = "ROBUST" if wfe >= 0.50 else "FRAGILE — re-optimise recommended"
 
-    print(f"\n  Total windows     : {n_win}")
-    print(f"  Valid windows     : {n_valid}  (≥5 IS trades, ≥1 OOS trade — used for WFE)")
-    print(f"  Silent windows    : {n_silent}  (0 OOS trades — model held back by efficiency filter)")
-    print(f"  Mean IS  Sharpe   : {mean_is:+.3f}  [valid only]")
-    print(f"  Mean OOS Sharpe   : {mean_oos:+.3f}  [valid only]")
-    print(f"  Walk-Forward Eff  : {wfe * 100:.1f}%  [{verdict}]")
+    print(f"  Total windows     : {n_win}")
+    print(f"  Valid windows     : {n_valid}  (OOS trades above hard floor, DD < 20%)")
+    print(f"  Median OOS score  : {float(__import__('numpy').median(scores)) if scores else 0.0:+.3f}")
+    print(f"  Std OOS Sharpe    : {wfa['std_sharpe']:.3f}")
+    print(f"  Median OOS trades : {wfa['median_trades']}")
+    print(f"  WFE ratio         : {wfe:.3f}  [{verdict}]")
+    print(f"  WFO score         : {wfa['wfo_score']:+.3f}")
 
-    if n_win > 0:
-        print("\n  Per-window OOS breakdown:")
-        WFA_FOLD_PASS_SCORE = 1.0
-        for w in wfa["windows"]:
-            oos_s  = w.get("oos_sharpe_ratio", 0.0)
-            oos_t  = w.get("oos_n_trades",    0)
-            period = (
-                f"{w['oos_start'].strftime('%Y-%m')} → "
-                f"{w['oos_end'].strftime('%Y-%m')}"
-            )
-            if oos_t == 0:
-                flag = "—"          # model was silent; not a warning
-            elif oos_t < 3:
-                flag = "⚠️ (thin)"  # signal fired but sample too small to trust
-            else:
-                oos_fdd = w.get("oos_floating_max_drawdown", w.get("oos_max_drawdown", 0.0))
-                fold_r  = {
-                    "total_return":          w.get("oos_total_return", 0.0),
-                    "floating_max_drawdown": oos_fdd,
-                    "sharpe_ratio":          oos_s,
-                    "profit_factor":         w.get("oos_profit_factor", 1.0),
-                    "return_consistency":    w.get("oos_return_consistency", 0.0),
-                }
-                fold_score = _calc_score(fold_r, tf=tf)
-                if fold_score >= WFA_FOLD_PASS_SCORE:
-                    flag = f"✅ ({fold_score:.2f})"
-                elif fold_score >= 0:
-                    flag = f"⚠️ ({fold_score:.2f})"
-                else:
-                    flag = f"❌ ({fold_score:.2f})"
-                if w.get("oos_profit_factor", 1.0) < 1.2:
-                    flag += " ⚠️PF<1.2"
-            oos_pf  = w.get("oos_profit_factor", 1.0)
-            oos_eff = w.get("oos_avg_efficiency", 0.0)
-            eff_str = f"{oos_eff:.2f}x" if oos_t >= 3 else "  —  "
-            print(f"    {period}  OOS={oos_s:+.3f}  PF={oos_pf:.2f}  Eff={eff_str}  trades={oos_t}  {flag}")
+    if scores:
+        print("\n  Per-window scores:")
+        for i, s in enumerate(scores):
+            bar = "#" * max(0, int((s + 1) * 5))
+            print(f"    Window {i+1:>2}: {s:+.3f}  {bar}")
 
     send_telegram_msg(
-        f"📊 <b>Walk-Forward Analysis [{tf}]</b>\n"
-        f"Valid windows: <b>{n_valid}/{n_win}</b>  |  "
-        f"IS: <b>{mean_is:+.3f}</b>  |  OOS: <b>{mean_oos:+.3f}</b>\n"
-        f"WFE: <b>{wfe * 100:.1f}%</b>  "
-        + ("✅ Robust" if wfe >= 0.50 else "⚠️ Fragile — re-optimise recommended")
+        f"<b>Walk-Forward Analysis [{tf}]</b>\n"
+        f"Valid windows: <b>{n_valid}/{n_win}</b>  |  WFE: <b>{wfe:.2f}</b>\n"
+        f"WFO score: <b>{wfa['wfo_score']:+.3f}</b>  "
+        + ("Robust" if wfe >= 0.50 else "Fragile — re-optimise")
     )
 
 
@@ -350,20 +259,46 @@ def cmd_process(args):
 
 
 def cmd_optimize(args):
-    balance = _resolve_balance(args)
-    broker = args.broker
-    tfs = [t.strip().upper() for t in args.tf.split(",")]
+    import pandas as pd
+    balance  = _resolve_balance(args)
+    broker   = args.broker
+    tfs      = [t.strip().upper() for t in args.tf.split(",")]
+    wfo_mode = "fast" if getattr(args, "fast_wfo", False) else "standard"
+
     for tf in tfs:
         reconfigure_for_tf(tf)
-        logger.info("Optimizing [%s] broker=%s balance=$%.0f trials=%d", tf, broker, balance, args.trials)
-        study = run_optimization(n_trials=args.trials, balance=balance, broker=broker, tf=tf, n_jobs=args.n_jobs)
+        logger.info(
+            "Optimizing [%s] broker=%s balance=$%.0f trials=%d wfo_mode=%s",
+            tf, broker, balance, args.trials, wfo_mode,
+        )
+
+        # Pre-load parquet once — make_objective only calls kalman_smooth per trial
+        processed_path = TF_CONFIG[tf]["processed_path"]
+        if not processed_path.exists():
+            print(
+                f"\nERROR: Processed parquet not found for {tf}.\n"
+                f"Run  python main.py --mode process --tf {tf}  first."
+            )
+            sys.exit(1)
+        df = pd.read_parquet(processed_path)
+
+        study = run_optimization(
+            df=df,
+            tf=tf,
+            broker=broker,
+            account_size=balance,
+            n_trials=args.trials,
+            wfo_mode=wfo_mode,
+            n_jobs=args.n_jobs,
+        )
+
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
-        print(f"Broker:        {broker}")
-        print(f"Balance:       ${balance:.0f} USD")
+        print(f"Broker:        {broker}  |  Balance: ${balance:.0f}  |  WFO mode: {wfo_mode}")
         print("Best Params:")
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
+
         if tf == "M5":
             meta_path = _m5_meta_path(broker)
             meta_path.parent.mkdir(parents=True, exist_ok=True)
@@ -434,6 +369,35 @@ def cmd_train(args):
     if cpcv_score is not None:
         print(f"CPCV Validation Score (best trial): {cpcv_score:.3f}")
     print(f"\nModels saved. Run --mode export to generate ONNX.")
+
+
+def cmd_extract_consensus(args):
+    """Extract consensus hyperparameters from top-N trials (median per param).
+
+    More robust than the single best trial. Prints the consensus params and
+    saves them nowhere — use with --mode train to apply the consensus params.
+    """
+    tf      = args.tf.upper()
+    broker  = args.broker
+    top_n   = getattr(args, "top_n", 10)
+    min_wfe = getattr(args, "min_wfe", 0.0)
+    reconfigure_for_tf(tf)
+
+    try:
+        consensus = extract_consensus_params(tf=tf, broker=broker, top_n=top_n, min_wfe=min_wfe)
+    except Exception as exc:
+        print(f"\nERROR: {exc}")
+        sys.exit(1)
+
+    meta = consensus.pop("meta", {})
+    print(f"\n=== Consensus Params [{tf} / {broker}] ===")
+    print(f"  Study:      {meta.get('study_name', '?')}")
+    print(f"  Top-N used: {meta.get('top_n_actual', top_n)}")
+    print(f"  Score range: [{meta.get('min_score', 0.0):.3f}, {meta.get('max_score', 0.0):.3f}]")
+    print(f"  Mean WFE:   {meta.get('mean_wfe', 0.0):.3f}")
+    print("\n  Consensus parameters (median of top-N):")
+    for k, v in sorted(consensus.items()):
+        print(f"    {k}: {v}")
 
 
 def cmd_compare(args):
@@ -1036,7 +1000,7 @@ def main():
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
                  "sync_validate", "demo", "live", "audit", "guardian", "listen",
-                 "consolidate", "wfa", "sensitivity", "train_tcn"],
+                 "consolidate", "wfa", "sensitivity", "train_tcn", "extract_consensus"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -1078,6 +1042,12 @@ def main():
                         help="Fine-tune an existing TCN on recent data instead of full retraining.")
     parser.add_argument("--recent_years", type=int, default=2,
                         help="Years of recent data used for --fine_tune (default 2).")
+    parser.add_argument("--fast_wfo", action="store_true",
+                        help="Use faster WFO window sizes for --mode optimize and --mode wfa.")
+    parser.add_argument("--top_n", type=int, default=10,
+                        help="Top-N trials to aggregate for --mode extract_consensus (default 10).")
+    parser.add_argument("--min_wfe", type=float, default=0.0,
+                        help="Minimum WFE ratio filter for --mode extract_consensus (default 0).")
 
     args = parser.parse_args()
     {
@@ -1097,6 +1067,7 @@ def main():
         "wfa":           cmd_wfa,
         "sensitivity":   cmd_sensitivity,
         "train_tcn":     cmd_train_tcn,
+        "extract_consensus": cmd_extract_consensus,
     }[args.mode](args)
 
 
