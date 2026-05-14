@@ -45,14 +45,22 @@ except ImportError:
     logger.debug("psutil not installed — RAM guard disabled.")
 
 # ── Versioning ─────────────────────────────────────────────────────────────────
-OPTIMIZER_VERSION = "3.1"  # bump when search space or scoring formula changes
+OPTIMIZER_VERSION = "3.3"  # bump when search space or scoring formula changes
 
 # ── Rolling WFO window sizes (bars) ───────────────────────────────────────────
 WFO_PARAMS = {
-    "H1":  {"is_bars": 8760,   "oos_bars": 2160,  "embargo_bars": 24,  "step_bars": 2160},
+    # H1: step doubled to 2×OOS (4320) so IS overlap between consecutive
+    # windows drops from 75% → 50%, giving more independent test periods.
+    "H1":  {"is_bars": 8760,   "oos_bars": 2160,  "embargo_bars": 24,  "step_bars": 4320},
     "M15": {"is_bars": 35040,  "oos_bars": 8640,  "embargo_bars": 96,  "step_bars": 8640},
     "M5":  {"is_bars": 105120, "oos_bars": 25920, "embargo_bars": 288, "step_bars": 25920},
 }
+
+# Maximum number of WFO windows to evaluate per trial.  When the dataset
+# yields more windows than this cap, the OLDEST windows are skipped so that
+# only the most-recent MAX_WFO_WINDOWS windows are used.  This keeps trial
+# cost predictable and avoids over-weighting stale market regimes.
+MAX_WFO_WINDOWS = {"H1": 8, "M15": 8, "M5": 8}
 WFO_PARAMS_FAST = {
     "H1":  {"is_bars": 4380,  "oos_bars": 1080, "embargo_bars": 24,  "step_bars": 1080},
     "M15": {"is_bars": 17520, "oos_bars": 4320, "embargo_bars": 96,  "step_bars": 4320},
@@ -93,8 +101,8 @@ SEARCH_SPACES = {
         "n_states":         (3,     4,    "int"),
         "max_depth":        (3,     7,    "int"),
         "reg_alpha":        (1e-6,  0.3,  "log"),
-        "reg_lambda":       (0.1,   10.0, "log"),
-        "min_child_weight": (5,     100,  "int"),
+        "reg_lambda":       (0.1,   5.0,  "log"),
+        "min_child_weight": (5,     40,   "int"),
         "learning_rate":    (0.005, 0.15, "log"),
         "n_estimators":     (50,    400,  "int"),
     },
@@ -426,8 +434,19 @@ def _run_wfo(
     n_valid_windows = 0
     n_cv_folds      = CV_FOLDS.get(tf.upper(), 2)
 
-    start = 0
-    while start + is_bars + oos_bars + embargo_bars <= n:
+    # Pre-compute all valid window start positions, then skip the oldest ones
+    # if the total exceeds MAX_WFO_WINDOWS.  Using the most-recent windows
+    # avoids over-weighting old regimes and keeps trial cost bounded.
+    all_starts: list[int] = []
+    s = 0
+    while s + is_bars + oos_bars + embargo_bars <= n:
+        all_starts.append(s)
+        s += step_bars
+    max_wins = MAX_WFO_WINDOWS.get(tf.upper(), 12)
+    if len(all_starts) > max_wins:
+        all_starts = all_starts[-max_wins:]
+
+    for start in all_starts:
         is_end    = start + is_bars
         oos_start = is_end + embargo_bars
         oos_end   = oos_start + oos_bars
@@ -436,7 +455,7 @@ def _run_wfo(
         df_oos = df.iloc[oos_start:min(oos_end, n)]
 
         if len(df_oos) < oos_bars // 2:
-            break
+            continue
 
         win = _run_single_window(
             df_is=df_is, df_oos=df_oos,
@@ -450,7 +469,6 @@ def _run_wfo(
         # Skip windows that error out before producing any result
         if not win["ok"] and "degenerate" not in (win.get("error") or ""):
             logger.warning("WFO [%s] window start=%d skipped: %s", tf, start, win.get("error"))
-            start += step_bars
             continue
 
         score = win["oos_score"]
@@ -466,7 +484,6 @@ def _run_wfo(
             "WFO [%s] window start=%d: trades=%d sharpe=%.3f cv_sharpe=%.3f score=%.3f",
             tf, start, win["oos_n_trades"], win["oos_sharpe"], win["is_cv_sharpe"], score,
         )
-        start += step_bars
 
     if not window_scores:
         logger.warning(
@@ -483,7 +500,16 @@ def _run_wfo(
     median_trades = int(np.median(window_trades))
     mean_oos      = float(np.mean(window_sharpes))
     mean_is       = float(np.mean(is_cv_sharpes)) if is_cv_sharpes else 0.0
-    wfe_ratio     = (mean_oos / max(abs(mean_is), 0.01)) if mean_is != 0 else 0.0
+    # WFE (Walk-Forward Efficiency): OOS Sharpe / IS Sharpe — sign-preserving.
+    # Positive WFE means OOS and IS agree in direction (either both good or both
+    # bad).  Negative WFE means IS is positive but OOS flips negative, which is
+    # the classic overfitting signature.  Using abs(mean_is) as the denominator
+    # (old approach) incorrectly treated a consistently-negative model as
+    # overfitting, causing the -3 cap to fire on every trial.
+    if abs(mean_is) < 0.01:
+        wfe_ratio = 0.0
+    else:
+        wfe_ratio = float(mean_oos / mean_is)  # sign-preserving
 
     valid_sc = [s for s in window_scores if s > -50.0]
     if valid_sc and all(s > 0.30 for s in valid_sc):
