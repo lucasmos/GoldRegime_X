@@ -45,7 +45,7 @@ except ImportError:
     logger.debug("psutil not installed — RAM guard disabled.")
 
 # ── Versioning ─────────────────────────────────────────────────────────────────
-OPTIMIZER_VERSION = "3.3"  # bump when search space or scoring formula changes
+OPTIMIZER_VERSION = "3.5"  # bump when search space or scoring formula changes
 
 # ── Rolling WFO window sizes (bars) ───────────────────────────────────────────
 WFO_PARAMS = {
@@ -96,37 +96,49 @@ TF_MIN_OOS_TRADES = SOFT_TRADE_FLOORS    # backward-compat alias
 # TF-keyed search space specs (for config hash)
 SEARCH_SPACES = {
     "H1": {
-        "obs_cov":          (0.5,   5.0,  "log"),
-        "trans_cov":        (0.001, 0.03, "log"),
-        "n_states":         (3,     4,    "int"),
-        "max_depth":        (3,     7,    "int"),
-        "reg_alpha":        (1e-6,  0.3,  "log"),
-        "reg_lambda":       (0.1,   5.0,  "log"),
-        "min_child_weight": (5,     40,   "int"),
-        "learning_rate":    (0.005, 0.15, "log"),
-        "n_estimators":     (50,    400,  "int"),
+        "obs_cov":           (0.5,   5.0,  "log"),
+        "trans_cov":         (0.001, 0.03, "log"),
+        "n_states":          (3,     4,    "int"),
+        "max_depth":         (3,     7,    "int"),
+        "reg_alpha":         (1e-6,  0.3,  "log"),
+        "reg_lambda":        (0.1,   10.0, "log"),
+        "min_child_weight":  (5,     100,  "int"),
+        "learning_rate":     (0.005, 0.15, "log"),
+        "n_estimators":      (50,    400,  "int"),
+        "subsample":         (0.5,   0.9,  "float"),
+        "colsample_bytree":  (0.4,   0.9,  "float"),
+        "gamma":             (1e-6,  0.3,  "log"),
+        "scale_pos_weight":  (0.5,   2.0,  "log"),
     },
     "M15": {
-        "obs_cov":          (0.5,   5.0,  "log"),
-        "trans_cov":        (0.001, 0.03, "log"),
-        "n_states":         (4,     4,    "cat"),
-        "max_depth":        (3,     7,    "int"),
-        "reg_alpha":        (0.05,  5.0,  "log"),
-        "reg_lambda":       (0.5,   15.0, "log"),
-        "min_child_weight": (3,     30,   "int"),
-        "learning_rate":    (0.005, 0.2,  "log"),
-        "n_estimators":     (100,   500,  "int"),
+        "obs_cov":           (0.5,   5.0,  "log"),
+        "trans_cov":         (0.001, 0.03, "log"),
+        "n_states":          (4,     4,    "cat"),
+        "max_depth":         (3,     7,    "int"),
+        "reg_alpha":         (0.05,  5.0,  "log"),
+        "reg_lambda":        (0.5,   15.0, "log"),
+        "min_child_weight":  (3,     30,   "int"),
+        "learning_rate":     (0.005, 0.2,  "log"),
+        "n_estimators":      (100,   500,  "int"),
+        "subsample":         (0.5,   0.9,  "float"),
+        "colsample_bytree":  (0.5,   1.0,  "float"),
+        "gamma":             (1e-6,  0.3,  "log"),
+        "scale_pos_weight":  (0.5,   2.0,  "log"),
     },
     "M5": {
-        "obs_cov":          (0.05,  5.0,  "log"),
-        "trans_cov":        (0.001, 0.1,  "log"),
-        "n_states":         (4,     4,    "cat"),
-        "max_depth":        (2,     4,    "int"),
-        "reg_alpha":        (1.0,   30.0, "log"),
-        "reg_lambda":       (1.0,   30.0, "log"),
-        "min_child_weight": (5,     25,   "int"),
-        "learning_rate":    (0.01,  0.15, "log"),
-        "n_estimators":     (200,   600,  "int"),
+        "obs_cov":           (0.05,  5.0,  "log"),
+        "trans_cov":         (0.001, 0.1,  "log"),
+        "n_states":          (4,     4,    "cat"),
+        "max_depth":         (2,     4,    "int"),
+        "reg_alpha":         (1.0,   30.0, "log"),
+        "reg_lambda":        (1.0,   30.0, "log"),
+        "min_child_weight":  (5,     25,   "int"),
+        "learning_rate":     (0.01,  0.15, "log"),
+        "n_estimators":      (200,   600,  "int"),
+        "subsample":         (0.55,  0.85, "float"),
+        "colsample_bytree":  (0.4,   0.8,  "float"),
+        "gamma":             (1e-6,  0.3,  "log"),
+        "scale_pos_weight":  (0.5,   2.0,  "log"),
     },
 }
 
@@ -495,23 +507,30 @@ def _run_wfo(
             "median_trades": 0, "std_sharpe": 0.0, "window_scores": [], "wfe_ratio": 0.0,
         }
 
-    wfo_score     = float(np.median(window_scores)) - 0.20 * float(np.std(window_scores))
     std_sharpe    = float(np.std(window_sharpes))
     median_trades = int(np.median(window_trades))
     mean_oos      = float(np.mean(window_sharpes))
     mean_is       = float(np.mean(is_cv_sharpes)) if is_cv_sharpes else 0.0
     # WFE (Walk-Forward Efficiency): OOS Sharpe / IS Sharpe — sign-preserving.
-    # Positive WFE means OOS and IS agree in direction (either both good or both
-    # bad).  Negative WFE means IS is positive but OOS flips negative, which is
-    # the classic overfitting signature.  Using abs(mean_is) as the denominator
-    # (old approach) incorrectly treated a consistently-negative model as
-    # overfitting, causing the -3 cap to fire on every trial.
     if abs(mean_is) < 0.01:
         wfe_ratio = 0.0
     else:
-        wfe_ratio = float(mean_oos / mean_is)  # sign-preserving
+        wfe_ratio = float(mean_oos / mean_is)
 
     valid_sc = [s for s in window_scores if s > -50.0]
+    n_failed = len(window_scores) - len(valid_sc)
+
+    if valid_sc:
+        # Compute WFO score on VALID windows only — including -50.0 in std
+        # inflates the penalty by 5-20× when even one window fails technically
+        # (e.g. null XGB model → <20 trades → -50 floor).
+        wfo_score = float(np.median(valid_sc)) - 0.20 * float(np.std(valid_sc))
+        # Each hard-floor window still penalises the trial (0.5 per failure)
+        if n_failed > 0:
+            wfo_score -= n_failed * 0.5
+    else:
+        wfo_score = -100.0
+
     if valid_sc and all(s > 0.30 for s in valid_sc):
         wfo_score *= 1.05
 

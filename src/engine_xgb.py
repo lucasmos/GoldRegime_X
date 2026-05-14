@@ -157,6 +157,20 @@ def train_xgb(
     X_test  = X.iloc[split_idx:] if has_holdout else None
     y_test  = y.iloc[split_idx:] if has_holdout else None
 
+    # Adaptive min_child_weight cap: prevents zero-split (null) models when the
+    # bucket training set is small.  At max_depth d, a full binary tree has 2^d
+    # leaves; each needs min_child_weight samples.  Capping at rows / (2^d)
+    # guarantees at least one valid split path even under heavy regularisation.
+    es_preview = int(len(X_train) * 0.85) if not has_holdout else len(X_train)
+    effective_train = max(es_preview, 30)
+    max_safe_mcw = max(3, effective_train // (2 ** max_depth))
+    if min_child_weight > max_safe_mcw:
+        logger.debug(
+            "min_child_weight capped %d→%d (effective_train=%d, max_depth=%d)",
+            min_child_weight, max_safe_mcw, effective_train, max_depth,
+        )
+        min_child_weight = max_safe_mcw
+
     model = xgb.XGBClassifier(
         max_depth=max_depth,
         learning_rate=learning_rate,
@@ -170,17 +184,38 @@ def train_xgb(
         scale_pos_weight=scale_pos_weight,
         objective="binary:logistic",
         eval_metric="logloss",
+        early_stopping_rounds=30,
         random_state=42,
         n_jobs=-1,
         verbosity=0,
     )
     if has_holdout:
+        # Explicit holdout: use it for early stopping and accuracy reporting
         model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+        X_eval, y_eval = X_test, y_test
     else:
-        model.fit(X_train, y_train, verbose=False)
+        # Full IS mode (train_ratio=1.0): carve last 15% as early-stopping guard.
+        # Time-ordered split so the guard fold represents "near-future" signal
+        # quality, preventing the model from memorising the IS data.
+        es_idx = int(len(X_train) * 0.85)
+        if es_idx > 30:
+            model.fit(
+                X_train.iloc[:es_idx], y_train.iloc[:es_idx],
+                eval_set=[(X_train.iloc[es_idx:], y_train.iloc[es_idx:])],
+                verbose=False,
+            )
+            X_train = X_train.iloc[:es_idx]
+            y_train = y_train.iloc[:es_idx]
+            X_eval  = X.iloc[es_idx:]
+            y_eval  = y.iloc[es_idx:]
+        else:
+            # Not enough rows for a meaningful guard fold — fall back to no ES
+            model.set_params(early_stopping_rounds=None)
+            model.fit(X_train, y_train, verbose=False)
+            X_eval, y_eval = X_train, y_train
 
     train_acc = accuracy_score(y_train, model.predict(X_train))
-    test_acc  = accuracy_score(y_test, model.predict(X_test)) if has_holdout else train_acc
+    test_acc  = accuracy_score(y_eval, model.predict(X_eval))
     importance = dict(zip(list(X.columns), model.feature_importances_))
     if importance.get("hmm_state", 1.0) == 0.0:
         logger.warning(
