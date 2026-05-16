@@ -122,6 +122,37 @@ def compute_position_sizes(
     return sizes
 
 
+def compute_signals(
+    df: "pd.DataFrame",
+    probabilities: np.ndarray,
+    hmm_states: np.ndarray,
+    tf: str = "H1",
+    broker: str = "standard",
+    account_size: float = 15.0,
+    hmm_transmat=None,
+    **_kwargs,  # absorb legacy zscore/regime_stats/threshold arguments
+) -> np.ndarray:
+    """Return the +1/0/-1 signal array from the SignalEngine bar loop.
+
+    Thin public wrapper around ``_run_bar_loop`` for use by visualizer and
+    audit tools.  All deprecated Z-score / regime-stats arguments are silently
+    ignored via ``**_kwargs``.
+    """
+    closes = df["Close"].values
+    highs  = df["High"].values if "High" in df.columns else closes
+    lows   = df["Low"].values  if "Low"  in df.columns else closes
+    _tr = np.maximum(highs - lows,
+          np.maximum(np.abs(highs - np.roll(closes, 1)),
+                     np.abs(lows  - np.roll(closes, 1))))
+    raw_atr_arr = pd.Series(_tr).rolling(14, min_periods=1).mean().bfill().values
+    signals, *_ = _run_bar_loop(
+        df, probabilities, hmm_states, hmm_transmat,
+        tf=tf, broker=broker, account_size=account_size,
+        raw_atr_arr=raw_atr_arr,
+    )
+    return signals
+
+
 def compute_trade_costs(signals: np.ndarray, broker: str = "standard") -> np.ndarray:
     """Apply spread + commission only at position transitions (entry / exit / reversal).
 
@@ -428,10 +459,10 @@ def _run_bar_loop(
     tp1_level     = 0.0
     signal_type   = "trend"
 
-    # Cooldown length: H1 → 5 bars (one quarter-day); shorter TFs → 2 bars.
+    # Cooldown length: H1 → 3 bars; shorter TFs → 2 bars.
     # Prevents immediate re-entry after a stop-out in a rapidly oscillating
-    # HMM regime, which otherwise produces 700+ H1 trades per OOS window.
-    _entry_cooldown = 5 if _tf_up == "H1" else 2
+    # HMM regime while still allowing reasonable trade frequency.
+    _entry_cooldown = 3 if _tf_up == "H1" else 2
 
     for i in range(n):
         regime_info  = engine.update_regime(int(states[i]), hmm_transmat)

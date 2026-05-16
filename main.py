@@ -34,6 +34,7 @@ from src.optimizer import (
     extract_consensus_params, run_wfa as optimizer_run_wfa,
     WFO_PARAMS, WFO_PARAMS_FAST,
     run_optimization_stage1,
+    CPCV_N_BLOCKS, CPCV_K_TEST, _N_PATHS,
 )
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
@@ -183,12 +184,11 @@ def _check_model_staleness(tf: str, broker: str, args) -> None:
 
 
 def cmd_wfa(args):
-    """Walk-Forward Analysis: re-fit HMM+XGBoost on each rolling IS window.
+    """Walk-Forward Analysis using CPCV.
 
-    Uses the best Optuna params from the study DB to run the same rolling
-    IS/OOS evaluation that scored those params during optimization.  Prints
-    per-window OOS diagnostics and the Walk-Forward Efficiency (WFE) ratio.
-    WFE target: > 0.50 (OOS performance is at least 50% of IS performance).
+    Uses the best Optuna params from the study DB to evaluate all
+    C(N,K) combinatorial train/test paths (CPCV).  Prints per-path OOS
+    diagnostics and path-score statistics.
     """
     import pandas as pd
     from src.notifier import send_telegram_msg
@@ -207,38 +207,36 @@ def cmd_wfa(args):
     df = pd.read_parquet(processed_path)
     print(f"\n=== Walk-Forward Analysis [{tf} / {broker}] (mode: {wfo_mode}) ===")
     print(f"  Dataset: {len(df)} bars  ({df.index[0].date()} – {df.index[-1].date()})")
-    print("  Running rolling IS/OOS windows with best Optuna params...\n")
+    print(f"  Running CPCV ({CPCV_N_BLOCKS} blocks, C({CPCV_N_BLOCKS},{CPCV_K_TEST})={_N_PATHS} paths) with best Optuna params...\n")
 
     wfa = optimizer_run_wfa(
         df=df, tf=tf, broker=broker,
         account_size=balance, wfo_mode=wfo_mode,
     )
 
-    n_win     = wfa["n_windows"]
+    n_paths   = wfa["n_windows"]
     n_valid   = wfa["n_valid_windows"]
-    wfe       = wfa["wfe_ratio"]
     scores    = wfa["window_scores"]
-    verdict   = "ROBUST" if wfe >= 0.50 else "FRAGILE — re-optimise recommended"
+    verdict   = "ROBUST" if n_valid >= n_paths // 2 else "FRAGILE — re-optimise recommended"
 
-    print(f"  Total windows     : {n_win}")
-    print(f"  Valid windows     : {n_valid}  (OOS trades above hard floor, DD < 20%)")
+    print(f"  Total CPCV paths  : {n_paths}")
+    print(f"  Valid paths       : {n_valid}  (OOS trades above hard floor, DD < 20%)")
     print(f"  Median OOS score  : {float(__import__('numpy').median(scores)) if scores else 0.0:+.3f}")
     print(f"  Std OOS Sharpe    : {wfa['std_sharpe']:.3f}")
     print(f"  Median OOS trades : {wfa['median_trades']}")
-    print(f"  WFE ratio         : {wfe:.3f}  [{verdict}]")
-    print(f"  WFO score         : {wfa['wfo_score']:+.3f}")
+    print(f"  Verdict           : {verdict}")
+    print(f"  CPCV score        : {wfa['wfo_score']:+.3f}")
 
     if scores:
-        print("\n  Per-window scores:")
+        print("\n  Per-path scores:")
         for i, s in enumerate(scores):
             bar = "#" * max(0, int((s + 1) * 5))
-            print(f"    Window {i+1:>2}: {s:+.3f}  {bar}")
+            print(f"    Path  {i+1:>2}: {s:+.3f}  {bar}")
 
     send_telegram_msg(
         f"<b>Walk-Forward Analysis [{tf}]</b>\n"
-        f"Valid windows: <b>{n_valid}/{n_win}</b>  |  WFE: <b>{wfe:.2f}</b>\n"
-        f"WFO score: <b>{wfa['wfo_score']:+.3f}</b>  "
-        + ("Robust" if wfe >= 0.50 else "Fragile — re-optimise")
+        f"Valid paths: <b>{n_valid}/{n_paths}</b>  |  CPCV score: <b>{wfa['wfo_score']:+.3f}</b>\n"
+        + ("Robust" if n_valid >= n_paths // 2 else "Fragile — re-optimise")
     )
 
 
@@ -830,95 +828,6 @@ def cmd_listen(args):
 
 
 
-def cmd_train_tcn(args):
-    """Train the TCN signal confidence scorer (replaces LSTM ensemble).
-
-    The TCN learns from 100-bar sequences to predict whether the next bar's
-    direction will match the current HMM regime.  At inference time the output
-    (a confidence multiplier in [0.7, 1.3]) scales the Z-Score cutoff:
-
-        effective_z = base_z × multiplier
-        multiplier < 1.0 → relaxed entry (strong, clear regime)
-        multiplier > 1.0 → tightened entry (noisy / uncertain regime)
-
-    Full training:
-        python main.py --mode train_tcn --tf H1 --broker headway_cent --epochs 100
-
-    Fine-tune on last 2 years:
-        python main.py --mode train_tcn --tf H1 --broker headway_cent \\
-            --epochs 20 --fine_tune --recent_years 2
-    """
-    from src.engine_tcn import SignalConfidenceTCN, get_tcn_dir
-    from src.processor import load_data_with_hmm_labels
-
-    tf           = args.tf.upper()
-    broker       = args.broker
-    epochs       = getattr(args, "epochs", 100)
-    seq_len      = getattr(args, "seq_len", 100)
-    temperature  = getattr(args, "temperature", 1.5)
-    fine_tune    = getattr(args, "fine_tune", False)
-    recent_years = getattr(args, "recent_years", 2)
-    reconfigure_for_tf(tf)
-
-    try:
-        df = load_data_with_hmm_labels(tf, broker)
-    except FileNotFoundError as exc:
-        print(f"\nERROR: {exc}\n")
-        sys.exit(1)
-
-    n_states = int(df["hmm_state"].nunique())
-    save_dir  = get_tcn_dir(tf, broker)
-
-    # TF-specific sequence lengths — CLI --seq_len overrides only if explicitly
-    # different from the default (100).  TF defaults give the best context window.
-    TF_SEQ_LENGTHS = {"H1": 50, "M15": 80, "M5": 100}
-    default_seq_len = TF_SEQ_LENGTHS.get(tf, 100)
-    seq_len = default_seq_len if seq_len == 100 else seq_len
-    if seq_len != default_seq_len:
-        logger.info("Using CLI --seq_len=%d (TF default was %d)", seq_len, default_seq_len)
-    else:
-        logger.info("Using TF-default seq_len=%d for %s", seq_len, tf)
-
-    tcn = SignalConfidenceTCN(
-        seq_len=seq_len,
-        n_states=n_states,
-        temperature=temperature,
-    )
-
-    if fine_tune:
-        import os
-        if not os.path.exists(os.path.join(save_dir, "tcn_confidence_model.keras")):
-            print("\nERROR: No existing TCN model to fine-tune. "
-                  "Run without --fine_tune first.\n")
-            sys.exit(1)
-        tcn.load(save_dir)
-        logger.info("Fine-tuning TCN [%s/%s] on last %d years…", tf, broker, recent_years)
-        tcn.fine_tune(
-            df, df["hmm_state"], df["log_return"],
-            epochs=epochs, recent_years=recent_years,
-        )
-    else:
-        logger.info("Training TCN [%s/%s] — %d bars  n_states=%d  T=%.1f",
-                    tf, broker, len(df), n_states, temperature)
-        tcn.train(df, df["hmm_state"], df["log_return"], epochs=epochs)
-
-    tcn.save(save_dir)
-
-    # Quick inference test on last bar
-    recent_seq = df.iloc[-(tcn.seq_len + 10):]
-    multiplier = tcn.predict_confidence(recent_seq)
-    if multiplier is not None:
-        logger.info(
-            "Quick test — last bar confidence multiplier: %.3f "
-            "(Z-cutoff %.0f%% of base)",
-            multiplier, multiplier * 100,
-        )
-
-    print(f"\n  TCN confidence model saved: {save_dir}")
-    print(f"  Run --mode demo/live to use dynamic Z-Score adjustment.\n")
-
-
-
 def cmd_sensitivity(args):
     """Z-Score sensitivity analysis on already-trained models.
 
@@ -1011,7 +920,7 @@ def main():
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
                  "sync_validate", "demo", "live", "audit", "guardian", "listen",
-                 "consolidate", "wfa", "sensitivity", "train_tcn", "extract_consensus"],
+                 "consolidate", "wfa", "sensitivity", "extract_consensus"],
         required=True,
     )
     parser.add_argument("--trials",   type=int,   default=250)
@@ -1087,7 +996,6 @@ def main():
         "consolidate":   cmd_consolidate,
         "wfa":           cmd_wfa,
         "sensitivity":   cmd_sensitivity,
-        "train_tcn":     cmd_train_tcn,
         "extract_consensus": cmd_extract_consensus,
     }[args.mode](args)
 

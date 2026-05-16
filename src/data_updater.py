@@ -1,8 +1,6 @@
 """Automatic weekly data updater — appends fresh MT5 bars to the raw CSV files.
 
-Runs every Sunday during a live/demo session.  After a successful update,
-``TCNMaintenanceScheduler`` in ``tcn_maintenance.py`` detects the refresh and
-triggers automatic TCN fine-tuning.
+Runs every Sunday during a live/demo session.
 
 The MT5 terminal must already be running and logged in before
 ``WeeklyDataUpdater.update_all_timeframes()`` is called (same requirement as the
