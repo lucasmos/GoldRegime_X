@@ -239,11 +239,13 @@ def run_validation(
     score = float((_rf_capped * 0.4) + (pf * 0.3) + (sharpe * 0.3))
 
     min_trades_warn = MIN_TRADES_WARNING_BY_TF.get(tf.upper(), 15)
+    _period_suggestions = {"M5": "3m", "M15": "6m", "H1": "1y"}
+    _period_hint = _period_suggestions.get(tf.upper(), "1y")
     if n_trades < min_trades_warn:
         logger.warning(
             "Only %d trades in the validation window — Sharpe estimate may be "
-            "unreliable.  Consider using a longer --period (e.g. '6m').",
-            n_trades,
+            "unreliable.  Consider using a longer --period (e.g. '%s').",
+            n_trades, _period_hint,
         )
 
     # Spread-Payoff Ratio check — warn if broker costs eat >50% of the model's edge

@@ -134,20 +134,16 @@ def plot_equity_curve(df, probabilities, hmm_states, split_idx=None, tf="H1", br
     """Equity curve with signal-type differentiated entry markers.
 
     Entry markers are split into four visual categories:
-      Blue   triangle-up   = Trend BUY   (HMM Bull state, high positive Z-Score)
-      Red    triangle-down = Trend SELL  (HMM Bear state, high negative Z-Score)
-      Gold   circle        = MR BUY      (HMM Chop state, extreme low Z-Score)
-      Purple circle        = MR SELL     (HMM Chop state, extreme high Z-Score)
+      Blue   triangle-up   = Trend BUY   (HMM Bull state, high XGB buy probability)
+      Red    triangle-down = Trend SELL  (HMM Bear state, high XGB sell probability)
+      Gold   circle        = MR BUY      (HMM Chop state, XGB buy signal in low-vol cluster)
+      Purple circle        = MR SELL     (HMM Chop state, XGB sell signal in high-vol cluster)
     """
     save_path = save_path or _tf_dir(tf, broker) / "2_equity_curve.png"
 
-    from src.backtester import compute_signals, compute_signals_zscore, compute_position_sizes, PROB_THRESHOLD, CHOP_STATE
+    from src.backtester import compute_signals, compute_position_sizes, CHOP_STATE
 
-    if regime_stats:
-        gmm_clusters = df["gmm_vol_cluster"].values if "gmm_vol_cluster" in df.columns else None
-        signals = compute_signals_zscore(probabilities, hmm_states, regime_stats, gmm_clusters)
-    else:
-        signals = compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD)
+    signals = compute_signals(df, probabilities, hmm_states, tf=tf, broker=broker)
     sizes = compute_position_sizes(signals, df["atr_normalized"].values)
 
     log_returns  = df["log_return"].values
@@ -641,18 +637,12 @@ def generate_full_report(df, hmm_states, state_names, model_hmm,
     account_size is used to convert drawdown fractions and signal-attribution
     log-returns into approximate USD figures on the summary dashboard.
     """
-    from src.backtester import compute_signals_zscore, compute_signals, compute_position_sizes, PROB_THRESHOLD
-
-    regime_stats = metrics.get("regime_stats") if metrics else None
+    from src.backtester import compute_signals, compute_position_sizes
 
     # Compute attribution metrics and inject into an enriched copy of result
     # so plot_summary_dashboard can render the Trend vs MR breakdown.
     try:
-        if regime_stats:
-            gmm_clusters = df["gmm_vol_cluster"].values if "gmm_vol_cluster" in df.columns else None
-            _sigs = compute_signals_zscore(probabilities, hmm_states, regime_stats, gmm_clusters)
-        else:
-            _sigs = compute_signals(probabilities, hmm_states, threshold=PROB_THRESHOLD)
+        _sigs = compute_signals(df, probabilities, hmm_states, tf=tf, broker=broker)
         _sizes = compute_position_sizes(_sigs, df["atr_normalized"].values)
         _lr    = df["log_return"].values
         _nr    = np.roll(_lr, -1)

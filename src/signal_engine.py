@@ -18,14 +18,14 @@ MIN_CHOP_CONFIRM_BARS = {"H1": 3, "M15": 2, "M5": 2}
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
 # exit fires.  H1: raised to 5 to match entry confirmation logic — a single
 # regime blip during a multi-day H1 trend should not prematurely close the trade.
-MIN_EXIT_CONFIRM_BARS = {"H1": 3, "M15": 2, "M5": 3}
+MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
 
 # XGBoost probability threshold for trend and MR entries.
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
 # direction), so only the highest-confidence bars have real signal.  Allowing
 # lower thresholds floods the engine with noise trades and destroys performance.
-ENTRY_PROB    = {"H1": 0.58, "M15": 0.55, "M5": 0.52}
-MR_ENTRY_PROB = {"H1": 0.55, "M15": 0.52, "M5": 0.50}
+ENTRY_PROB    = {"H1": 0.54, "M15": 0.55, "M5": 0.52}
+MR_ENTRY_PROB = {"H1": 0.56, "M15": 0.52, "M5": 0.50}
 
 # Maximum bars to hold a single trade before forcing exit
 MAX_HOLD_BARS = {"H1": 24, "M15": 32, "M5": 48}
@@ -36,7 +36,7 @@ PROFIT_EROSION_THRESHOLD = 0.40
 # Minimum HMM self-transition probability for stable regime entry/hold.
 # TF-specific: M5 HMMs naturally have lower persistence due to noise.
 PERSISTENCE_MIN = {
-    "H1": 0.65,
+    "H1": 0.55,
     "M15": 0.55,
     "M5": 0.45,
 }
@@ -44,10 +44,6 @@ PERSISTENCE_MIN = {
 # BB position extremity thresholds for MR entries
 MR_BB_BUY_MAX  = 0.30   # below this → MR_BUY (price at lower band)
 MR_BB_SELL_MIN = 0.70   # above this → MR_SELL (price at upper band)
-
-# TCN multiplier threshold — below this boosts effective xgb_prob by 10%
-TCN_BOOST_THRESHOLD = 0.85
-TCN_BOOST_FACTOR    = 1.10
 
 # MR position size fraction (smaller than trend — mean-reversion is higher risk)
 MR_SIZE_MULTIPLIER = 0.75
@@ -112,7 +108,6 @@ class SignalEngine:
         xgb_prob: float,
         gmm_cluster: int,
         bb_position: float | None = None,
-        tcn_multiplier: float = 1.0,
     ) -> dict | None:
         """Evaluate entry conditions for the current bar.
 
@@ -125,9 +120,8 @@ class SignalEngine:
         # xgb_prob = P(next bar UP) from binary XGBoost classifier.
         # Compute directional probabilities separately so BUY and SELL both
         # require XGB to AGREE with the intended trade direction.
-        _boost = TCN_BOOST_FACTOR if tcn_multiplier < TCN_BOOST_THRESHOLD else 1.0
-        eff_buy  = min(1.0, xgb_prob * _boost)           # P(UP)  — for BUY entries
-        eff_sell = min(1.0, (1.0 - xgb_prob) * _boost)   # P(DOWN) — for SELL entries
+        eff_buy  = xgb_prob             # P(UP)  — for BUY entries
+        eff_sell = 1.0 - xgb_prob       # P(DOWN) — for SELL entries
 
         state = regime_info["state"]
         bars = regime_info["bars_in_regime"]

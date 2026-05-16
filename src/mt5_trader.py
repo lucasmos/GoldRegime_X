@@ -1379,13 +1379,6 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         _upd.update_all_timeframes()
                 except Exception as _upd_exc:
                     logger.debug("Weekly data updater: %s", _upd_exc)
-                try:
-                    from src.tcn_maintenance import TCNMaintenanceScheduler
-                    _maint = TCNMaintenanceScheduler(broker=broker, balance=account_size)
-                    if _maint.should_run_check():
-                        _maint.run_maintenance_cycle()
-                except Exception as _maint_exc:
-                    logger.debug("TCN maintenance check: %s", _maint_exc)
             _, _probs = get_predictions_ensemble(models_xgb, thresholds_xgb, features_df)
             prob        = float(_probs[0])
             gmm_cluster = int(features_df["gmm_vol_cluster"].iloc[0]) if "gmm_vol_cluster" in features_df.columns else -1
@@ -1490,21 +1483,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
             _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
             _gmc    = gmm_cluster if gmm_cluster >= 0 else 1
 
-            # TCN multiplier
-            _tcn_mult_val = 1.0
-            if tcn_classifier is not None:
-                try:
-                    _tcn_r = tcn_classifier.predict_confidence(live_df)
-                    if _tcn_r is not None:
-                        _tcn_mult_val = float(_tcn_r)
-                except Exception:
-                    pass
-
             regime_info = signal_engine.update_regime(hmm_state, model_hmm.transmat_)
             entry = signal_engine.should_enter(
                 regime_info, prob, _gmc,
                 bb_position=_bb_pos if hmm_state >= CHOP_STATE else None,
-                tcn_multiplier=_tcn_mult_val,
             )
 
             if entry is None:
@@ -1512,10 +1494,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                                else "BEAR" if hmm_state == BEAR_STATE
                                else "CHOP")
                 logger.info(
-                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  BB=%.2f  tcn=%.2f",
+                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  BB=%.2f",
                     regime_desc, hmm_state, prob,
                     regime_info["bars_in_regime"], regime_info["stability"],
-                    _bb_pos, _tcn_mult_val,
+                    _bb_pos,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue
