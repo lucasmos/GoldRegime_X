@@ -33,6 +33,7 @@ from src.optimizer import (
     run_optimization, get_best_params, _score_result as _calc_score,
     extract_consensus_params, run_wfa as optimizer_run_wfa,
     WFO_PARAMS, WFO_PARAMS_FAST,
+    run_optimization_stage1,
 )
 from src.backtester import vectorized_backtest, format_payout
 from src.visualizer import generate_full_report
@@ -264,12 +265,13 @@ def cmd_optimize(args):
     broker   = args.broker
     tfs      = [t.strip().upper() for t in args.tf.split(",")]
     wfo_mode = "fast" if getattr(args, "fast_wfo", False) else "standard"
+    stage    = getattr(args, "stage", None)   # None | "xgb" | "trading"
 
     for tf in tfs:
         reconfigure_for_tf(tf)
         logger.info(
-            "Optimizing [%s] broker=%s balance=$%.0f trials=%d wfo_mode=%s",
-            tf, broker, balance, args.trials, wfo_mode,
+            "Optimizing [%s] broker=%s balance=$%.0f trials=%d wfo_mode=%s stage=%s",
+            tf, broker, balance, args.trials, wfo_mode, stage or "joint",
         )
 
         # Pre-load parquet once — make_objective only calls kalman_smooth per trial
@@ -282,15 +284,24 @@ def cmd_optimize(args):
             sys.exit(1)
         df = pd.read_parquet(processed_path)
 
-        study = run_optimization(
-            df=df,
-            tf=tf,
-            broker=broker,
-            account_size=balance,
-            n_trials=args.trials,
-            wfo_mode=wfo_mode,
-            n_jobs=args.n_jobs,
-        )
+        if stage == "xgb":
+            # ── Stage-1: fast single hold-out XGB exploration (no CPCV) ─────
+            study = run_optimization_stage1(
+                df=df, tf=tf, broker=broker,
+                account_size=balance, n_trials=args.trials,
+            )
+        else:
+            # ── Stage-2 / joint: full CPCV optimization ───────────────────────
+            study = run_optimization(
+                df=df,
+                tf=tf,
+                broker=broker,
+                account_size=balance,
+                n_trials=args.trials,
+                wfo_mode=wfo_mode,
+                n_jobs=args.n_jobs,
+                warm_start_stage1=(stage == "trading"),
+            )
 
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
@@ -1048,6 +1059,16 @@ def main():
                         help="Top-N trials to aggregate for --mode extract_consensus (default 10).")
     parser.add_argument("--min_wfe", type=float, default=0.0,
                         help="Minimum WFE ratio filter for --mode extract_consensus (default 0).")
+    parser.add_argument(
+        "--stage", type=str, default=None, choices=["xgb", "trading"],
+        help=(
+            "Two-stage optimisation mode for --mode optimize.\n"
+            "  xgb     : Stage-1 — fast single hold-out XGB exploration (no CPCV, ~5x faster).\n"
+            "            Saves best params to models/stage1_{tf}_{broker}.json.\n"
+            "  trading : Stage-2 — full CPCV optimization warm-started from Stage-1 params.\n"
+            "If omitted, runs the standard joint optimization (same as before)."
+        ),
+    )
 
     args = parser.parse_args()
     {
