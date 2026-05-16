@@ -88,13 +88,35 @@ def reconfigure_for_tf(tf: str, level: int = logging.INFO) -> None:
 
     # Ensure future loggers created during this run also write to the TF file.
     # We do this by monkeypatching setup_logger's default file path for this process.
-    global _active_tf_handler
+    global _active_tf_handler, _score_fh
     _active_tf_handler = tf_fh
+
+    # Score-only log: one clean line per trial for easy tail -f monitoring.
+    score_log_path = LOG_DIR / f"goldregimex_{tf.upper()}_scores.log"
+    _score_fh = _make_file_handler(score_log_path, level)
 
 
 # Module-level slot for the active TF handler so setup_logger can pick it up
 # for loggers created *after* reconfigure_for_tf() is called.
 _active_tf_handler: Optional[logging.FileHandler] = None
+
+# Separate per-TF score log — one line per trial for easy progress tracking.
+_score_fh: Optional[logging.FileHandler] = None
+
+
+def append_trial_score(message: str) -> None:
+    """Append a single score line to logs/goldregimex_{tf}_scores.log.
+
+    Called once per trial by the optimizer so the scores log stays clean and
+    easy to ``tail -f`` without HMM/XGB noise.
+    """
+    if _score_fh is None:
+        return
+    record = logging.LogRecord(
+        name="scores", level=logging.INFO, pathname="", lineno=0,
+        msg=message, args=(), exc_info=None,
+    )
+    _score_fh.emit(record)
 
 
 def log_regime_transition(logger, timestamp, old_state, new_state, state_names):

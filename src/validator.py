@@ -25,14 +25,18 @@ from src.processor import (
     TF_CONFIG,
     USDCHF_MASTER_PATH,
     _USDCHF_PATH_BY_TF,
+    _EXTERNAL_ASSET_PATHS,
     load_usdchf_data,
     map_usdchf_to_bars,
+    load_asset_data,
+    map_asset_to_bars,
     compute_log_returns,
     kalman_smooth,
     compute_volatility,
     compute_rsi,
     compute_atr,
     compute_gmm_vol_cluster,
+    compute_synth_vix,
     load_gmm_model,
     load_feature_scaler,
 )
@@ -89,27 +93,24 @@ def _apply_features(
         df["volatility"].values, fitted_gmm=_gmm, fitted_scaler=_scaler
     )
 
-    # Mirror process_pipeline: add USDCHF if the matching TF master file exists
-    usdchf_path = _USDCHF_PATH_BY_TF.get(tf.upper(), USDCHF_MASTER_PATH)
-    usdchf_df = load_usdchf_data(usdchf_path)
-    if usdchf_df is not None:
-        df["usdchf_log_return"] = map_usdchf_to_bars(df.index, usdchf_df)
+    # All external cross-asset features — mirrors process_pipeline exactly.
+    for asset_key, path_by_tf in _EXTERNAL_ASSET_PATHS.items():
+        col_name = f"{asset_key}_log_return"
+        path     = path_by_tf.get(tf.upper(), path_by_tf.get("H1"))
+        asset_df = load_asset_data(path, col_name)
+        if asset_df is not None:
+            df[col_name] = map_asset_to_bars(df.index, asset_df, col_name)
 
-    # Log NaN counts per column before dropping — helps diagnose alignment issues
-    nan_counts = df.isna().sum()
-    any_all_nan = nan_counts[nan_counts == len(df)]
-    if not any_all_nan.empty:
-        logger.warning(
-            "_apply_features [%s]: columns entirely NaN (will wipe all rows after dropna): %s",
-            tf, any_all_nan.index.tolist(),
-        )
-    else:
-        logger.debug(
-            "_apply_features [%s]: NaN counts before dropna: %s",
-            tf, nan_counts[nan_counts > 0].to_dict(),
-        )
+    # Backfill so short-history assets (e.g. XTIUSD from Feb 2017) don't wipe rows.
+    _ext_cols = [c for c in df.columns if c.endswith("_log_return") and c != "log_return"]
+    if _ext_cols:
+        df[_ext_cols] = df[_ext_cols].bfill()
 
     df.dropna(inplace=True)
+
+    # Synthetic VIX (Williams VIX Fix z-score) — must come after dropna on core cols.
+    df["synth_vix_zscore"] = compute_synth_vix(df)
+
     return df
 
 

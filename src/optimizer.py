@@ -32,7 +32,7 @@ from src.engine_xgb import (
 )
 from src.backtester import vectorized_backtest
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
-from src.logger import setup_logger
+from src.logger import setup_logger, append_trial_score
 
 logger = setup_logger(__name__)
 
@@ -44,7 +44,7 @@ except ImportError:
     logger.debug("psutil not installed — RAM guard disabled.")
 
 # ── Versioning ─────────────────────────────────────────────────────────────────
-OPTIMIZER_VERSION = "3.7"  # bump when search space or scoring formula changes
+OPTIMIZER_VERSION = "3.8"  # bump when search space or scoring formula changes
 
 # ── Rolling WFO window sizes (bars) ───────────────────────────────────────────
 WFO_PARAMS = {
@@ -98,10 +98,10 @@ SEARCH_SPACES = {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
         "n_states":          (3,     4,    "int"),
-        "max_depth":         (3,     7,    "int"),
+        "max_depth":         (4,     8,    "int"),   # raised ceiling: deeper trees for regime features
         "reg_alpha":         (1e-6,  0.5,  "log"),
-        "reg_lambda":        (0.1,   2.0,  "log"),
-        "min_child_weight":  (5,     100,  "int"),
+        "reg_lambda":        (0.01,  2.0,  "log"),   # lowered floor: allow hmm_state signal
+        "min_child_weight":  (1,     50,   "int"),   # lowered floor: allow finer splits on small vol buckets
         "learning_rate":     (0.005, 0.15, "log"),
         "n_estimators":      (50,    400,  "int"),
         "subsample":         (0.5,   0.9,  "float"),
@@ -153,7 +153,7 @@ CPCV_PARAMS = {
     "M15": {"n_splits": 5, "n_test_splits": 2, "embargo_bars": 96},
     "M5":  {"n_splits": 5, "n_test_splits": 2, "embargo_bars": 288},
 }
-CPCV_N_BLOCKS       = 6
+CPCV_N_BLOCKS       = 4   # C(4,2)=6 paths — faster per trial, less strict than C(6,2)=15
 CPCV_K_TEST         = 2
 CPCV_TRIALS         = {"H1": 80, "M15": 120, "M5": 200}
 CPCV_PURGE_BARS     = {"H1": 24, "M15": 32,  "M5": 48}
@@ -625,10 +625,10 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             subsample        = trial.suggest_float("subsample", 0.55, 0.85)
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
         elif tf_up == "H1":
-            max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5,  log=True)  # capped: prevent hmm_state dropout
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)  # lowered floor: allow hmm_state signal
-            min_child_weight = trial.suggest_int("min_child_weight", 5, 100)
+            max_depth        = trial.suggest_int("max_depth", 4, 8)             # raised ceiling
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 50)     # lowered floor
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
             subsample        = trial.suggest_float("subsample", 0.5, 0.9)
@@ -697,6 +697,11 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
                 trial.number, tf, broker, score, n_valid_paths, _N_PATHS,
                 std_sharpe, median_trades,
             )
+            append_trial_score(
+                f"Trial {trial.number} [{tf}/{broker}]: score={score:.3f} | "
+                f"valid_paths={n_valid_paths}/{_N_PATHS} | "
+                f"std_sharpe={std_sharpe:.3f} | median_trades={median_trades}"
+            )
 
             return score
 
@@ -762,6 +767,212 @@ def _make_callbacks(total_target: int, study_name: str, already_done: int = 0) -
 
 # ── Main optimization entry point ──────────────────────────────────────────────
 
+def make_objective_stage1(
+    df: pd.DataFrame,
+    tf: str,
+    broker: str,
+    account_size: float = 15.0,
+):
+    """Single hold-out objective for Stage-1 (fast XGB exploration).
+
+    Uses the last ``oos_bars`` of the dataset as a fixed hold-out instead of
+    running all C(n_blocks, k_test) CPCV paths.  Approximately 5-10× faster
+    per trial than the full CPCV objective — ideal for rapid search-space
+    exploration before Stage-2 CPCV validation.
+    """
+    tf_up   = tf.upper()
+    wfo_cfg = WFO_PARAMS.get(tf_up, WFO_PARAMS["H1"])
+    oos_bars   = wfo_cfg["oos_bars"]
+    n          = len(df)
+    oos_start  = max(n - oos_bars, oos_bars)   # keep at least 1×oos for IS
+    df_is_base = df.iloc[:oos_start]
+    df_oos_base = df.iloc[oos_start:]
+    n_cv_folds  = CV_FOLDS.get(tf_up, 2)
+
+    def objective(trial: optuna.Trial) -> float:
+        # ── Kalman params ─────────────────────────────────────────────────────
+        if tf_up == "M5":
+            obs_cov   = trial.suggest_float("obs_cov",   0.05, 5.0,  log=True)
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.1, log=True)
+        else:
+            obs_cov   = trial.suggest_float("obs_cov",   0.5,  5.0,  log=True)
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
+
+        if tf_up == "M5":
+            n_states = trial.suggest_categorical("n_states", [4])
+        elif tf_up == "H1":
+            n_states = trial.suggest_int("n_states", 3, 4)
+        else:
+            n_states = trial.suggest_categorical("n_states", [4])
+
+        # ── XGBoost params (same ranges as full CPCV objective) ───────────────
+        if tf_up == "M5":
+            max_depth        = trial.suggest_int("max_depth", 2, 4)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.5, 5.0, log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 10.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
+            learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
+            n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
+            subsample        = trial.suggest_float("subsample", 0.55, 0.85)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
+        elif tf_up == "H1":
+            max_depth        = trial.suggest_int("max_depth", 4, 8)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5, log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 1, 50)
+            learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
+            n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
+            subsample        = trial.suggest_float("subsample", 0.5, 0.9)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
+        else:  # M15
+            max_depth        = trial.suggest_int("max_depth", 3, 7)
+            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 2.0, log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 5.0, log=True)
+            min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
+            learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
+            n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
+            subsample        = trial.suggest_float("subsample", 0.5, 0.9)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.5, 1.0)
+
+        gamma            = trial.suggest_float("gamma", 1e-6, 0.3, log=True)
+        scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5, 2.0, log=True)
+
+        # ── Recompute Kalman on each partition independently ──────────────────
+        try:
+            df_is  = df_is_base.copy()
+            df_oos = df_oos_base.copy()
+            df_is["kalman_return"]  = kalman_smooth(
+                df_is["log_return"].values, obs_cov=obs_cov, trans_cov=trans_cov
+            )
+            df_oos["kalman_return"] = kalman_smooth(
+                df_oos["log_return"].values, obs_cov=obs_cov, trans_cov=trans_cov
+            )
+        except Exception as exc:
+            logger.warning("Stage1[%s] Kalman error trial %d: %s", tf, trial.number, exc)
+            return -50.0
+
+        xgb_kwargs = dict(
+            max_depth=max_depth, reg_alpha=reg_alpha, reg_lambda=reg_lambda,
+            min_child_weight=min_child_weight, learning_rate=learning_rate,
+            n_estimators=n_estimators, subsample=subsample,
+            colsample_bytree=colsample_bytree, gamma=gamma,
+            scale_pos_weight=scale_pos_weight,
+        )
+
+        try:
+            result = _run_single_window(
+                df_is=df_is, df_oos=df_oos,
+                n_states=int(n_states), tf=tf,
+                balance=account_size, broker=broker,
+                xgb_kwargs=xgb_kwargs,
+                n_cv_folds=n_cv_folds,
+                oos_bars=oos_bars,
+            )
+        except Exception as exc:
+            logger.warning("Stage1[%s] trial %d error: %s", tf, trial.number, exc)
+            return -50.0
+
+        score = result.get("oos_score", -50.0)
+        trial.set_user_attr("oos_sharpe", float(result.get("oos_sharpe", -10.0)))
+        trial.set_user_attr("oos_trades", int(result.get("oos_n_trades", 0)))
+        trial.set_user_attr("oos_fdd",    float(result.get("oos_fdd", 1.0)))
+        return score
+
+    return objective
+
+
+def run_optimization_stage1(
+    df:           pd.DataFrame,
+    tf:           str,
+    broker:       str,
+    account_size: float = 15.0,
+    n_trials:     int   = 60,
+) -> optuna.Study:
+    """Stage-1: fast single hold-out optimization (no CPCV).
+
+    Run this before the full Stage-2 CPCV optimization to rapidly explore the
+    hyperparameter landscape.  Each trial runs ~5-10× faster than CPCV
+    because it evaluates a single IS/OOS split instead of C(4,2)=6 paths.
+
+    On completion writes ``models/stage1_{tf}_{broker}.json`` with the best
+    hyperparameters.  Stage-2 (``--stage trading``) automatically loads this
+    file to warm-start Optuna's TPE sampler.
+
+    Usage::
+
+        python main.py --mode optimize --tf H1 --broker headway_cent \\
+            --stage xgb --trials 60
+        python main.py --mode optimize --tf H1 --broker headway_cent \\
+            --stage trading --trials 130
+    """
+    from pathlib import Path
+
+    tier    = _get_tier(account_size)
+    name    = _study_name(broker=broker, tier=tier, tf=tf) + "_stage1"
+    storage = _study_db(broker)
+
+    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
+    study  = optuna.create_study(
+        study_name=name,
+        storage=storage,
+        direction="maximize",
+        load_if_exists=True,
+        pruner=pruner,
+    )
+
+    already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
+    remaining    = max(0, n_trials - already_done)
+
+    if already_done > 0:
+        pct = already_done / n_trials * 100
+        print(
+            f"\nResuming Stage-1: {already_done}/{n_trials} trials ({pct:.0f}%). "
+            f"{remaining} remaining.\n"
+        )
+    else:
+        print(
+            f"\nStarting Stage-1 XGB study '{name}' — target {n_trials} trials.\n"
+            f"Mode: single hold-out (no CPCV) — ~5x faster per trial than Stage-2.\n"
+        )
+
+    if remaining == 0:
+        print("Stage-1 target already reached. Use higher --trials to continue.\n")
+    else:
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+        study.optimize(
+            make_objective_stage1(df=df, tf=tf, broker=broker, account_size=account_size),
+            n_trials=remaining,
+            n_jobs=1,
+            show_progress_bar=True,
+            callbacks=_make_callbacks(n_trials, name, already_done=already_done),
+        )
+
+    # ── Persist best params for Stage-2 warm-start ───────────────────────────
+    stage1_path = Path(f"models/stage1_{tf.lower()}_{broker}.json")
+    stage1_path.parent.mkdir(parents=True, exist_ok=True)
+    stage1_path.write_text(json.dumps({
+        "params": study.best_params,
+        "score":  study.best_value,
+        "tf":     tf,
+        "broker": broker,
+    }, indent=2))
+
+    logger.info(
+        "Stage-1 complete: best=%.3f  saved to %s  params=%s",
+        study.best_value, stage1_path, study.best_params,
+    )
+    print(
+        f"\n{'*'*60}\n"
+        f"  Stage-1 Complete\n"
+        f"  Best score : {study.best_value:.3f}\n"
+        f"  Saved to   : {stage1_path}\n"
+        f"  Next step  : python main.py --mode optimize --tf {tf} "
+        f"--broker {broker} --stage trading --trials 130\n"
+        f"{'*'*60}\n"
+    )
+    return study
+
+
 def run_optimization(
     df:           pd.DataFrame,
     tf:           str,
@@ -771,6 +982,7 @@ def run_optimization(
     wfo_mode:     str   = "standard",
     n_jobs:       int   = 1,
     telegram_fn         = None,
+    warm_start_stage1:  bool = False,   # enqueue Stage-1 best params as first trial
 ) -> optuna.Study:
     """Run (or resume) a rolling-WFO Optuna study and return the completed study.
 
@@ -813,6 +1025,30 @@ def run_optimization(
 
     feature_cols = list(get_feature_cols(df))
     _check_study_hash(study, tf=tf, broker=broker, feature_cols=feature_cols)
+
+    # ── Stage-2 warm-start: seed Optuna TPE with Stage-1 best params ─────────
+    # When --stage trading is passed, any previously saved Stage-1 JSON is
+    # enqueued as the first trial so TPE explores the confirmed-good region
+    # immediately rather than burning trials on cold-start random sampling.
+    if warm_start_stage1:
+        from pathlib import Path
+        _s1_path = Path(f"models/stage1_{tf.lower()}_{broker}.json")
+        if _s1_path.exists():
+            try:
+                _s1 = json.loads(_s1_path.read_text())
+                study.enqueue_trial(_s1["params"])
+                logger.info(
+                    "Stage-2: warm-started from %s (stage1 score=%.3f)",
+                    _s1_path, _s1.get("score", float("nan")),
+                )
+                print(f"  Warm-starting from Stage-1 params (score={_s1.get('score', '?'):.3f}).\n")
+            except Exception as _e:
+                logger.warning("Failed to load Stage-1 params for warm-start: %s", _e)
+        else:
+            logger.warning(
+                "Stage-2 warm_start_stage1=True but no file found at %s. "
+                "Run --stage xgb first.", _s1_path,
+            )
 
     already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     remaining    = max(0, n_trials - already_done)
@@ -1175,13 +1411,15 @@ def execute_cpcv(
             test_states = states_all_al[test_mask_al]
 
             # ── Regime oscillation guard ──────────────────────────────────
-            # If the HMM state sequence has more than 12% transition bars
-            # (e.g. switching every ~8 bars) the path is degenerate —
-            # the signal engine will trade every 3 bars → DD blowup.
-            # Threshold: 5% is typical for healthy H1; 12% = 2.4× elevated.
+            # If the HMM state sequence has more than 20% transition bars
+            # the path is degenerate — too-rapid regime switching causes
+            # trade churn even with MIN_CONFIRMATION_BARS=5.
+            # 20% = regime changes on 1 in 5 bars; 5% is typical for H1.
+            # Raised from 12%: the tighter threshold was discarding too many
+            # valid paths from legitimate volatile periods.
             if len(test_states) > 1:
                 _n_trans = int(np.sum(np.diff(test_states) != 0))
-                if _n_trans / len(test_states) > 0.12:
+                if _n_trans / len(test_states) > 0.20:
                     logger.debug(
                         "CPCV path %d: high oscillation rate %.1f%% — skipped",
                         path_idx + 1, _n_trans / len(test_states) * 100,
@@ -1212,7 +1450,7 @@ def execute_cpcv(
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
             continue
 
-    if n_valid_paths < 5:  # require at least 5 successful combinatorial paths
+    if n_valid_paths < 4:  # C(4,2)=6 total paths; require 4/6 valid (one bad pair tolerated)
         logger.warning(
             "CPCV [%s]: only %d valid paths — rejecting trial.", tf, n_valid_paths
         )
