@@ -109,9 +109,15 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     df = df.copy()
     df["hmm_state"] = hmm_states
     df["prev_log_return"] = df["log_return"].shift(1)
-    horizon        = 6
-    future_returns = df["log_return"].rolling(window=horizon).sum().shift(-horizon)
-    y = (future_returns > 0).astype(int).rename("target")
+
+    # Spread-aware target: the 6-bar forward return must beat the average
+    # spread + slippage buffer (0.0005 log-return ≈ $1 on $2000 gold) to be
+    # labelled a valid buy signal.  Without this floor, micro-momentum noise
+    # bars generate thousands of false positives that cannot cover costs.
+    horizon           = 6
+    MIN_PROFIT_MARGIN = 0.0005
+    future_returns    = df["log_return"].rolling(window=horizon).sum().shift(-horizon)
+    y = (future_returns > MIN_PROFIT_MARGIN).astype(int).rename("target")
 
     feature_cols = get_feature_cols(df)
     X = df[feature_cols]

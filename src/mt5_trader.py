@@ -1109,6 +1109,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # Session state (persists across bars within a day)
     last_bar_time = None
     current_day   = None
+    cooldown_bars = 0   # bars to wait after a trade close before evaluating new signals
     # Tracks the tickets and entry context of the most recently placed signal
     # so the break-even SL logic can fire when TP1 closes position 1.
     signal_tracker = {"tickets": [], "entry_price": 0.0,
@@ -1214,6 +1215,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         if not signal_tracker["tickets"]:
                             signal_tracker["tp1_hit"] = False
                             signal_engine.on_trade_closed()
+                            cooldown_bars = 3
+                            logger.info("Post-trade cooldown activated: 3 bars.")
 
                 # ── Daily equity protection gate ──────────────────────────
                 _pnl_divisor = 100 if broker == "headway_cent" else 1
@@ -1342,6 +1345,11 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
             last_bar_time = bar_time
 
+            # ── Decrement post-trade cooldown on each new bar ─────────────
+            if cooldown_bars > 0:
+                cooldown_bars -= 1
+                logger.info("Post-trade cooldown: %d bar(s) remaining.", cooldown_bars)
+
             # Update rolling close cache for Bollinger Band confluence filter
             close_prices_cache.append(float(bars[0]["close"]))
             if len(close_prices_cache) > 50:
@@ -1446,6 +1454,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 signal_tracker["tickets"] = active
                 if not active:
                     signal_engine.on_trade_closed()
+                    cooldown_bars = 3
+                    logger.info("Post-trade cooldown activated: 3 bars.")
             if equity_gate.locked:
                 logger.info(
                     "Equity gate locked — no new signal (state=%s).",
@@ -1459,6 +1469,15 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 logger.info(
                     "Open position -- holding (state=%s).",
                     state_lbl,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
+            # ── 8a. Post-trade cooldown guard ─────────────────────────────
+            if cooldown_bars > 0:
+                logger.info(
+                    "Cooldown active: %d bar(s) remaining — no new signal (state=%s).",
+                    cooldown_bars, state_lbl,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue

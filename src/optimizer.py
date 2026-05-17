@@ -86,11 +86,11 @@ WFO_TRIALS_FAST = {"H1": 60,  "M15": 100, "M5": 120}
 CV_FOLDS = {"H1": 2, "M15": 3, "M5": 4}
 
 # Hard trade floors — trials below return -50.0 immediately
-HARD_TRADE_FLOORS = {"M5": 120, "M15": 60, "H1": 20}
+HARD_TRADE_FLOORS = {"M5": 120, "M15": 60, "H1": 30}
 MIN_OOS_TRADES_HARD = HARD_TRADE_FLOORS  # backward-compat alias
 
 # Soft trade floors — trials below earn score × 0.1
-SOFT_TRADE_FLOORS = {"H1": 25, "M15": 140, "M5": 350}
+SOFT_TRADE_FLOORS = {"H1": 35, "M15": 140, "M5": 350}
 TF_MIN_OOS_TRADES = SOFT_TRADE_FLOORS    # backward-compat alias
 
 # TF-keyed search space specs (for config hash)
