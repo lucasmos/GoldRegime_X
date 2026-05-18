@@ -22,13 +22,14 @@ _CONTINUOUS_COLS = [
     "rsi_slope", "atr_normalized", "prev_log_return",
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
     "us500_log_return", "usdjpy_log_return", "synth_vix_zscore",
+    "atr_band_position",
 ]
 
 # All optional external-asset feature columns (log returns + synth_vix)
 # US500 and USDJPY removed — consistently 0.0 importance across H1 trials.
 _EXTERNAL_ASSETS = [
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
-    "synth_vix_zscore",
+    "synth_vix_zscore", "atr_band_position",
 ]
 
 # LSTM context feature columns added when a trained LSTM context model is present.

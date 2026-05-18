@@ -427,6 +427,14 @@ def _run_bar_loop(
     lows        = df_aligned["Low"].values  if "Low"  in df_aligned.columns else closes
     log_returns = df_aligned["log_return"].values
 
+    # ── Signal engine auxiliary arrays ────────────────────────────────────────
+    vix_zscore_arr = (df_aligned["synth_vix_zscore"].values
+                      if "synth_vix_zscore" in df_aligned.columns
+                      else np.zeros(n, dtype=np.float64))
+    atr_band_arr   = (df_aligned["atr_band_position"].values
+                      if "atr_band_position" in df_aligned.columns
+                      else np.full(n, 0.5, dtype=np.float64))
+
     # ── Raw ATR fallback (if not pre-computed by caller) ─────────────────────
     if raw_atr_arr is None:
         _tr = np.maximum(highs - lows,
@@ -628,7 +636,7 @@ def _run_bar_loop(
                     if (_bar_atr / spread_cost) < _min_eff:
                         continue
 
-                    entry = engine.should_enter(regime_info, current_prob, 1, 0.5)
+                    entry = engine.should_enter(regime_info, current_prob, float(vix_zscore_arr[i]), float(atr_band_arr[i]))
 
                     if entry:
                         _dir = 1 if entry["signal"] in ("BUY", "MR_BUY") else -1

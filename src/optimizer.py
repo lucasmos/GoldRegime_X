@@ -157,7 +157,7 @@ CPCV_PARAMS = {
 CPCV_N_BLOCKS       = 4   # C(4,2)=6 paths — faster per trial, less strict than C(6,2)=15
 CPCV_K_TEST         = 2
 CPCV_TRIALS         = {"H1": 80, "M15": 120, "M5": 200}
-CPCV_PURGE_BARS     = {"H1": 24, "M15": 32,  "M5": 48}
+CPCV_PURGE_BARS     = {"H1": 24, "M15": 96,  "M5": 288}
 MIN_TRADES_PER_PATH = {"H1": 15, "M15": 60,  "M5": 100}
 
 
@@ -617,8 +617,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
         # ── XGBoost params ────────────────────────────────────────────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.5,  5.0,  log=True)  # capped: prevent hmm_state dropout
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 10.0, log=True)  # capped: prevent hmm_state dropout
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-3, 1.0,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
             learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
@@ -635,8 +635,8 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
         else:  # M15
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 2.0,  log=True)  # capped: prevent hmm_state dropout
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5,  5.0,  log=True)  # capped: prevent hmm_state dropout
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 1.0,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)
@@ -808,8 +808,8 @@ def make_objective_stage1(
         # ── XGBoost params (same ranges as full CPCV objective) ───────────────
         if tf_up == "M5":
             max_depth        = trial.suggest_int("max_depth", 2, 4)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.5, 5.0, log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 10.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-3, 1.0,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.1,  2.0,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 5, 25)
             learning_rate    = trial.suggest_float("learning_rate", 0.01, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 200, 600, step=50)
@@ -817,8 +817,8 @@ def make_objective_stage1(
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.8)
         elif tf_up == "H1":
             max_depth        = trial.suggest_int("max_depth", 4, 8)
-            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5, log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-6, 0.5,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 1, 50)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.15, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 50, 400, step=50)
@@ -826,8 +826,8 @@ def make_objective_stage1(
             colsample_bytree = trial.suggest_float("colsample_bytree", 0.4, 0.9)
         else:  # M15
             max_depth        = trial.suggest_int("max_depth", 3, 7)
-            reg_alpha        = trial.suggest_float("reg_alpha", 0.05, 2.0, log=True)
-            reg_lambda       = trial.suggest_float("reg_lambda", 0.5, 5.0, log=True)
+            reg_alpha        = trial.suggest_float("reg_alpha", 1e-4, 1.0,  log=True)
+            reg_lambda       = trial.suggest_float("reg_lambda", 0.01, 2.0,  log=True)
             min_child_weight = trial.suggest_int("min_child_weight", 3, 30)
             learning_rate    = trial.suggest_float("learning_rate", 0.005, 0.2, log=True)
             n_estimators     = trial.suggest_int("n_estimators", 100, 500, step=50)

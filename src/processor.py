@@ -57,6 +57,7 @@ CONTINUOUS_FEATURE_COLS = [
     "rsi_slope", "atr_normalized", "prev_log_return",
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
     "us500_log_return", "usdjpy_log_return", "synth_vix_zscore",
+    "atr_band_position",
 ]
 
 
@@ -476,6 +477,22 @@ def compute_gmm_vol_cluster(
     return labels_out
 
 
+def compute_dynamic_atr_bands(df: pd.DataFrame, period: int = 20, multiplier: float = 2.0) -> pd.Series:
+    """Computes price position relative to dynamic ATR Keltner-style bands.
+
+    Returns a Series where 0.0 = at lower band, 1.0 = at upper band.
+    Values outside [0, 1] indicate price beyond the bands.
+    """
+    ma = df["Close"].rolling(window=period).mean()
+    # Denormalize ATR for standard price scaling
+    atr = df["atr_normalized"] * df["Close"]
+    band_width = atr * multiplier
+
+    # 0.0 = at lower band, 1.0 = at upper band
+    position = (df["Close"] - (ma - band_width)) / (2 * band_width)
+    return position.rename("atr_band_position")
+
+
 def process_pipeline(
     obs_cov: float = None,
     trans_cov: float = None,
@@ -548,6 +565,8 @@ def process_pipeline(
                  and c != "log_return"]
     if _ext_cols:
         df[_ext_cols] = df[_ext_cols].bfill()
+
+    df["atr_band_position"] = compute_dynamic_atr_bands(df)
 
     # Drop only rows where core features are NaN.
     _core_cols = ["log_return", "kalman_return", "volatility", "rsi", "rsi_slope",
