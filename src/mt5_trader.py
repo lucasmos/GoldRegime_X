@@ -796,6 +796,11 @@ def compute_live_features(
         _svix = compute_synth_vix(df)
         feature_dict["synth_vix_zscore"] = float(_svix.iloc[-1]) if not np.isnan(_svix.iloc[-1]) else 0.0
 
+    if "atr_band_position" in feature_cols:
+        from src.processor import compute_dynamic_atr_bands
+        _atr_bands = compute_dynamic_atr_bands(df)
+        feature_dict["atr_band_position"] = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
+
     features_df = pd.DataFrame([feature_dict])[feature_cols]
 
     # Apply the 10-year feature scaler so live values match the training distribution
@@ -1465,12 +1470,17 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
 
             _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
-            _gmc    = gmm_cluster if gmm_cluster >= 0 else 1
+
+            # ── Signal engine inputs: Z-score and ATR band position ───────────
+            from src.processor import compute_synth_vix, compute_dynamic_atr_bands
+            _svix_raw  = compute_synth_vix(live_df)
+            _svix_val  = float(_svix_raw.iloc[-1]) if not np.isnan(_svix_raw.iloc[-1]) else 0.0
+            _atr_bands = compute_dynamic_atr_bands(live_df)
+            _atr_band_val = float(_atr_bands.iloc[-1]) if not np.isnan(_atr_bands.iloc[-1]) else 0.5
 
             regime_info = signal_engine.update_regime(hmm_state, model_hmm.transmat_)
             entry = signal_engine.should_enter(
-                regime_info, prob, _gmc,
-                bb_position=_bb_pos if hmm_state >= CHOP_STATE else None,
+                regime_info, prob, _svix_val, _atr_band_val,
             )
 
             if entry is None:
@@ -1478,10 +1488,10 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                                else "BEAR" if hmm_state == BEAR_STATE
                                else "CHOP")
                 logger.info(
-                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  BB=%.2f",
+                    "[LOGIC AUDIT] %s | state=%d  prob=%.3f  bars=%d  P(stay)=%.2f  vix_z=%.2f  atr_band=%.2f",
                     regime_desc, hmm_state, prob,
                     regime_info["bars_in_regime"], regime_info["stability"],
-                    _bb_pos,
+                    _svix_val, _atr_band_val,
                 )
                 time.sleep(POLL_INTERVAL_SEC)
                 continue

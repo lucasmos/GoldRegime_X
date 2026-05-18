@@ -24,8 +24,20 @@ MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
 # direction), so only the highest-confidence bars have real signal.  Allowing
 # lower thresholds floods the engine with noise trades and destroys performance.
-ENTRY_PROB    = {"H1": 0.575, "M15": 0.55, "M5": 0.52}
-MR_ENTRY_PROB = {"H1": 0.575, "M15": 0.52, "M5": 0.50}
+# XGBoost probability thresholds (H1 only — M15/M5 bypass probability checks).
+# On lower timeframes XGB probabilities cluster near 50–55%, so strict gates
+# produce a "dead zone" that suppresses genuinely profitable volatility regimes.
+ENTRY_PROB    = {"H1": 0.575}
+MR_ENTRY_PROB = {"H1": 0.575}
+
+# Z-Score thresholds for trend and MR entries.
+MIN_TREND_ZSCORE = {"H1": 0.5, "M15": 1.0, "M5": 1.5}
+MIN_MR_ZSCORE    = {"H1": 1.0, "M15": 1.5, "M5": 2.0}
+
+# Dynamic ATR band thresholds (0 = lower band, 1 = upper band).
+# Prevent buying when overextended up or selling when overextended down.
+ATR_BAND_TREND_MAX = 0.80
+ATR_BAND_TREND_MIN = 0.20
 
 # Maximum bars to hold a single trade before forcing exit
 MAX_HOLD_BARS = {"H1": 24, "M15": 32, "M5": 48}
@@ -41,9 +53,10 @@ PERSISTENCE_MIN = {
     "M5": 0.45,
 }
 
-# BB position extremity thresholds for MR entries
-MR_BB_BUY_MAX  = 0.30   # below this → MR_BUY (price at lower band)
-MR_BB_SELL_MIN = 0.70   # above this → MR_SELL (price at upper band)
+# BB position extremity thresholds for MR entries — superseded by ATR band logic
+# below, retained here for reference only.
+# MR_BB_BUY_MAX  = 0.30
+# MR_BB_SELL_MIN = 0.70
 
 # MR position size fraction (smaller than trend — mean-reversion is higher risk)
 MR_SIZE_MULTIPLIER = 0.75
@@ -106,51 +119,61 @@ class SignalEngine:
         self,
         regime_info: dict,
         xgb_prob: float,
-        gmm_cluster: int,
-        bb_position: float | None = None,
+        synth_vix_zscore: float,
+        atr_band_position: float,
     ) -> dict | None:
-        """Evaluate entry conditions for the current bar.
+        """Evaluate entry conditions utilizing Z-scores, Dynamic ATR bands, and conditional probabilities.
 
-        Returns an entry dict on success, None otherwise.
-        Entry dict keys: ``signal``, ``size_multiplier``.
+        H1: Dual constraint — requires both high ML probability AND confirmed
+            volatility expansion (synth_vix_zscore).
+        M15/M5: Z-score/ATR-band only — probability check bypassed (defaults to
+            0.0 = always True) to avoid the dual-constraint dead zone caused by
+            XGB probabilities clustering near 50–55% on noisy lower timeframes.
         """
         if self.in_trade:
             return None
 
-        # xgb_prob = P(next bar UP) from binary XGBoost classifier.
-        # Compute directional probabilities separately so BUY and SELL both
-        # require XGB to AGREE with the intended trade direction.
-        eff_buy  = xgb_prob             # P(UP)  — for BUY entries
-        eff_sell = 1.0 - xgb_prob       # P(DOWN) — for SELL entries
+        eff_buy  = xgb_prob
+        eff_sell = 1.0 - xgb_prob
 
         state = regime_info["state"]
         bars = regime_info["bars_in_regime"]
         stability = regime_info["stability"]
 
-        # ── Trend entry: Bull (0) → BUY when XGB confirms UP ──────────────────
+        # H1 requires probability checks; M15/M5 bypass this (default 0.0 = always True)
+        prob_req_buy      = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
+        prob_req_sell     = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
+        mr_prob_req_buy   = eff_buy  >= MR_ENTRY_PROB.get(self.tf, 0.0)
+        mr_prob_req_sell  = eff_sell >= MR_ENTRY_PROB.get(self.tf, 0.0)
+
+        # ── Trend entry: Bull (0) ─────────────────────────────────────────────
         if state == 0:
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
-                and eff_buy >= ENTRY_PROB.get(self.tf, 0.55)
+                and synth_vix_zscore >= MIN_TREND_ZSCORE.get(self.tf, 1.0)
+                and prob_req_buy
+                and atr_band_position < ATR_BAND_TREND_MAX
                 and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
             ):
                 return {"signal": "BUY", "size_multiplier": 1.0}
 
-        # ── Trend entry: Bear (1) → SELL when XGB confirms DOWN ───────────────
+        # ── Trend entry: Bear (1) ─────────────────────────────────────────────
         elif state == 1:
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
-                and eff_sell >= ENTRY_PROB.get(self.tf, 0.55)
+                and synth_vix_zscore >= MIN_TREND_ZSCORE.get(self.tf, 1.0)
+                and prob_req_sell
+                and atr_band_position > ATR_BAND_TREND_MIN
                 and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
             ):
                 return {"signal": "SELL", "size_multiplier": 1.0}
 
         # ── Mean-reversion entry: Chop (state >= 2) ───────────────────────────
-        elif state >= 2 and bb_position is not None:
+        elif state >= 2 and atr_band_position is not None:
             if bars >= MIN_CHOP_CONFIRM_BARS.get(self.tf, 2):
-                if bb_position < MR_BB_BUY_MAX and eff_buy >= MR_ENTRY_PROB.get(self.tf, 0.52):
+                if atr_band_position < 0.1 and synth_vix_zscore >= MIN_MR_ZSCORE.get(self.tf, 1.5) and mr_prob_req_buy:
                     return {"signal": "MR_BUY", "size_multiplier": MR_SIZE_MULTIPLIER}
-                elif bb_position > MR_BB_SELL_MIN and eff_sell >= MR_ENTRY_PROB.get(self.tf, 0.52):
+                elif atr_band_position > 0.9 and synth_vix_zscore >= MIN_MR_ZSCORE.get(self.tf, 1.5) and mr_prob_req_sell:
                     return {"signal": "MR_SELL", "size_multiplier": MR_SIZE_MULTIPLIER}
 
         return None
