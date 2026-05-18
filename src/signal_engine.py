@@ -18,7 +18,7 @@ MIN_CHOP_CONFIRM_BARS = {"H1": 4, "M15": 2, "M5": 2}
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
 # exit fires.  H1: raised to 5 to match entry confirmation logic — a single
 # regime blip during a multi-day H1 trend should not prematurely close the trade.
-MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 3}
+MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 
 # XGBoost probability threshold for trend and MR entries.
 # Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar

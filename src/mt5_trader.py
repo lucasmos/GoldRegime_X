@@ -90,8 +90,8 @@ ATR_TRAIL_MULTIPLIER  = {"M5": 1.5, "M15": 1.5, "H1": 2.5}   # superseded by ATR
 MIN_LOT_GUARD = 0.01
 
 # ── Per-timeframe signal thresholds and order parameters ──────────────────────
-TF_PROB_THRESHOLD  = {"M5": 0.52, "M15": 0.54, "H1": 0.54}   # fallback — Optuna value used when available
-TF_SHORT_THRESHOLD = {"M5": 0.48, "M15": 0.46, "H1": 0.46}   # fallback only
+TF_PROB_THRESHOLD  = {"M5": 0.55, "M15": 0.55, "H1": 0.55}   # fallback — Optuna value used when available
+TF_SHORT_THRESHOLD = {"M5": 0.45, "M15": 0.45, "H1": 0.45}   # fallback only
 TF_DEFAULT_DEV     = {"M5": 30,   "M15": 20,   "H1": 20}
 TF_HIGH_VOL_DEV    = {"M5": 50,   "M15": 50,   "H1": 50}
 
@@ -1451,6 +1451,19 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 continue
 
             # ── 9. Signal routing — regime-confirmation engine ────────────
+
+            # STRICT PROBABILITY GUARD: Reject weak signals immediately
+            _thresh_long  = TF_PROB_THRESHOLD.get(tf.upper(), 0.55)
+            _thresh_short = TF_SHORT_THRESHOLD.get(tf.upper(), 0.45)
+
+            if _thresh_short < prob < _thresh_long:
+                logger.info(
+                    "Signal rejected: prob=%.3f is within the noise zone (%.2f - %.2f).",
+                    prob, _thresh_short, _thresh_long,
+                )
+                time.sleep(POLL_INTERVAL_SEC)
+                continue
+
             _bb_pos = _calculate_bb_position(np.array(close_prices_cache))
             _gmc    = gmm_cluster if gmm_cluster >= 0 else 1
 

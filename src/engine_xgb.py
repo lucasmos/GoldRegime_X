@@ -404,11 +404,17 @@ def train_xgb_ensemble(
     p33, p66 = compute_vol_thresholds(X_is["atr_normalized"])
     buckets_is = assign_vol_bucket(X_is["atr_normalized"].values, p33, p66)
 
+    # gmm_vol_cluster is redundant within each vol-bucket: routing on atr_normalized
+    # already encodes the volatility regime, so gmm_vol_cluster is near-constant
+    # inside every bucket (e.g. all 0s in "low", all 1s in "med") and XGBoost
+    # assigns it zero importance.  Dropping it keeps colsample_bytree efficient.
+    bucket_feature_cols = [c for c in list(X.columns) if c != GMM_FEATURE]
+
     models = {}
     bucket_sizes = {}
     for bucket in VOL_BUCKETS:
         mask = (buckets_is == bucket)
-        X_b = X_is[mask]
+        X_b = X_is[mask][bucket_feature_cols]
         y_b = y_is[mask]
         bucket_sizes[bucket] = int(mask.sum())
 
@@ -418,7 +424,7 @@ def train_xgb_ensemble(
                 "Vol bucket '%s' has only %d IS samples — falling back to full IS data.",
                 bucket, len(X_b),
             )
-            X_b, y_b = X_is, y_is
+            X_b, y_b = X_is[bucket_feature_cols], y_is
 
         model, _ = train_xgb(X_b, y_b, train_ratio=train_ratio, **xgb_kwargs)
         models[bucket] = model
@@ -428,7 +434,7 @@ def train_xgb_ensemble(
     fi = {}
     if "med" in models:
         try:
-            fi = dict(zip(list(X.columns), models["med"].feature_importances_))
+            fi = dict(zip(bucket_feature_cols, models["med"].feature_importances_))
         except Exception:
             pass
 
@@ -486,7 +492,10 @@ def get_predictions_ensemble(
         if not mask.any():
             continue
         model = models[bucket]
-        X_b   = X[mask]
+        # Select only the columns the bucket model was trained on
+        # (gmm_vol_cluster is excluded — see train_xgb_ensemble)
+        bucket_cols = list(model.feature_names_in_)
+        X_b = X[mask][bucket_cols]
         predictions[mask]   = model.predict(X_b)
         probabilities[mask] = model.predict_proba(X_b)[:, 1]
 
