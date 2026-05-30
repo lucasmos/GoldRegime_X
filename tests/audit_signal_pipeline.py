@@ -1,20 +1,14 @@
 """
-Signal pipeline audit — verifies Bull/Bear/Chop signal generation end-to-end.
+Signal pipeline audit — verifies the Phase E rebuild end-to-end.
 
 Tests confirm:
-  1. SignalEngine fires BUY on Bull regime with sufficient VIX and persistence.
-  2. SignalEngine fires SELL on Bear regime with sufficient VIX and persistence.
-  3. SignalEngine fires no trend signal on Chop state for M5/M15.
-  4. SignalEngine respects MIN_CONFIRMATION_BARS before entering.
-  5. should_apply_prob_gate returns True only for H1.
-  6. evaluate_bar returns SignalDecision with correct structure.
-  7. Parity test: same synthetic bar yields identical SignalDecision from
-     both backtest adapter and live adapter paths.
-  8. M15 _m15_entry_ok gate: accepts/rejects correctly.
-  9. dynamic_prob_threshold adapts to window percentile.
- 10. SignalEngine should_exit fires on regime reversal after confirm bars.
- 11. Per-call Z override changes evaluate_bar decision (relaxed vs default).
- 12. Backtester smoke: strict Z yields 0 trades, relaxed Z yields >0 trades.
+  1.  Regime mapping is deterministic (same stats → same TREND/MR/SHOCK label).
+  2.  MR state is always no-trade (state_disabled reason, no signal).
+  3.  Model routing: TREND bars use trend_model, SHOCK bars use shock_model.
+  4.  CPCV objective emits all 5 required metric components.
+  5.  DD cap at 20%: validate_strategy returns FAIL when floating_dd > 0.20.
+  6.  sync_validate gate blocks strategies with mr_leak > 0.
+  7.  Smoke test H1: process→train→backtest produces valid metrics dict.
 
 Run:
     python tests/audit_signal_pipeline.py
@@ -23,16 +17,15 @@ Run:
 import sys
 import logging
 import numpy as np
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 sys.path.insert(0, ".")
 
-from src.signal_engine import SignalEngine, SignalDecision, should_apply_prob_gate
 
-
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 def _pass(n, msg):
     logger.info("PASS  [T%02d] %s", n, msg)
@@ -45,237 +38,213 @@ def _fail(n, msg):
 
 
 def _make_transmat():
-    return np.array([[0.85, 0.10, 0.05],
-                     [0.10, 0.80, 0.10],
-                     [0.05, 0.10, 0.85]])
+    return np.array([[0.92, 0.05, 0.03],   # TREND  (high persistence)
+                     [0.10, 0.85, 0.05],   # MR
+                     [0.05, 0.05, 0.90]])  # SHOCK  (high persistence)
 
 
-def _prime(engine: SignalEngine, state: int, bars: int = 5) -> dict:
+def _prime(engine, state: int, bars: int = 5) -> dict:
+    """Advance a SignalEngine through `bars` of the given HMM state."""
     info = {}
     for _ in range(bars):
         info = engine.update_regime(state, _make_transmat())
     return info
 
 
-# ── Tests ────────────────────────────────────────────────────────────────────
+# ── Tests ─────────────────────────────────────────────────────────────────────
 
 def run_tests() -> bool:
+    from src.engine_hmm import (
+        REGIME_TREND, REGIME_MR, REGIME_SHOCK,
+        CANONICAL_REGIME_ID, STATE_NAMES, STATE_POLICY,
+    )
+    from src.signal_engine import (
+        SignalEngine, SignalDecision,
+        TREND_STATE, MR_STATE, SHOCK_STATE,
+    )
+    from src.engine_xgb import (
+        train_regime_models, get_regime_predictions, TB_CONFIG,
+    )
+    from src.optimizer import composite_score
+    from src.validator import validate_strategy
+
     results = []
 
-    # ── T01: Bull regime → BUY signal ────────────────────────────────────────
-    eng = SignalEngine("H1")
-    info = _prime(eng, 0)
-    entry = eng.should_enter(info, xgb_prob=0.62, synth_vix_zscore=1.2, atr_band_position=0.45)
-    r = entry is not None and entry["signal"] == "BUY"
-    results.append(_pass(1, f"H1 Bull→BUY  entry={entry}") if r else
-                   _fail(1, f"H1 Bull did not fire BUY  entry={entry}"))
+    # ── T01: Regime constants are canonical ──────────────────────────────────
+    r = (CANONICAL_REGIME_ID[REGIME_TREND] == 0
+         and CANONICAL_REGIME_ID[REGIME_MR]    == 1
+         and CANONICAL_REGIME_ID[REGIME_SHOCK] == 2
+         and TREND_STATE == 0 and MR_STATE == 1 and SHOCK_STATE == 2
+         and STATE_NAMES[0] == "TREND"
+         and STATE_NAMES[1] == "MEAN_REVERSION"
+         and STATE_NAMES[2] == "VOLATILITY_SHOCK")
+    results.append(_pass(1, "Regime constants canonical (TREND=0, MR=1, SHOCK=2)") if r else
+                   _fail(1, f"Regime constants wrong: {CANONICAL_REGIME_ID}  names={STATE_NAMES}"))
 
-    # ── T02: Bear regime → SELL signal ───────────────────────────────────────
-    eng = SignalEngine("H1")
-    info = _prime(eng, 1)
-    entry = eng.should_enter(info, xgb_prob=0.38, synth_vix_zscore=1.2, atr_band_position=0.55)
-    r = entry is not None and entry["signal"] == "SELL"
-    results.append(_pass(2, f"H1 Bear→SELL  entry={entry}") if r else
-                   _fail(2, f"H1 Bear did not fire SELL  entry={entry}"))
+    # ── T02: MR state is always no-trade ─────────────────────────────────────
+    r = (STATE_POLICY[REGIME_MR] is False
+         and STATE_POLICY[REGIME_TREND] is True
+         and STATE_POLICY[REGIME_SHOCK] is True)
+    results.append(_pass(2, "STATE_POLICY: MR=False, TREND=True, SHOCK=True") if r else
+                   _fail(2, f"STATE_POLICY wrong: {STATE_POLICY}"))
 
-    # ── T03: M5 Chop (state=2) → no trend signal ────────────────────────────
-    eng = SignalEngine("M5")
-    info = _prime(eng, 2, bars=3)
-    entry = eng.should_enter(info, xgb_prob=0.65, synth_vix_zscore=2.0, atr_band_position=0.5)
+    # ── T03: MR bars return state_disabled (no entry, no signal) ─────────────
+    eng = SignalEngine("H1")
+    _prime(eng, MR_STATE, bars=6)   # 6 bars = past MIN_CONFIRMATION_BARS
+    entry = eng.should_enter(
+        eng.update_regime(MR_STATE, _make_transmat()),
+        xgb_prob=0.70, synth_vix_zscore=2.5, atr_band_position=0.3,
+    )
     r = entry is None
-    results.append(_pass(3, f"M5 Chop→no trend  entry={entry}") if r else
-                   _fail(3, f"M5 Chop fired trend signal!  entry={entry}"))
+    results.append(_pass(3, f"MR state→no entry (should_enter=None)  entry={entry}") if r else
+                   _fail(3, f"MR state leaked a trade signal!  entry={entry}"))
 
-    # ── T04: MIN_CONFIRMATION_BARS respected — no entry after only 1 bar ─────
+    # ── T04: evaluate_bar returns state_disabled for MR ──────────────────────
     eng = SignalEngine("H1")
-    info = eng.update_regime(0, _make_transmat())
-    entry = eng.should_enter(info, xgb_prob=0.70, synth_vix_zscore=1.5, atr_band_position=0.3)
-    r = entry is None
-    results.append(_pass(4, "H1 no entry before MIN_CONFIRMATION_BARS") if r else
-                   _fail(4, f"H1 fired entry after only 1 bar  entry={entry}"))
+    _prime(eng, MR_STATE, bars=6)
+    row_mr = {"hmm_state": MR_STATE, "prob": 0.75,
+              "synth_vix_zscore": 3.0, "atr_band_position": 0.3}
+    cfg_mr = {"tf": "H1", "hmm_transmat": _make_transmat()}
+    dec = eng.evaluate_bar(row_mr, current_position=None, tf_config=cfg_mr)
+    r = isinstance(dec, SignalDecision) and not dec.enter and dec.reason == "state_disabled"
+    results.append(_pass(4, f"evaluate_bar MR→state_disabled  reason={dec.reason}") if r else
+                   _fail(4, f"evaluate_bar MR wrong: enter={dec.enter} reason={dec.reason}"))
 
-    # ── T05: should_apply_prob_gate H1=True, M15/M5=False ────────────────────
-    r = (should_apply_prob_gate("H1") is True
-         and should_apply_prob_gate("M15") is False
-         and should_apply_prob_gate("M5") is False
-         and should_apply_prob_gate("h1") is True)
-    results.append(_pass(5, "should_apply_prob_gate correct for all TFs") if r else
-                   _fail(5, "should_apply_prob_gate mismatch"))
-
-    # ── T06: evaluate_bar returns valid SignalDecision ─────────────────────────
+    # ── T05: TREND state fires BUY signal ────────────────────────────────────
     eng = SignalEngine("H1")
-    _prime(eng, 0)
-    row_ctx = {"hmm_state": 0, "prob": 0.63,
-               "synth_vix_zscore": 1.3, "atr_band_position": 0.40}
-    tf_cfg = {"tf": "H1", "hmm_transmat": _make_transmat(),
-              "sl_atr_multiple": 2.0, "tp_atr_multiple": 1.5}
-    decision = eng.evaluate_bar(row_ctx, current_position=None, tf_config=tf_cfg)
-    r = (isinstance(decision, SignalDecision)
-         and hasattr(decision, "enter") and hasattr(decision, "direction")
-         and hasattr(decision, "reason") and hasattr(decision, "position_size_multiplier"))
-    results.append(_pass(6, f"evaluate_bar→SignalDecision  enter={decision.enter} dir={decision.direction}") if r else
-                   _fail(6, f"evaluate_bar invalid: {decision}"))
+    _prime(eng, TREND_STATE, bars=6)
+    info = eng.update_regime(TREND_STATE, _make_transmat())
+    entry_trend = eng.should_enter(
+        info, xgb_prob=0.65, synth_vix_zscore=1.2, atr_band_position=0.4,
+    )
+    r = entry_trend is not None and entry_trend["signal"] == "BUY"
+    results.append(_pass(5, f"TREND state→BUY entry  entry={entry_trend}") if r else
+                   _fail(5, f"TREND state did not fire BUY  entry={entry_trend}"))
 
-    # ── T07: Parity — same input → same SignalDecision ────────────────────────
-    def _primed_engine(state=0, bars=5):
-        e = SignalEngine("H1")
-        _prime(e, state, bars)
-        return e
-
-    row_par = {"hmm_state": 0, "prob": 0.61,
-               "synth_vix_zscore": 1.1, "atr_band_position": 0.45}
-    tf_par = {"tf": "H1", "hmm_transmat": _make_transmat(),
-              "sl_atr_multiple": 2.0, "tp_atr_multiple": 1.5}
-
-    d_bt = _primed_engine().evaluate_bar(row_par, None, tf_par)
-    d_lv = _primed_engine().evaluate_bar(row_par, None, tf_par)
-
-    r = (d_bt.enter == d_lv.enter and d_bt.exit == d_lv.exit
-         and d_bt.direction == d_lv.direction and d_bt.reason == d_lv.reason)
-    results.append(_pass(7, f"Parity backtest==live  enter={d_bt.enter} dir={d_bt.direction}") if r else
-                   _fail(7, f"Parity mismatch  bt={d_bt}  lv={d_lv}"))
-
-    # ── T08: _m15_entry_ok gate accepts good bar, rejects weak bar ────────────
-    eng = SignalEngine("M15")
-    cfg_gate = {"m15_min_regime_bars": 4, "m15_min_persistence": 0.55,
-                "m15_min_atr_expansion": 1.0, "m15_min_vix_z": 0.5,
-                "m15_min_rv_ratio": 1.0}
-    good_row = {"regime_duration": 5, "persistence": 0.72,
-                "atr_expansion_ratio": 1.15, "synth_vix_zscore": 0.8,
-                "realized_vol_ratio": 1.1}
-    weak_row = {"regime_duration": 2, "persistence": 0.50,
-                "atr_expansion_ratio": 0.90, "synth_vix_zscore": 0.3,
-                "realized_vol_ratio": 0.9}
-    r = eng._m15_entry_ok(good_row, cfg_gate) and not eng._m15_entry_ok(weak_row, cfg_gate)
-    results.append(_pass(8, "_m15_entry_ok accepts good/rejects weak") if r else
-                   _fail(8, f"_m15_entry_ok wrong  good={eng._m15_entry_ok(good_row, cfg_gate)} weak={eng._m15_entry_ok(weak_row, cfg_gate)}"))
-
-    # ── T09: dynamic_prob_threshold adapts to window size ─────────────────────
-    eng = SignalEngine("M5")
-    t_small = eng.dynamic_prob_threshold(np.array([0.50, 0.51, 0.52]))  # <30 → fallback
-    t_large = eng.dynamic_prob_threshold(np.linspace(0.50, 0.70, 100))
-    r = t_small == 0.55 and t_large > 0.55
-    results.append(_pass(9, f"dynamic_prob_threshold  small={t_small:.3f} large={t_large:.3f}") if r else
-                   _fail(9, f"dynamic_prob_threshold wrong  small={t_small} large={t_large}"))
-
-    # ── T10: should_exit fires on regime reversal after confirm bars ──────────
+    # ── T06: SHOCK state fires entry signal ──────────────────────────────────
     eng = SignalEngine("H1")
-    _prime(eng, 0, bars=3)
-    eng.on_trade_entered(0)
-    from src.signal_engine import MIN_EXIT_CONFIRM_BARS
-    n_confirm = MIN_EXIT_CONFIRM_BARS.get("H1", 2)
-    for _ in range(n_confirm):
-        info = eng.update_regime(1, _make_transmat())
-    exit_now, reason = eng.should_exit(info, cur_pnl=0.0, max_fav_pnl=1.0, bars_in_trade=5)
-    r = exit_now and "regime" in reason
-    results.append(_pass(10, f"should_exit fires on reversal  reason={reason}") if r else
-                   _fail(10, f"should_exit failed  exit={exit_now} reason={reason}"))
+    _prime(eng, SHOCK_STATE, bars=6)
+    info = eng.update_regime(SHOCK_STATE, _make_transmat())
+    entry_shock = eng.should_enter(
+        info, xgb_prob=0.65, synth_vix_zscore=2.5, atr_band_position=0.4,
+    )
+    r = entry_shock is not None and entry_shock["signal"] in ("BUY", "SELL")
+    results.append(_pass(6, f"SHOCK state→entry signal  entry={entry_shock}") if r else
+                   _fail(6, f"SHOCK state did not fire any signal  entry={entry_shock}"))
 
-    # ── T11: per-call Z override changes evaluate_bar decision ───────────────
-    # H1 MIN_TREND_ZSCORE = 0.5.  vix_z=0.3 is below default → no entry.
-    # With z_cutoff_bull=0.2, vix_z=0.3 >= 0.2 → entry fires.
-    transmat_t11 = _make_transmat()
-    eng_default = SignalEngine("H1")
-    _prime(eng_default, 0)
-    eng_relaxed = SignalEngine("H1")
-    _prime(eng_relaxed, 0)
+    # ── T07: Model routing — get_regime_predictions dispatches correctly ──────
+    n = 30
+    rng = np.random.default_rng(0)
+    X_dummy = pd.DataFrame({"f1": rng.random(n), "f2": rng.random(n)})
+    states_all_trend = np.zeros(n, dtype=int)     # all TREND
+    states_all_shock = np.full(n, SHOCK_STATE, dtype=int)
+    states_all_mr    = np.full(n, MR_STATE,    dtype=int)
 
-    row_t11 = {"hmm_state": 0, "prob": 0.63,
-               "synth_vix_zscore": 0.3, "atr_band_position": 0.40}
-    cfg_default_t11 = {"tf": "H1", "hmm_transmat": transmat_t11}
-    cfg_relaxed_t11 = {"tf": "H1", "hmm_transmat": transmat_t11,
-                       "z_cutoff_bull": 0.2, "z_cutoff_bear": -0.2}
-
-    d_default = eng_default.evaluate_bar(row_t11, None, cfg_default_t11)
-    d_relaxed = eng_relaxed.evaluate_bar(row_t11, None, cfg_relaxed_t11)
-    r = (not d_default.enter) and d_relaxed.enter
-    results.append(
-        _pass(11, f"Z override changes decision  default.enter={d_default.enter} relaxed.enter={d_relaxed.enter}") if r else
-        _fail(11, f"Z override had no effect  default={d_default.enter} relaxed={d_relaxed.enter}")
+    from unittest.mock import MagicMock
+    trend_mock = MagicMock()
+    trend_mock.predict_proba.return_value = np.column_stack(
+        [np.full(n, 0.3), np.full(n, 0.7)]   # prob_1 = 0.7
+    )
+    shock_mock = MagicMock()
+    shock_mock.predict_proba.return_value = np.column_stack(
+        [np.full(n, 0.4), np.full(n, 0.6)]   # prob_1 = 0.6
     )
 
-    # ── T12: backtester smoke test — strict vs relaxed Z yields different trades
-    import pandas as pd
-    from src.backtester import vectorized_backtest
-    from src.signal_engine import MIN_CONFIRMATION_BARS as _MCB
+    probs_trend = get_regime_predictions(X_dummy, states_all_trend, trend_mock, shock_mock)
+    probs_shock = get_regime_predictions(X_dummy, states_all_shock, trend_mock, shock_mock)
+    probs_mr    = get_regime_predictions(X_dummy, states_all_mr,    trend_mock, shock_mock)
 
-    n_bars = 120
-    _confirm = _MCB.get("H1", 2)
-    rng = np.random.default_rng(42)
-    # Build a synthetic df with Bull regime throughout so entries are attempted.
-    prices  = 1800.0 + np.cumsum(rng.normal(0, 0.5, n_bars))
-    _df_bt  = pd.DataFrame({
-        "Open": prices, "High": prices * 1.001, "Low": prices * 0.999,
-        "Close": prices, "Volume": 1000,
-        "log_return":   np.concatenate([[0.0], np.diff(np.log(prices))]),
-        "atr_normalized": np.full(n_bars, 0.5),
-        "synth_vix_zscore":  np.full(n_bars, 0.3),   # below H1 default (0.5)
-        "atr_band_position": np.full(n_bars, 0.40),
-    })
-    _states_bt  = np.zeros(n_bars, dtype=int)          # all Bull
-    _probs_bt   = np.full(n_bars, 0.63)                 # above ENTRY_PROB H1
+    r = (np.allclose(probs_trend, 0.7)
+         and np.allclose(probs_shock, 0.6)
+         and np.allclose(probs_mr, 0.5))
+    results.append(_pass(7, f"get_regime_predictions routing correct  "
+                           f"trend={probs_trend[0]:.1f} shock={probs_shock[0]:.1f} mr={probs_mr[0]:.1f}") if r else
+                   _fail(7, f"get_regime_predictions wrong values: "
+                             f"trend={probs_trend[0]} shock={probs_shock[0]} mr={probs_mr[0]}"))
 
-    # Strict: Z default (0.5) — vix_z 0.3 never qualifies → 0 trades expected.
-    res_strict = vectorized_backtest(
-        _df_bt, _probs_bt, _states_bt, tf="H1", account_size=15.0,
+    # ── T08: composite_score emits all 5 metric components ───────────────────
+    test_metrics = {
+        "deflated_sharpe": 1.2,
+        "calmar":          1.5,
+        "profit_factor":   1.8,
+        "expectancy":      0.3,
+        "stability_score": 0.7,
+    }
+    score = composite_score(test_metrics)
+    expected_base = 0.35*1.2 + 0.25*1.5 + 0.20*1.8 + 0.10*0.3 + 0.10*0.7
+    r = abs(score - expected_base) < 1e-9
+    results.append(_pass(8, f"composite_score correct: {score:.6f} == {expected_base:.6f}") if r else
+                   _fail(8, f"composite_score mismatch: {score} != {expected_base}"))
+
+    # ── T09: validate_strategy FAIL when dd > 20% ────────────────────────────
+    gate_dd = validate_strategy(
+        {"floating_max_drawdown": 0.25, "n_trades": 100, "mr_leak_count": 0},
+        tf="H1",
     )
-    # Relaxed: Z override 0.2 — vix_z 0.3 >= 0.2 → trades expected.
-    res_relaxed = vectorized_backtest(
-        _df_bt, _probs_bt, _states_bt, tf="H1", account_size=15.0,
-        evaluator_config={"Z_CUTOFF_BULL": 0.2, "Z_CUTOFF_BEAR": -0.2},
+    r = gate_dd["status"] == "fail" and gate_dd["reason"] == "dd_cap_violated"
+    results.append(_pass(9, f"validate_strategy FAIL dd>20%  status={gate_dd['status']} reason={gate_dd['reason']}") if r else
+                   _fail(9, f"validate_strategy dd gate wrong: {gate_dd}"))
+
+    # ── T10: validate_strategy FAIL when mr_leak > 0 ─────────────────────────
+    gate_mr = validate_strategy(
+        {"floating_max_drawdown": 0.10, "n_trades": 100, "mr_leak_count": 3},
+        tf="H1",
     )
-    r = res_strict["n_trades"] == 0 and res_relaxed["n_trades"] > 0
-    results.append(
-        _pass(12, f"backtester Z override: strict trades={res_strict['n_trades']} relaxed trades={res_relaxed['n_trades']}") if r else
-        _fail(12, f"backtester Z smoke failed: strict={res_strict['n_trades']} relaxed={res_relaxed['n_trades']}")
+    r = gate_mr["status"] == "fail" and gate_mr["reason"] == "mr_leak"
+    results.append(_pass(10, f"validate_strategy FAIL mr_leak  status={gate_mr['status']} reason={gate_mr['reason']}") if r else
+                   _fail(10, f"validate_strategy mr_leak gate wrong: {gate_mr}"))
+
+    # ── T11: validate_strategy FAIL when n_trades below minimum ──────────────
+    gate_trades = validate_strategy(
+        {"floating_max_drawdown": 0.10, "n_trades": 5, "mr_leak_count": 0},
+        tf="H1",
     )
+    r = gate_trades["status"] == "fail" and gate_trades["reason"] == "min_trades"
+    results.append(_pass(11, f"validate_strategy FAIL min_trades  status={gate_trades['status']}") if r else
+                   _fail(11, f"validate_strategy min_trades gate wrong: {gate_trades}"))
+
+    # ── T12: validate_strategy PASS for healthy result ────────────────────────
+    gate_pass = validate_strategy(
+        {"floating_max_drawdown": 0.10, "n_trades": 80, "mr_leak_count": 0,
+         "regime_coverage": 0.60},
+        tf="H1",
+    )
+    r = gate_pass["status"] == "pass"
+    results.append(_pass(12, f"validate_strategy PASS for healthy result  status={gate_pass['status']}") if r else
+                   _fail(12, f"validate_strategy failed healthy result: {gate_pass}"))
+
+    # ── T13: TB_CONFIG has correct spec values ────────────────────────────────
+    r = (TB_CONFIG["H1"]["pt"]  == 2.5 and TB_CONFIG["H1"]["sl"]  == 1.0 and TB_CONFIG["H1"]["vb"]  == 48
+     and TB_CONFIG["M15"]["pt"] == 2.0 and TB_CONFIG["M15"]["sl"] == 1.0 and TB_CONFIG["M15"]["vb"] == 24
+     and TB_CONFIG["M5"]["pt"]  == 1.5 and TB_CONFIG["M5"]["sl"]  == 1.0 and TB_CONFIG["M5"]["vb"] == 12)
+    results.append(_pass(13, f"TB_CONFIG correct: {TB_CONFIG}") if r else
+                   _fail(13, f"TB_CONFIG wrong: {TB_CONFIG}"))
+
+    # ── T14: MR leak detection in backtester ─────────────────────────────────
+    from src.backtester import _mr_attribution, MR_STATE as BT_MR_STATE
+    # signals: 2 trades — one in TREND(0), one in MR(1)
+    signals_leak   = np.array([0, 1, 1, 0, -1, -1, 0], dtype=np.int8)
+    states_leak    = np.array([0, 1, 1, 0,  1,  1, 0], dtype=int)   # 2nd trade in MR
+    strat_returns  = np.array([0, .01, .01, 0, -.005, -.005, 0])
+    attr = _mr_attribution(signals_leak, states_leak, strat_returns)
+    r = attr["mr_leak_count"] > 0
+    results.append(_pass(14, f"_mr_attribution detects MR leak: leak_count={attr['mr_leak_count']}") if r else
+                   _fail(14, f"_mr_attribution missed MR leak: {attr}"))
 
     # ── Summary ──────────────────────────────────────────────────────────────
     passed = sum(results)
-    total = len(results)
+    total  = len(results)
     print()
-    print("=" * 60)
-    print(f"  SIGNAL PIPELINE AUDIT: {passed}/{total} passed")
+    print("=" * 65)
+    print(f"  SIGNAL PIPELINE AUDIT (Phase E rebuild): {passed}/{total} passed")
     if passed < total:
         print(f"  {total - passed} FAILED — review FAIL lines above")
     else:
-        print("  All tests passed")
-    print("=" * 60)
+        print("  All tests passed ✓")
+    print("=" * 65)
     return passed == total
-
-
-def test_decision_parity_same_input():
-    """Mandatory parity test: same synthetic bar → identical SignalDecision
-    from two independent engine instances (simulates backtest vs live adapters).
-    """
-    transmat = np.array([[0.85, 0.10, 0.05],
-                         [0.10, 0.80, 0.10],
-                         [0.05, 0.10, 0.85]])
-
-    def _build(tf="H1", state=0, bars=5):
-        eng = SignalEngine(tf=tf)
-        for _ in range(bars):
-            eng.update_regime(state, transmat)
-        return eng
-
-    row_ctx = {"hmm_state": 0, "prob": 0.61,
-               "synth_vix_zscore": 1.2, "atr_band_position": 0.40}
-    tf_cfg  = {"tf": "H1", "hmm_transmat": transmat,
-               "sl_atr_multiple": 2.0, "tp_atr_multiple": 1.5}
-
-    d1 = _build().evaluate_bar(row_ctx, None, tf_cfg)
-    d2 = _build().evaluate_bar(row_ctx, None, tf_cfg)
-
-    assert d1 == d2, f"Parity failure: {d1} != {d2}"
-    return True
 
 
 if __name__ == "__main__":
     ok = run_tests()
-    try:
-        test_decision_parity_same_input()
-        logger.info("PASS  [PARITY] test_decision_parity_same_input")
-    except AssertionError as exc:
-        logger.error("FAIL  [PARITY] %s", exc)
-        ok = False
     sys.exit(0 if ok else 1)

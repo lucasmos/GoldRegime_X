@@ -16,8 +16,8 @@ ENSEMBLE_PKL_PATH = Path("models/xgb_ensemble.pkl")
 
 # Continuous features that are StandardScaler-normalized before XGBoost.
 # Discrete/categorical columns (hmm_state, gmm_vol_cluster) are excluded.
-# LSTM context columns (lstm_ctx_0..3) are tanh-activated [-1,1] — no scaling.
-# Staleness counters ({asset}_staleness) are integer counts — no scaling needed.
+# LSTM context columns (lstm_ctx_0..3) are tanh-activated [-1,1] -- no scaling.
+# Staleness counters ({asset}_staleness) are integer counts -- no scaling needed.
 _CONTINUOUS_COLS = [
     "rsi_slope", "atr_normalized", "prev_log_return",
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
@@ -29,7 +29,7 @@ _CONTINUOUS_COLS = [
 ]
 
 # All optional external-asset feature columns (log returns + synth_vix + cyclic time)
-# US500 and USDJPY removed — consistently 0.0 importance across H1 trials.
+# US500 and USDJPY removed -- consistently 0.0 importance across H1 trials.
 _EXTERNAL_ASSETS = [
     "usdchf_log_return", "xagusd_log_return", "xtiusd_log_return",
     "synth_vix_zscore", "atr_band_position",
@@ -46,7 +46,7 @@ LSTM_CONTEXT_COLS = [f"lstm_ctx_{i}" for i in range(4)]
 def get_ensemble_path(tf: str, broker: str = "headway_cent") -> Path:
     """Return the TF+broker-specific XGB ensemble path.
 
-    Example: get_ensemble_path("H1", "headway_cent") → models/xgb_ensemble_H1_headway_cent.pkl
+    Example: get_ensemble_path("H1", "headway_cent") -> models/xgb_ensemble_H1_headway_cent.pkl
     Falls back to the generic models/xgb_ensemble_H1.pkl (then ENSEMBLE_PKL_PATH) if absent.
     """
     return Path(f"models/xgb_ensemble_{tf.upper()}_{broker}.pkl")
@@ -76,13 +76,13 @@ def load_meta_model(path: Path):
 FEATURE_COLS    = ["hmm_state", "gmm_vol_cluster", "rsi_slope", "atr_normalized", "prev_log_return"]
 GMM_FEATURE     = "gmm_vol_cluster"
 USDCHF_FEATURE  = "usdchf_log_return"
-DXY_FEATURE     = USDCHF_FEATURE   # legacy alias — kept so old imports don't crash
+DXY_FEATURE     = USDCHF_FEATURE   # legacy alias -- kept so old imports don't crash
 
 # Volatility bucket labels (ATR tertiles: low / med / high)
 VOL_BUCKETS = ["low", "med", "high"]
 
 # Timeframe-specific IS/OOS split ratios.
-# H1 has a smaller dataset (~125K bars but 21 years of hourly data) — 70/30 gives
+# H1 has a smaller dataset (~125K bars but 21 years of hourly data) -- 70/30 gives
 # a more realistic OOS window without starving the scaler fit.
 # M15/M5 have larger bar counts per year so a wider OOS window (35%) is feasible.
 TF_TRAIN_RATIO = {"H1": 0.70, "M15": 0.65, "M5": 0.65}
@@ -120,14 +120,20 @@ def get_feature_cols(df: pd.DataFrame) -> list[str]:
     return cols
 
 
-# ── TBM Configuration — aligned with TP_SL_CONFIG in backtester.py ─────────
-# tp_mult: fraction of ATR for upper barrier (matches tp1_mult "trend" config)
-# sl_mult: fraction of ATR for lower barrier (matches sl_mult "trend" config)
-# horizon: max bars before time-barrier label = 0 (ambiguous, excluded)
+# -- Triple-Barrier Config (per spec: pt/sl as ATR multiples, vb as bar horizon) -
+# pt (profit target): ATR multiples for upper barrier
+# sl (stop loss):     ATR multiples for lower barrier
+# vb (vertical bar):  max look-forward bars before time-barrier fires
+# Wider pt + tighter sl = regime-specific asymmetric risk/reward.
+TB_CONFIG = {
+    "H1":  {"pt": 2.5, "sl": 1.0, "vb": 48},
+    "M15": {"pt": 2.0, "sl": 1.0, "vb": 24},
+    "M5":  {"pt": 1.5, "sl": 1.0, "vb": 12},
+}
+# Internal alias for _compute_triple_barrier_labels (keeps existing call sites)
 _TBM_CONFIG = {
-    "H1":  {"tp_mult": 1.5, "sl_mult": 2.0, "horizon": 6},
-    "M15": {"tp_mult": 1.2, "sl_mult": 2.0, "horizon": 12},
-    "M5":  {"tp_mult": 0.8, "sl_mult": 1.5, "horizon": 18},
+    tf: {"tp_mult": v["pt"], "sl_mult": v["sl"], "horizon": v["vb"]}
+    for tf, v in TB_CONFIG.items()
 }
 
 
@@ -138,19 +144,19 @@ def _compute_triple_barrier_labels(
     sl_mult: float,
     horizon: int,
 ) -> np.ndarray:
-    """Compute Triple Barrier Method labels (López de Prado, AFML Ch. 3).
+    """Compute Triple Barrier Method labels (L?pez de Prado, AFML Ch. 3).
 
     For each bar i, scans the next `horizon` bars to determine which barrier
     is touched first:
-        +1  upper barrier hit (entry_close * (1 + tp_mult * atr_pct)) — profit
-        -1  lower barrier hit (entry_close * (1 - sl_mult * atr_pct)) — loss
-         0  time barrier (neither barrier touched in horizon bars) — ambiguous
+        +1  upper barrier hit (entry_close * (1 + tp_mult * atr_pct)) -- profit
+        -1  lower barrier hit (entry_close * (1 - sl_mult * atr_pct)) -- loss
+         0  time barrier (neither barrier touched in horizon bars) -- ambiguous
 
     Args:
         closes:   Close price array (raw, not log-transformed).
         atr:      ATR array in price units (raw ATR, not normalised by price).
         tp_mult:  Upper barrier as multiple of ATR.
-        sl_mult:  Lower barrier as multiple of ATR (positive value → subtract).
+        sl_mult:  Lower barrier as multiple of ATR (positive value -> subtract).
         horizon:  Max look-forward bars before time barrier fires.
 
     Returns:
@@ -177,7 +183,7 @@ def _compute_triple_barrier_labels(
             elif future_close <= lower:
                 labels[i] = -1
                 break
-        # If neither barrier hit: labels[i] stays 0 (time barrier — ambiguous)
+        # If neither barrier hit: labels[i] stays 0 (time barrier -- ambiguous)
 
     return labels
 
@@ -194,20 +200,20 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
         df:             Featurised DataFrame from process_pipeline / _apply_features.
         hmm_states:     HMM state array aligned with df.
         feature_scaler: Pre-fitted StandardScaler to reuse (inference / validation).
-        tf:             Timeframe string — drives the IS split ratio for scaler fitting.
+        tf:             Timeframe string -- drives the IS split ratio for scaler fitting.
                         When None a new scaler is fitted on IS data (training mode).
 
     Returns:
-        X             (pd.DataFrame)     — scaled feature matrix
-        y             (pd.Series)        — binary target (next-bar direction)
-        df_aligned    (pd.DataFrame)     — df rows aligned to X
-        scaler        (StandardScaler)   — fitted scaler (same object as input when
+        X             (pd.DataFrame)     -- scaled feature matrix
+        y             (pd.Series)        -- binary target (next-bar direction)
+        df_aligned    (pd.DataFrame)     -- df rows aligned to X
+        scaler        (StandardScaler)   -- fitted scaler (same object as input when
                                            feature_scaler is provided)
     """
     df = df.copy()
     df["hmm_state"] = hmm_states
 
-    # ── One-hot encode HMM states for M5/M15 (causal rolling median) ─────────
+    # -- One-hot encode HMM states for M5/M15 (causal rolling median) ---------
     # Use a backward-looking window so no future state information leaks into
     # training.  The integer hmm_state is replaced by state_0/1/2 indicator
     # columns that XGBoost treats as unordered categories, preventing false
@@ -259,7 +265,7 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
         .mean()
         .bfill()
         .values
-        * df["Close"].values        # convert fraction → price units
+        * df["Close"].values        # convert fraction -> price units
     )
 
     _tbm_labels = _compute_triple_barrier_labels(
@@ -270,7 +276,7 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
         horizon = _tbm["horizon"],
     )
 
-    # Map +1/-1 → 1/0 for binary classification; exclude ambiguous (0) labels
+    # Map +1/-1 -> 1/0 for binary classification; exclude ambiguous (0) labels
     y = pd.Series(
         np.where(_tbm_labels == 1, 1, np.where(_tbm_labels == -1, 0, np.nan)),
         index=df.index,
@@ -288,7 +294,7 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
     cont_cols = [c for c in _CONTINUOUS_COLS if c in X.columns]
     if feature_scaler is None:
         # Training: fit only on IS portion to prevent future-data leakage.
-        # Split ratio is TF-specific — H1: 70%, M15/M5: 65%.
+        # Split ratio is TF-specific -- H1: 70%, M15/M5: 65%.
         scaler = StandardScaler()
         split_ratio = TF_TRAIN_RATIO.get(tf.upper(), 0.70)
         split_idx = int(len(X) * split_ratio)
@@ -332,7 +338,7 @@ def train_xgb(
     max_safe_mcw = max(3, effective_train // (2 ** max_depth))
     if min_child_weight > max_safe_mcw:
         logger.debug(
-            "min_child_weight capped %d→%d (effective_train=%d, max_depth=%d)",
+            "min_child_weight capped %d->%d (effective_train=%d, max_depth=%d)",
             min_child_weight, max_safe_mcw, effective_train, max_depth,
         )
         min_child_weight = max_safe_mcw
@@ -361,7 +367,7 @@ def train_xgb(
         X_eval, y_eval = X_test, y_test
     else:
         # Full CPCV mode (train_ratio=1.0): without a holdout XGBoost builds all
-        # n_estimators trees → 90%+ train accuracy (severe overfitting).
+        # n_estimators trees -> 90%+ train accuracy (severe overfitting).
         # Fix: carve the last 15% of the stitched CPCV training path as an internal
         # eval set for early stopping.  This halts tree growth before memorisation
         # without leaking future OOS data into the scaler or feature distribution.
@@ -379,7 +385,7 @@ def train_xgb(
         logger.warning(
             "hmm_state importance=0: XGBoost ignores the HMM regime. "
             "The regime-aligned filter gates signals on a feature XGB deems "
-            "uninformative — likely caused by heavy regularisation or n_states=2. "
+            "uninformative -- likely caused by heavy regularisation or n_states=2. "
             "Consider re-optimising with n_states>=3 or lower reg_alpha/gamma."
         )
 
@@ -445,7 +451,7 @@ def _strip_zipmap(onnx_model):
             nodes_to_keep.append(node)
 
     if float_tensor_name is None:
-        return onnx_model  # no ZipMap present — nothing to do
+        return onnx_model  # no ZipMap present -- nothing to do
 
     new_outputs = []
     for output in graph.output:
@@ -500,13 +506,13 @@ def export_onnx(model: xgb.XGBClassifier, n_features: int = 4, path: Path = ONNX
         "ONNX exported to %s | inputs: %s | outputs: %s | n_classes=%d",
         path, inputs, outputs, n_classes,
     )
-    print(f"\n  ONNX export OK — n_classes={n_classes}. "
+    print(f"\n  ONNX export OK -- n_classes={n_classes}. "
           f"Set NStates={n_classes} in the MT5 EA inputs.\n")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Three-model volatility-regime ensemble
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def compute_vol_thresholds(atr_normalized: pd.Series) -> tuple[float, float]:
     """Compute ATR 33rd and 66th percentile thresholds from the supplied series.
@@ -535,7 +541,7 @@ def train_xgb_ensemble(
 
     When train_ratio=1.0 (used by CPCV, which owns the IS/OOS split), the
     entire X is used as training data and the thresholds are computed on the
-    full set.  No internal OOS evaluation is performed in this mode — all
+    full set.  No internal OOS evaluation is performed in this mode -- all
     validation is handled externally by the CPCV loop.
 
     Args:
@@ -553,11 +559,11 @@ def train_xgb_ensemble(
     """
     split_idx = int(len(X) * train_ratio)
     # When train_ratio=1.0 (CPCV mode), split_idx == len(X) and X_is == X.
-    # This is correct — the caller owns the IS/OOS split.
+    # This is correct -- the caller owns the IS/OOS split.
     X_is = X.iloc[:split_idx] if split_idx < len(X) else X
     y_is = y.iloc[:split_idx] if split_idx < len(X) else y
 
-    # Thresholds from IS only — no look-ahead into OOS bars
+    # Thresholds from IS only -- no look-ahead into OOS bars
     p33, p66 = compute_vol_thresholds(X_is["atr_normalized"])
     buckets_is = assign_vol_bucket(X_is["atr_normalized"].values, p33, p66)
 
@@ -576,9 +582,9 @@ def train_xgb_ensemble(
         bucket_sizes[bucket] = int(mask.sum())
 
         if len(X_b) < 100:
-            # Too few samples in this bucket — fall back to all IS data
+            # Too few samples in this bucket -- fall back to all IS data
             logger.warning(
-                "Vol bucket '%s' has only %d IS samples — falling back to full IS data.",
+                "Vol bucket '%s' has only %d IS samples -- falling back to full IS data.",
                 bucket, len(X_b),
             )
             X_b, y_b = X_is[bucket_feature_cols], y_is
@@ -621,7 +627,7 @@ def get_predictions_ensemble(
     Args:
         models:     ``{"low": model, "med": model, "high": model}``
         thresholds: ``(p33, p66)`` from training.
-        X:          Feature DataFrame — must contain ``atr_normalized``.
+        X:          Feature DataFrame -- must contain ``atr_normalized``.
 
     Returns:
         predictions:  int array of class labels.
@@ -637,7 +643,7 @@ def get_predictions_ensemble(
     bad_mask = np.any(np.isnan(X.values) | np.isinf(X.values), axis=1)
     if bad_mask.any():
         logger.warning(
-            "get_predictions_ensemble: %d row(s) contain NaN/Inf — "
+            "get_predictions_ensemble: %d row(s) contain NaN/Inf -- "
             "defaulting to prob=0.5 for those rows. "
             "Check feature pipeline for upstream errors.",
             int(bad_mask.sum()),
@@ -650,7 +656,7 @@ def get_predictions_ensemble(
             continue
         model = models[bucket]
         # Select only the columns the bucket model was trained on
-        # (gmm_vol_cluster is excluded — see train_xgb_ensemble)
+        # (gmm_vol_cluster is excluded -- see train_xgb_ensemble)
         bucket_cols = list(model.feature_names_in_)
         X_b = X[mask][bucket_cols]
         predictions[mask]   = model.predict(X_b)
@@ -677,7 +683,7 @@ def compute_regime_stats(
         hmm_states_is: HMM state labels aligned with ``X_is``.
 
     Returns:
-        Mapping of ``state_id → {"mean": float, "std": float, "count": int}``.
+        Mapping of ``state_id -> {"mean": float, "std": float, "count": int}``.
     """
     _, probs = get_predictions_ensemble(models, thresholds, X_is)
 
@@ -691,7 +697,7 @@ def compute_regime_stats(
             std  = float(max(np.std(state_p), 0.010))
         else:
             logger.warning(
-                "State %d: only %d IS samples — using fallback stats (mean=0.50, std=0.15)",
+                "State %d: only %d IS samples -- using fallback stats (mean=0.50, std=0.15)",
                 state, n,
             )
             mean, std = 0.50, 0.15
@@ -700,6 +706,123 @@ def compute_regime_stats(
             "  Regime stats  state=%d  mean=%.4f  std=%.4f  n=%d", state, mean, std, n
         )
     return regime_stats
+
+
+# -- Regime-Specific Training (Phase C/D rebuild) --------------------------------
+
+def train_regime_models(
+    X,
+    y,
+    states,
+    tf='H1',
+    **xgb_kwargs
+):
+    # Train separate XGBoost models for TREND and VOLATILITY_SHOCK regimes.
+    # MEAN_REVERSION bars are excluded (no-trade policy per STATE_POLICY).
+    from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_SHOCK
+
+    TREND_ID = CANONICAL_REGIME_ID[REGIME_TREND]   # 0
+    SHOCK_ID = CANONICAL_REGIME_ID[REGIME_SHOCK]   # 2
+    _MIN_SAMPLES = 50
+
+    states_arr = __import__('numpy').asarray(states)
+    if len(states_arr) != len(X):
+        logger.warning(
+            'train_regime_models: states length %d != X length %d; truncating.',
+            len(states_arr), len(X)
+        )
+        _n = min(len(states_arr), len(X))
+        states_arr = states_arr[:_n]
+        X = X.iloc[:_n]
+        y = y.iloc[:_n]
+
+    results = {
+        'trend_model': None, 'shock_model': None,
+        'trend_n': 0,        'shock_n': 0,
+        'trend_metrics': {}, 'shock_metrics': {},
+    }
+
+    # TREND model
+    trend_mask = (states_arr == TREND_ID)
+    results['trend_n'] = int(trend_mask.sum())
+    if results['trend_n'] >= _MIN_SAMPLES:
+        try:
+            tm, tm_metrics = train_xgb(X[trend_mask], y[trend_mask], train_ratio=1.0, **xgb_kwargs)
+            results['trend_model']   = tm
+            results['trend_metrics'] = tm_metrics
+            logger.info('[%s] TREND model: n=%d  train_acc=%.4f',
+                        tf, results['trend_n'], tm_metrics.get('train_accuracy', 0.0))
+        except Exception as exc:
+            logger.warning('[%s] TREND model training failed: %s', tf, exc)
+    else:
+        logger.warning('[%s] TREND model skipped: only %d samples (min %d)',
+                       tf, results['trend_n'], _MIN_SAMPLES)
+
+    # SHOCK model
+    shock_mask = (states_arr == SHOCK_ID)
+    results['shock_n'] = int(shock_mask.sum())
+    if results['shock_n'] >= _MIN_SAMPLES:
+        try:
+            sm, sm_metrics = train_xgb(X[shock_mask], y[shock_mask], train_ratio=1.0, **xgb_kwargs)
+            results['shock_model']   = sm
+            results['shock_metrics'] = sm_metrics
+            logger.info('[%s] SHOCK model: n=%d  train_acc=%.4f',
+                        tf, results['shock_n'], sm_metrics.get('train_accuracy', 0.0))
+        except Exception as exc:
+            logger.warning('[%s] SHOCK model training failed: %s', tf, exc)
+    else:
+        logger.warning('[%s] SHOCK model skipped: only %d samples (min %d)',
+                       tf, results['shock_n'], _MIN_SAMPLES)
+
+    return results
+
+
+def get_regime_predictions(X, states, trend_model, shock_model, fallback_prob=0.50):
+    # Merge per-regime predictions. TREND->trend_model, SHOCK->shock_model, MR->0.5
+    import numpy as _np
+    from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_SHOCK
+
+    TREND_ID = CANONICAL_REGIME_ID[REGIME_TREND]
+    SHOCK_ID = CANONICAL_REGIME_ID[REGIME_SHOCK]
+
+    probs = _np.full(len(X), fallback_prob, dtype=_np.float64)
+    states_arr = _np.asarray(states)
+
+    trend_mask = (states_arr == TREND_ID)
+    if trend_model is not None and trend_mask.any():
+        probs[trend_mask] = trend_model.predict_proba(X[trend_mask])[:, 1]
+
+    shock_mask = (states_arr == SHOCK_ID)
+    if shock_model is not None and shock_mask.any():
+        probs[shock_mask] = shock_model.predict_proba(X[shock_mask])[:, 1]
+
+    return probs
+
+
+def save_regime_models(regime_result, tf, broker='headway_cent'):
+    # Persist trend_model and shock_model to models/ directory.
+    for key in ('trend_model', 'shock_model'):
+        model = regime_result.get(key)
+        if model is not None:
+            path = Path('models/%s_%s_%s.pkl' % (key, tf.upper(), broker))
+            path.parent.mkdir(parents=True, exist_ok=True)
+            joblib.dump(model, path)
+            logger.info('Saved %s -> %s', key, path)
+
+
+def load_regime_models(tf, broker='headway_cent'):
+    # Load trend_model and shock_model from models/ directory. Returns (trend, shock).
+    models = []
+    for key in ('trend_model', 'shock_model'):
+        path = Path('models/%s_%s_%s.pkl' % (key, tf.upper(), broker))
+        if path.exists():
+            m = joblib.load(path)
+            logger.info('Loaded %s <- %s', key, path)
+        else:
+            m = None
+            logger.warning('%s not found at %s', key, path)
+        models.append(m)
+    return tuple(models)
 
 
 def save_xgb_ensemble(
@@ -739,7 +862,7 @@ def export_onnx_ensemble(
         ``models/xgb_model_vol_med.onnx``
         ``models/xgb_model_vol_high.onnx``
 
-    Returns a dict mapping bucket name → ONNX path.
+    Returns a dict mapping bucket name -> ONNX path.
     """
     base_dir = Path(base_dir)
     paths = {}
@@ -750,9 +873,9 @@ def export_onnx_ensemble(
     return paths
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # Per-regime XGBoost classifiers
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def train_regime_classifiers(
     X: pd.DataFrame,
@@ -775,7 +898,7 @@ def train_regime_classifiers(
         X:           Feature DataFrame (output of ``prepare_features``).
         hmm_states:  HMM state labels aligned row-for-row with X.
         train_ratio: IS fraction for fitting (default 0.70 = H1 ratio).
-        **xgb_kwargs: Forwarded to XGBClassifier (max_depth, learning_rate…).
+        **xgb_kwargs: Forwarded to XGBClassifier (max_depth, learning_rate...).
 
     Returns:
         ``{0: xgb_model, 1: xgb_model, 2: xgb_model}``
@@ -784,7 +907,7 @@ def train_regime_classifiers(
     n_unique = len(np.unique(states))
     next_states = np.roll(states, -1)   # next-bar state; last entry is invalid
 
-    # Drop last row — no valid next_state
+    # Drop last row -- no valid next_state
     X_fit = X.iloc[:-1]
     next_s = next_states[:-1]
 
@@ -820,7 +943,7 @@ def train_regime_classifiers(
         pos_ratio = y_is.mean()
         if pos_ratio <= 0 or pos_ratio >= 1:
             logger.warning(
-                "Regime classifier [%s]: degenerate class ratio=%.3f — using scale_pos_weight=1",
+                "Regime classifier [%s]: degenerate class ratio=%.3f -- using scale_pos_weight=1",
                 regime_name, pos_ratio,
             )
             scale_pos_weight = 1.0
@@ -861,7 +984,7 @@ def predict_regime_proba(
     Args:
         regime_models: ``{0: xgb, 1: xgb, 2: xgb}`` from :func:`train_regime_classifiers`,
                        or ``None`` for a uniform fallback.
-        X_row:         Single-row feature input — DataFrame row, Series, or 1-D array.
+        X_row:         Single-row feature input -- DataFrame row, Series, or 1-D array.
 
     Returns:
         ``{'Bull': float, 'Bear': float, 'Chop': float}``  (values sum to 1.0)
