@@ -3,6 +3,7 @@ import pandas as pd
 from src.logger import setup_logger
 from src.risk_manager import BROKER_CONFIGS
 from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_MR, REGIME_SHOCK
+from src.trade_lifecycle import config_for_tf
 
 logger = setup_logger(__name__)
 
@@ -37,7 +38,9 @@ BULL_STATE  = TREND_STATE
 BEAR_STATE  = MR_STATE     # note: semantics changed — MR, not directional bear
 CHOP_STATE  = SHOCK_STATE
 
-# ── Live Execution Configs (mirrored from mt5_trader.py) ─────────────────────
+# ── Live Execution Configs ───────────────────────────────────────────────────
+# ATR_TRAIL_CONFIG is kept as a legacy read-only dict for notebooks/reports.
+# New code must use config_for_tf(tf) from src.trade_lifecycle instead.
 MAX_HOLD_BARS = 12
 
 ATR_TRAIL_CONFIG: dict = {
@@ -419,6 +422,7 @@ def _run_bar_loop(
     raw_atr_arr=None,
     z_cutoff_bull: float | None = None,
     z_cutoff_bear: float | None = None,
+    h1_entry_prob: float | None = None,
 ) -> tuple:
     from src.signal_engine import SignalEngine
 
@@ -457,6 +461,7 @@ def _run_bar_loop(
         "tf": tf, "hmm_transmat": hmm_transmat,
         "z_cutoff_bull": z_cutoff_bull,
         "z_cutoff_bear": z_cutoff_bear,
+        "h1_entry_prob": h1_entry_prob,
     }
 
     # ── Raw ATR fallback (if not pre-computed by caller) ─────────────────────
@@ -473,8 +478,16 @@ def _run_bar_loop(
     _tf_up       = tf.upper()
     prob_thresh  = 0.55    # legacy variable kept for any residual references
     short_thresh = 0.45    # legacy variable kept for any residual references
-    _trail_cfg   = ATR_TRAIL_CONFIG.get(_tf_up, ATR_TRAIL_CONFIG["H1"])
+    _lc_cfg      = config_for_tf(tf)
     _tp_sl_cfg   = TP_SL_CONFIG.get(_tf_up, TP_SL_CONFIG["H1"])
+
+    # ── Lifecycle event counters ──────────────────────────────────────────────
+    _lc_activation_events:       int   = 0
+    _lc_partial_close_events:    int   = 0
+    _lc_regime_forced_closes:    int   = 0
+    _lc_trail_update_events:     int   = 0
+    _lc_activation_pnl_sum:      float = 0.0
+    _lc_activation_pnl_count:    int   = 0
 
     # ── Trade state ───────────────────────────────────────────────────────────
     in_trade      = False
@@ -549,8 +562,8 @@ def _run_bar_loop(
             # Accumulate the raw directional log-return (un-sized) so cum_return
             # tracks the true price move from entry regardless of partial closes.
             cum_return += (bar_gross / size_mult) if size_mult > 0 else 0.0
-            cur_pnl      = cum_return * account_size
-            max_fav_pnl  = max(max_fav_pnl, cur_pnl)
+            floating_pnl_usd  = cum_return * account_size
+            max_fav_pnl  = max(max_fav_pnl, floating_pnl_usd)
             signals[i]   = direction
             sizes_arr[i] = size_mult
 
@@ -568,24 +581,30 @@ def _run_bar_loop(
                     guard_hit  = True
 
             # ── 4. ATR Trail Activation & Partial Close ───────────────────────
-            if not atr_activated and cur_pnl >= _trail_cfg["activation_pnl"]:
+            if not atr_activated and floating_pnl_usd >= _lc_cfg.activation_pnl_usd:
                 atr_activated = True
-                if _trail_cfg.get("partial_close") and not partial_done:
+                _lc_activation_events      += 1
+                _lc_activation_pnl_sum     += floating_pnl_usd
+                _lc_activation_pnl_count   += 1
+                if _lc_cfg.partial_close and not partial_done:
                     size_mult    *= 0.50
                     partial_done  = True
+                    _lc_partial_close_events += 1
                     costs_arr[i] += spread_cost * size_mult   # cost of halving
 
             # ── 5. Ratchet Trail SL ───────────────────────────────────────────
             if atr_activated:
-                trail_dist = _trail_cfg["trail_mult"] * entry_atr
+                trail_dist = _lc_cfg.trail_mult * entry_atr
                 if direction == 1:
                     new_sl = bar_close - trail_dist
                     if new_sl > current_sl:
                         current_sl = new_sl
+                        _lc_trail_update_events += 1
                 else:
                     new_sl = bar_close + trail_dist
                     if new_sl < current_sl:
                         current_sl = new_sl
+                        _lc_trail_update_events += 1
 
             # ── 6. End-of-bar exit checks ─────────────────────────────────────
             hit_time_stop = bars_in_trade >= MAX_HOLD_BARS
@@ -599,7 +618,7 @@ def _run_bar_loop(
             # Policy exit decision via evaluate_bar (Phase 2).
             # pos_ctx carries end-of-bar P&L so profit_erosion check is accurate.
             _pos_ctx = {
-                "direction": direction, "cur_pnl": cur_pnl,
+                "direction": direction, "cur_pnl": floating_pnl_usd,
                 "max_fav_pnl": max_fav_pnl, "bars_in_trade": bars_in_trade,
             }
             _row_ctx_exit = {
@@ -613,8 +632,9 @@ def _run_bar_loop(
 
             _scalp_hit = (
                 _tf_up == "M5"
-                and not _trail_cfg.get("partial_close")
-                and cur_pnl >= _trail_cfg.get("scalp_target", 4.00)
+                and _lc_cfg.scalp_target_usd is not None
+                and not _lc_cfg.partial_close
+                and floating_pnl_usd >= _lc_cfg.scalp_target_usd
             )
 
             _force_exit = (
@@ -636,7 +656,7 @@ def _run_bar_loop(
                             "regime":      int(states[trade_entry_i]),
                             "signal":      direction,
                             "prob":        float(probabilities[trade_entry_i]),
-                            "pnl":         cur_pnl,
+                            "pnl":         floating_pnl_usd,
                             "exit_reason": "SL"     if hit_sl        else
                                            "TP"     if hit_tp1        else
                                            "TIME"   if hit_time_stop  else
@@ -652,6 +672,9 @@ def _run_bar_loop(
                 cooldown_bars = COOLDOWN_PERIOD
                 engine.on_trade_closed()
                 cum_return, max_fav_pnl, bars_in_trade = 0.0, 0.0, 0
+                floating_pnl_usd = 0.0
+                if regime_exit:
+                    _lc_regime_forced_closes += 1
             else:
                 strategy_returns[i] = bar_gross
 
@@ -714,7 +737,18 @@ def _run_bar_loop(
                     costs_arr[i]        = spread_cost * size_mult
                     strategy_returns[i] = -spread_cost * size_mult
 
-    return signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades
+    _lc_avg_activation_pnl = (
+        _lc_activation_pnl_sum / _lc_activation_pnl_count
+        if _lc_activation_pnl_count > 0 else 0.0
+    )
+    _lifecycle_events = {
+        "activation_events":        _lc_activation_events,
+        "partial_close_events":     _lc_partial_close_events,
+        "regime_shift_forced_closes": _lc_regime_forced_closes,
+        "trail_updates":            _lc_trail_update_events,
+        "avg_activation_pnl_usd":   round(_lc_avg_activation_pnl, 4),
+    }
+    return signals, strategy_returns, gross_returns, costs_arr, sizes_arr, trades, _lifecycle_events
 
 
 def vectorized_backtest(
@@ -758,6 +792,7 @@ def vectorized_backtest(
     # Extract optional Z overrides from evaluator_config for sensitivity sweeps.
     z_bull = evaluator_config.get("Z_CUTOFF_BULL") if evaluator_config else None
     z_bear = evaluator_config.get("Z_CUTOFF_BEAR") if evaluator_config else None
+    h1_ep  = evaluator_config.get("h1_entry_prob") if evaluator_config else None
     atr_norm    = df["atr_normalized"].values
     n           = len(df)
 
@@ -799,12 +834,13 @@ def vectorized_backtest(
     raw_atr_arr = pd.Series(_tr).rolling(14, min_periods=1).mean().bfill().values
 
     # ── Signal generation via bar-by-bar SignalEngine ─────────────────────────
-    signals, strategy_returns, gross_returns, costs, sizes, _trades = _run_bar_loop(
+    signals, strategy_returns, gross_returns, costs, sizes, _trades, _lc_events = _run_bar_loop(
         df, probabilities, hmm_states, hmm_transmat,
         tf=tf, broker=broker, account_size=account_size,
         split_idx=split_idx, return_trades=return_trades,
         test_mask=test_mask, raw_atr_arr=raw_atr_arr,
         z_cutoff_bull=z_bull, z_cutoff_bear=z_bear,
+        h1_entry_prob=h1_ep,
     )
 
     _spread_frac = BROKER_CONFIGS.get(broker, BROKER_CONFIGS["standard"]).get("spread_frac", 0.0004)
@@ -823,6 +859,8 @@ def vectorized_backtest(
         "tf":            tf,
         "pos_per_trade": 1,
     })
+    # Lifecycle parity telemetry (activation, partial-close, trail, regime-shift counters)
+    result.update(_lc_events)
     # Full-period MR attribution
     result.update(_mr_attribution(signals, hmm_states, strategy_returns))
 

@@ -101,7 +101,7 @@ SEARCH_SPACES = {
     "H1": {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
-        "n_states":          (3,     4,    "int"),
+        "n_states":          (3,     3,    "int"),  # canonical: always 3
         "max_depth":         (3,     6,    "int"),   # spec: 3..6
         "reg_alpha":         (1e-6,  0.5,  "log"),
         "reg_lambda":        (0.01,  2.0,  "log"),
@@ -116,7 +116,7 @@ SEARCH_SPACES = {
     "M15": {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
-        "n_states":          (3,     4,    "int"),
+        "n_states":          (3,     3,    "int"),  # canonical: always 3
         "max_depth":         (3,     8,    "int"),   # spec: 3..8
         "reg_alpha":         (1e-6,  0.1,  "log"),
         "reg_lambda":        (1e-6,  0.1,  "log"),
@@ -131,7 +131,7 @@ SEARCH_SPACES = {
     "M5": {
         "obs_cov":           (0.05,  5.0,  "log"),
         "trans_cov":         (0.001, 0.1,  "log"),
-        "n_states":          (3,     4,    "int"),
+        "n_states":          (3,     3,    "int"),  # canonical: always 3
         "max_depth":         (2,     5,    "int"),   # spec: 2..5
         "reg_alpha":         (1e-6,  0.1,  "log"),
         "reg_lambda":        (1e-6,  0.1,  "log"),
@@ -168,6 +168,25 @@ MIN_TRADES_PER_PATH = {"H1": 15, "M15": 60,  "M5": 100}
 
 def _study_db(broker: str) -> str:
     return f"sqlite:///models/study_{broker}.db"
+
+
+def _study_db_tf(broker: str, tf: str) -> str:
+    """Per-TF SQLite DB for the unified pipeline optimizer."""
+    return f"sqlite:///models/study_{broker}_{tf.lower()}.db"
+
+
+def get_optuna_storage_url(broker: str) -> str:
+    """Canonical per-broker Optuna storage URL (all TF studies in one DB).
+
+    All studies for a broker are colocated so optuna-dashboard can display
+    every active TF study from a single --storage argument.
+    """
+    return f"sqlite:///models/study_{broker}.db"
+
+
+def get_optuna_study_name(tf: str, broker: str) -> str:
+    """Canonical unified-pipeline study name for a given TF + broker pair."""
+    return f"{tf.lower()}_{broker}_single_pipeline"
 
 
 def _get_tier(balance: float) -> str:
@@ -220,13 +239,33 @@ def _aligned_states_from_prepare(
 def resolve_n_states(tf: str, params: dict) -> int:
     """Return the canonical n_states for *tf*.
 
-    M5 and M15 are fixed at 3 (Bull/Bear/Chop) across optimize and train paths
-    so that CPCV and training always produce identical HMM structures.
-    H1 reads n_states from *params* (Optuna-tuned value, default 3).
+    The canonical regime contract mandates exactly 3 states for all TFs:
+    TREND (0), MEAN_REVERSION (1), VOLATILITY_SHOCK (2).
+    Any other value is rejected with a ValueError.
     """
-    if tf.upper() in ("M5", "M15"):
-        return 3
-    return int(params.get("n_states", 3))
+    requested = int(params.get("n_states", 3))
+    if requested != 3:
+        raise ValueError(
+            f"n_states must be 3 for all TFs (canonical regime contract). "
+            f"Received {requested} for {tf}. "
+            f"Supported states: TREND(0), MEAN_REVERSION(1), VOLATILITY_SHOCK(2)."
+        )
+    return 3
+
+
+def _enforce_three_states(params: dict, context: str) -> int:
+    """Validate and return n_states=3, raising immediately on violation.
+
+    Use this at every fit_hmm call site so 4-state drift cannot slip
+    through without an explicit error and traceback.
+    """
+    n = int(params.get("n_states", 3))
+    if n != 3:
+        raise ValueError(
+            f"{context}: n_states must be 3 (canonical contract), got {n}. "
+            f"Delete or reset the Optuna study if old 4/5-state trials are stored."
+        )
+    return 3
 
 
 def _make_purged_inner_cv_splits(
@@ -437,7 +476,9 @@ def _run_single_window(
                 "is_cv_sharpe": 0.0, "hmm_zeroed": False}
 
     try:
-        model_is, states_is, _ = fit_hmm(df_is, n_states=n_states, tf=tf)
+        model_is, states_is, _ = fit_hmm(
+            df_is, n_states=_enforce_three_states({"n_states": n_states}, "_run_single_window"), tf=tf
+        )
     except Exception as exc:
         return _fail(f"HMM fit: {exc}")
 
@@ -713,13 +754,11 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
 
         # ── n_states ──────────────────────────────────────────────────────────
-        # M5/M15 fixed at 3 (Bull/Bear/Chop) — Chop-High/ChopLow 4th state
-        # adds noise on short timeframes where the extra regime boundary is
-        # learned from too few intraday bars.
-        if tf_up in ("M5", "M15"):
-            n_states = 3
-        else:  # H1
-            n_states = trial.suggest_int("n_states", 3, 4)
+        # Pinned to 3 for ALL TFs — canonical regime contract.
+        # TREND(0), MEAN_REVERSION(1), VOLATILITY_SHOCK(2).
+        # Any 4/5-state trials in a resumed study are legacy and will score
+        # against floors; new trials will always use n_states=3.
+        n_states = 3
 
         # ── XGBoost params ────────────────────────────────────────────────────
         if tf_up == "M5":
@@ -993,7 +1032,11 @@ def make_objective_stage1(
         _STAGE1_MIN_BARS = 500  # minimum training bars per fold
         if tf_up in ("M5", "M15"):
             try:
-                _hmm, _states_is, _ = fit_hmm(df_is, n_states=int(n_states), tf=tf)
+                _hmm, _states_is, _ = fit_hmm(
+                    df_is,
+                    n_states=_enforce_three_states({"n_states": int(n_states)}, "stage1_cpcv"),
+                    tf=tf,
+                )
                 X_is_s, y_is_s, _, _ = prepare_features(df_is, _states_is, tf=tf)
                 if len(X_is_s) < _STAGE1_MIN_BARS * 2:
                     return -50.0
@@ -1061,6 +1104,425 @@ def make_objective_stage1(
     return objective
 
 
+
+# ── Unified trial summary format ──────────────────────────────────────────────
+
+def format_trial_summary(row: dict) -> str:
+    """Produce a uniform single-line trial log entry for all TFs."""
+    keys = [
+        "tf", "trial", "objective_score", "cpcv_mean_score", "cpcv_std_score",
+        "valid_paths", "total_paths", "sharpe_median", "pf_median", "calmar_median",
+        "expectancy_median", "floating_dd_median", "trades_median", "mr_leak_count",
+        "activation_events", "partial_close_events", "trail_updates",
+        "regime_shift_forced_closes", "avg_activation_pnl_usd",
+        "pruned", "elapsed_sec",
+    ]
+    return " | ".join(f"{k}={row.get(k)}" for k in keys)
+
+
+# ── H1 profitability safeguards ─────────────────────────────────────────────
+
+def _apply_h1_hard_floors(metrics: dict, params: dict) -> "tuple[float, list[str]]":
+    """Apply hard-floor penalty for H1 CPCV quality metrics.
+
+    Returns (penalty, reasons) where reasons is a list of grep-friendly tags.
+    Floors are trial params so Optuna learns which param combos can meet them.
+    """
+    penalty: float = 0.0
+    reasons: list = []
+
+    min_sharpe = float(params.get("h1_min_median_sharpe", 0.10))
+    min_exp    = float(params.get("h1_min_median_expectancy", 0.0))
+    min_pf     = float(params.get("h1_min_median_pf", 1.02))
+    min_valid  = int(  params.get("h1_min_valid_paths", 0))
+
+    med_sharpe  = float(metrics.get("median_sharpe",   0.0))
+    med_exp     = float(metrics.get("median_expectancy", 0.0))
+    med_pf      = float(metrics.get("median_pf",        1.0))
+    valid_paths = int(  metrics.get("n_valid_paths",    0))
+
+    if med_sharpe < min_sharpe:
+        penalty += 10.0 + (min_sharpe - med_sharpe) * 10.0
+        reasons.append(f"floor_sharpe:{med_sharpe:.3f}<{min_sharpe:.3f}")
+
+    if med_exp <= min_exp:
+        penalty += 8.0 + (min_exp - med_exp) * 25.0
+        reasons.append(f"floor_expectancy:{med_exp:.5f}<={min_exp:.5f}")
+
+    if med_pf < min_pf:
+        penalty += 6.0 + (min_pf - med_pf) * 12.0
+        reasons.append(f"floor_pf:{med_pf:.3f}<{min_pf:.3f}")
+
+    if min_valid > 0 and valid_paths < min_valid:
+        penalty += 8.0 + (min_valid - valid_paths) * 1.5
+        reasons.append(f"floor_valid_paths:{valid_paths}<{min_valid}")
+
+    return penalty, reasons
+
+
+def _turnover_penalty(metrics: dict, params: dict, tf: str) -> "tuple[float, list[str]]":
+    """Penalise excessive churn; H1-only (M15/M5 use spread-penalty in execute_cpcv).
+
+    Returns (penalty, reasons).
+    """
+    if tf.upper() != "H1":
+        return 0.0, []
+
+    trades_per_100 = float(metrics.get("trades_per_100_bars", 0.0))
+    reversal_ratio = float(metrics.get("reversal_ratio",      0.0))  # future metric
+    max_t100 = float(params.get("h1_max_trades_per_100", 4.0))
+    max_rev  = float(params.get("h1_max_reversal_ratio", 0.35))
+
+    penalty: float = 0.0
+    reasons: list = []
+
+    if trades_per_100 > max_t100:
+        penalty += (trades_per_100 - max_t100) * 1.5
+        reasons.append(f"turnover:{trades_per_100:.2f}>{max_t100:.2f}")
+
+    if reversal_ratio > max_rev:
+        penalty += (reversal_ratio - max_rev) * 2.0
+        reasons.append(f"reversals:{reversal_ratio:.2f}>{max_rev:.2f}")
+
+    return penalty, reasons
+
+
+# ── TF-specific objective weights ────────────────────────────────────────────
+
+def _tf_pipeline_score(cpcv_result: dict, tf: str) -> float:
+    """Apply TF-specific objective weights to CPCV aggregate metrics.
+
+    H1  : 0.50*expectancy + 0.30*calmar + 0.20*stability
+    M15 : 0.40*profit_factor + 0.30*sharpe + 0.30*calmar
+    M5  : 0.40*stability + 0.30*profit_factor + 0.30*drawdown_score
+    """
+    tf_up             = tf.upper()
+    median_sharpe     = float(cpcv_result.get("median_sharpe",     0.0))
+    median_pf         = float(cpcv_result.get("median_pf",         1.0))
+    median_calmar     = float(cpcv_result.get("median_calmar",     0.0))
+    median_expectancy = float(cpcv_result.get("median_expectancy", 0.0))
+    stability         = float(cpcv_result.get("median_win_rate",   0.0))
+    median_dd         = float(cpcv_result.get("median_drawdown",   0.0))
+
+    drawdown_score = max(0.0, 1.0 - median_dd / max(CPCV_MAX_FLOAT_DD, 1e-6))
+
+    if tf_up == "H1":
+        score = 0.50 * median_expectancy + 0.30 * median_calmar + 0.20 * stability
+    elif tf_up == "M15":
+        score = 0.40 * median_pf + 0.30 * median_sharpe + 0.30 * median_calmar
+    else:  # M5
+        score = 0.40 * stability + 0.30 * median_pf + 0.30 * drawdown_score
+
+    return float(score)
+
+
+# ── Unified single-stage pipeline optimizer ───────────────────────────────────
+
+class PipelineOptimizer:
+    """Unified end-to-end CPCV optimizer for a single timeframe.
+
+    Replaces the Stage-1 (AUC) / Stage-2 (CPCV) two-stage flow with one
+    objective per trial: HMM -> regimes -> XGB regime models -> signal policy
+    -> CPCV backtest.  The objective score is TF-specific (see _tf_pipeline_score).
+
+    Usage::
+
+        opt = PipelineOptimizer(tf="H1", broker="headway_cent",
+                                account_size=15.0, df=df)
+        study.optimize(opt.objective, n_trials=80)
+    """
+
+    def __init__(
+        self,
+        tf:           str,
+        broker:       str,
+        account_size: float,
+        df:           "pd.DataFrame",
+        wfo_mode:     str = "standard",
+    ):
+        self.tf           = tf.upper()
+        self.broker       = broker
+        self.account_size = account_size
+        self.df           = df
+        self.wfo_mode     = wfo_mode
+
+        from pathlib import Path as _Path
+        self._jsonl_path = _Path(
+            f"reports/optimization_trials_{tf.lower()}_{broker}.jsonl"
+        )
+        self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── Parameter space ───────────────────────────────────────────────────────
+
+    def suggest_params(self, trial: "optuna.Trial") -> dict:
+        """Suggest hyperparameters for one trial.
+
+        New unified parameter space:
+        - HMM:  n_states, obs_cov, trans_cov, persistence_threshold,
+                transition_penalty, median_filter_window
+        - GMM:  gmm_n_components, gmm_covariance_type  (future wiring)
+        - XGB:  per-TF ranges per spec
+        """
+        tf_up = self.tf
+
+        # ── Kalman smoothing ──────────────────────────────────────────────
+        if tf_up == "M5":
+            obs_cov   = trial.suggest_float("obs_cov",   0.05, 5.0,  log=True)
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.1, log=True)
+        else:
+            obs_cov   = trial.suggest_float("obs_cov",   0.5,  5.0,  log=True)
+            trans_cov = trial.suggest_float("trans_cov", 0.001, 0.03, log=True)
+
+        # Pinned to 3 for ALL TFs — canonical regime contract.
+        # TREND(0), MEAN_REVERSION(1), VOLATILITY_SHOCK(2).
+        n_states = 3
+
+        # HMM persistence gate: int [2,6] -> min-diagonal threshold [0.40,0.60].
+        # pt=2 -> 0.40 (permissive), pt=6 -> 0.60 (current default / strict).
+        persistence_threshold = trial.suggest_int("persistence_threshold", 2, 6)
+        # TODO: wire transition_penalty when engine_hmm exposes transmat smoothing API.
+        # TODO: wire median_filter_window when engine_hmm exposes state post-filter API.
+        # TODO: wire gmm_n_components / gmm_covariance_type when processor
+        #       supports per-trial GMM fitting (currently fitted once in process_pipeline).
+
+        # ── XGBoost (TF-specific ranges per spec) ─────────────────────────
+        if tf_up == "H1":
+            max_depth        = trial.suggest_int(  "max_depth",        3,  6)
+            learning_rate    = trial.suggest_float("learning_rate",    0.01, 0.08,  log=True)
+            subsample        = trial.suggest_float("subsample",        0.6,  0.95)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.6,  0.95)
+            min_child_weight = trial.suggest_int(  "min_child_weight", 5,  30)
+            gamma            = trial.suggest_float("gamma",            0.0,  5.0)
+            n_estimators     = trial.suggest_int(  "n_estimators",     200, 1200)
+        elif tf_up == "M15":
+            max_depth        = trial.suggest_int(  "max_depth",        3,  8)
+            learning_rate    = trial.suggest_float("learning_rate",    0.01, 0.15,  log=True)
+            subsample        = trial.suggest_float("subsample",        0.5,  1.0)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.5,  1.0)
+            min_child_weight = trial.suggest_int(  "min_child_weight", 3,  25)
+            gamma            = trial.suggest_float("gamma",            0.0, 10.0)
+            n_estimators     = trial.suggest_int(  "n_estimators",     300, 1500)
+        else:  # M5
+            max_depth        = trial.suggest_int(  "max_depth",        2,  5)
+            learning_rate    = trial.suggest_float("learning_rate",    0.005, 0.05, log=True)
+            subsample        = trial.suggest_float("subsample",        0.7,  1.0)
+            colsample_bytree = trial.suggest_float("colsample_bytree", 0.7,  1.0)
+            min_child_weight = trial.suggest_int(  "min_child_weight", 10, 50)
+            gamma            = trial.suggest_float("gamma",            1.0, 15.0)
+            n_estimators     = trial.suggest_int(  "n_estimators",     500, 2500)
+
+        reg_alpha        = trial.suggest_float("reg_alpha",        1e-6, 0.5,  log=True)
+        reg_lambda       = trial.suggest_float("reg_lambda",       0.01, 2.0,  log=True)
+        scale_pos_weight = trial.suggest_float("scale_pos_weight", 0.5,  2.0,  log=True)
+
+        # H1-only entry gate and profitability floor params
+        # These are sampled so Optuna learns which XGB/HMM combos can meet stricter bars.
+        _h1_gates: dict = {}
+        if tf_up == "H1":
+            _h1_gates = {
+                "h1_entry_prob":         trial.suggest_float("h1_entry_prob",         0.57, 0.66),
+                "h1_min_median_sharpe":  trial.suggest_float("h1_min_median_sharpe",  0.05, 0.25),
+                "h1_min_median_pf":      trial.suggest_float("h1_min_median_pf",      1.00, 1.10),
+                "h1_max_trades_per_100": trial.suggest_float("h1_max_trades_per_100", 2.5,  6.0),
+            }
+
+        return {
+            "kalman": {
+                "obs_cov":   obs_cov,
+                "trans_cov": trans_cov,
+            },
+            "hmm": {
+                "n_states":              n_states,
+                "persistence_threshold": persistence_threshold,
+            },
+            "xgb": {
+                "max_depth":        max_depth,
+                "learning_rate":    learning_rate,
+                "n_estimators":     n_estimators,
+                "subsample":        subsample,
+                "colsample_bytree": colsample_bytree,
+                "min_child_weight": min_child_weight,
+                "gamma":            gamma,
+                "reg_alpha":        reg_alpha,
+                "reg_lambda":       reg_lambda,
+                "scale_pos_weight": scale_pos_weight,
+            },
+            "h1_gates": _h1_gates,
+        }
+
+    # ── Single trial execution ────────────────────────────────────────────────
+
+    def run_single_trial(self, trial: "optuna.Trial") -> dict:
+        """Run full CPCV pipeline for one trial; return result dict."""
+        t_start = time.time()
+        params  = self.suggest_params(trial)
+
+        kalman_col = kalman_smooth(
+            self.df["log_return"].values,
+            params["kalman"]["obs_cov"],
+            params["kalman"]["trans_cov"],
+        )
+        df_trial = self.df.copy()
+        df_trial["kalman_return"] = kalman_col
+
+        xgb_kwargs = params["xgb"]
+        hmm_params = params["hmm"]
+        h1_gates   = params.get("h1_gates", {})
+        n_states   = int(hmm_params["n_states"])
+        tf_embargo = CPCV_PURGE_BARS.get(self.tf, 24)
+
+        cpcv = execute_cpcv(
+            df_full      = df_trial,
+            n_states     = n_states,
+            tf           = self.tf,
+            balance      = self.account_size,
+            broker       = self.broker,
+            xgb_kwargs   = xgb_kwargs,
+            hmm_params   = hmm_params,
+            h1_gates     = h1_gates,
+            n_splits     = CPCV_N_BLOCKS,
+            n_test_splits= CPCV_K_TEST,
+            embargo_bars = tf_embargo,
+            trial_number = trial.number,
+        )
+
+        # TF-specific objective base score
+        base_score      = _tf_pipeline_score(cpcv, self.tf)
+        objective_score = base_score
+
+        # Penalties
+        std_sharpe        = float(cpcv.get("std_sharpe",    0.0))
+        n_valid           = int(  cpcv.get("n_valid_paths", 0))
+        median_dd         = float(cpcv.get("median_drawdown", 0.0))
+        mr_leaks          = int(  cpcv.get("total_mr_leaks",  0))
+        median_trades     = int(  cpcv.get("median_trades",   0))
+
+        variance_penalty     = 0.10 * std_sharpe
+        instability_penalty  = 0.50 * max(0, _N_PATHS - n_valid)
+        dd_penalty           = 20.0 if median_dd > CPCV_MAX_FLOAT_DD else 0.0
+        mr_penalty           = float(mr_leaks) * 5.0
+
+        # Excessive turnover penalty (especially harmful at M5 due to spread)
+        spread_penalty = 0.0
+        if self.tf == "M5" and median_trades > 500:
+            spread_penalty = 1.0 * ((median_trades - 500) / 500.0)
+
+        objective_score -= (
+            variance_penalty + instability_penalty
+            + dd_penalty + mr_penalty + spread_penalty
+        )
+
+        # H1 profitability floors and turnover penalty
+        p_floor, floor_reasons = 0.0, []
+        p_turn,  turn_reasons  = 0.0, []
+        if self.tf == "H1":
+            # trades_per_100_bars: median_trades / (estimated OOS bars per path)
+            _test_bars = max(len(self.df) * CPCV_K_TEST // CPCV_N_BLOCKS, 1)
+            _cpcv_ext  = dict(cpcv)
+            _cpcv_ext["trades_per_100_bars"] = (median_trades / _test_bars) * 100.0
+            p_floor, floor_reasons = _apply_h1_hard_floors(cpcv, h1_gates)
+            p_turn,  turn_reasons  = _turnover_penalty(_cpcv_ext, h1_gates, self.tf)
+            objective_score -= (p_floor + p_turn)
+
+        all_reasons = floor_reasons + turn_reasons
+        logger.info(
+            "trial=%d tf=%s base=%.4f p_var=%.4f p_inst=%.4f p_dd=%.4f "
+            "p_mr=%.4f p_floor=%.4f p_turn=%.4f final=%.4f reasons=%s",
+            trial.number, self.tf,
+            base_score,
+            variance_penalty, instability_penalty, dd_penalty, mr_penalty,
+            p_floor, p_turn,
+            objective_score,
+            "|".join(all_reasons) or "none",
+        )
+
+        elapsed = round(time.time() - t_start, 1)
+
+        summary = {
+            "tf":                 self.tf,
+            "trial":              trial.number,
+            "objective_score":    round(float(objective_score),               4),
+            "cpcv_mean_score":    round(float(cpcv.get("cpcv_score", 0.0)),   4),
+            "cpcv_std_score":     round(float(std_sharpe),                    4),
+            "valid_paths":        n_valid,
+            "total_paths":        _N_PATHS,
+            "sharpe_median":      round(float(cpcv.get("median_sharpe",    0.0)), 4),
+            "pf_median":          round(float(cpcv.get("median_pf",        1.0)), 4),
+            "calmar_median":      round(float(cpcv.get("median_calmar",    0.0)), 4),
+            "expectancy_median":  round(float(cpcv.get("median_expectancy",0.0)), 6),
+            "floating_dd_median": round(float(median_dd),                     4),
+            "trades_median":      median_trades,
+            "mr_leak_count":      mr_leaks,
+            "activation_events":         int(cpcv.get("total_activation_events",    0)),
+            "partial_close_events":       int(cpcv.get("total_partial_close_events", 0)),
+            "trail_updates":              int(cpcv.get("total_trail_updates",         0)),
+            "regime_shift_forced_closes": int(cpcv.get("total_regime_forced_closes", 0)),
+            "avg_activation_pnl_usd":     round(float(cpcv.get("avg_activation_pnl_usd", 0.0)), 4),
+            "p_floor":            round(p_floor, 4),
+            "p_turn":             round(p_turn,  4),
+            "floor_reasons":      "|".join(floor_reasons) or "none",
+            "pruned":             False,
+            "elapsed_sec":        elapsed,
+        }
+
+        return {"objective_score": objective_score, "cpcv": cpcv, "summary": summary}
+
+    # ── Optuna objective ──────────────────────────────────────────────────────
+
+    def objective(self, trial: "optuna.Trial") -> float:
+        """Optuna-compatible objective function."""
+        t_start = time.time()
+        try:
+            result  = self.run_single_trial(trial)
+            score   = result["objective_score"]
+            summary = result["summary"]
+            cpcv    = result["cpcv"]
+
+            # Store attrs for Optuna history / callbacks
+            trial.set_user_attr("n_valid_paths",   summary["valid_paths"])
+            trial.set_user_attr("median_trades",   summary["trades_median"])
+            trial.set_user_attr("std_sharpe",      summary["cpcv_std_score"])
+            trial.set_user_attr("median_sharpe",   summary["sharpe_median"])
+            trial.set_user_attr("median_drawdown", summary["floating_dd_median"])
+            trial.set_user_attr("mr_leak_count",   summary["mr_leak_count"])
+
+            log_line = format_trial_summary(summary)
+            logger.info(log_line)
+            append_trial_score(log_line)
+
+            try:
+                with open(self._jsonl_path, "a", encoding="utf-8") as _fh:
+                    _fh.write(json.dumps(summary) + "\n")
+            except Exception:
+                pass
+
+            return float(score)
+
+        except Exception as exc:
+            elapsed = round(time.time() - t_start, 1)
+            logger.warning("Trial %d [%s] failed: %s", trial.number, self.tf, exc)
+            _err_row = {
+                "tf": self.tf, "trial": trial.number, "objective_score": -100.0,
+                "cpcv_mean_score": None, "cpcv_std_score": None,
+                "valid_paths": 0, "total_paths": _N_PATHS,
+                "sharpe_median": None, "pf_median": None, "calmar_median": None,
+                "expectancy_median": None, "floating_dd_median": None,
+                "trades_median": 0, "mr_leak_count": 0,
+                "activation_events": 0, "partial_close_events": 0,
+                "trail_updates": 0, "regime_shift_forced_closes": 0,
+                "avg_activation_pnl_usd": 0.0,
+                "pruned": False, "elapsed_sec": elapsed,
+            }
+            try:
+                with open(self._jsonl_path, "a", encoding="utf-8") as _fh:
+                    _fh.write(json.dumps(_err_row) + "\n")
+            except Exception:
+                pass
+            return -100.0
+
+        finally:
+            gc.collect()
+
 def run_optimization_stage1(
     df:           pd.DataFrame,
     tf:           str,
@@ -1085,72 +1547,19 @@ def run_optimization_stage1(
         python main.py --mode optimize --tf H1 --broker headway_cent \\
             --stage trading --trials 130
     """
-    from pathlib import Path
-
-    tier    = _get_tier(account_size)
-    name    = _study_name(broker=broker, tier=tier, tf=tf) + "_stage1"
-    storage = _study_db(broker)
-
-    pruner = optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=3)
-    study  = optuna.create_study(
-        study_name=name,
-        storage=storage,
-        direction="maximize",
-        load_if_exists=True,
-        pruner=pruner,
-    )
-
-    already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
-    remaining    = max(0, n_trials - already_done)
-
-    if already_done > 0:
-        pct = already_done / n_trials * 100
-        print(
-            f"\nResuming Stage-1: {already_done}/{n_trials} trials ({pct:.0f}%). "
-            f"{remaining} remaining.\n"
-        )
-    else:
-        print(
-            f"\nStarting Stage-1 XGB study '{name}' — target {n_trials} trials.\n"
-            f"Mode: single hold-out (no CPCV) — ~5x faster per trial than Stage-2.\n"
-        )
-
-    if remaining == 0:
-        print("Stage-1 target already reached. Use higher --trials to continue.\n")
-    else:
-        optuna.logging.set_verbosity(optuna.logging.WARNING)
-        study.optimize(
-            make_objective_stage1(df=df, tf=tf, broker=broker, account_size=account_size),
-            n_trials=remaining,
-            n_jobs=1,
-            show_progress_bar=True,
-            callbacks=_make_callbacks(n_trials, name, already_done=already_done),
-        )
-
-    # ── Persist best params for Stage-2 warm-start ───────────────────────────
-    stage1_path = Path(f"models/stage1_{tf.lower()}_{broker}.json")
-    stage1_path.parent.mkdir(parents=True, exist_ok=True)
-    stage1_path.write_text(json.dumps({
-        "params": study.best_params,
-        "score":  study.best_value,
-        "tf":     tf,
-        "broker": broker,
-    }, indent=2))
-
-    logger.info(
-        "Stage-1 complete: best=%.3f  saved to %s  params=%s",
-        study.best_value, stage1_path, study.best_params,
+    logger.warning(
+        "[DEPRECATED] run_optimization_stage1 is obsolete. "
+        "Two-stage optimization has been removed. "
+        "Forwarding to unified single-stage CPCV pipeline."
     )
     print(
-        f"\n{'*'*60}\n"
-        f"  Stage-1 Complete\n"
-        f"  Best score : {study.best_value:.3f}\n"
-        f"  Saved to   : {stage1_path}\n"
-        f"  Next step  : python main.py --mode optimize --tf {tf} "
-        f"--broker {broker} --stage trading --trials 130\n"
-        f"{'*'*60}\n"
+        "\n[DEPRECATED] Stage-1 optimization has been removed.\n"
+        "The unified pipeline optimizes end-to-end trading outcomes via CPCV.\n"
+        "Running unified pipeline instead...\n"
     )
-    return study
+    return run_optimization(
+        df=df, tf=tf, broker=broker, account_size=account_size, n_trials=n_trials,
+    )
 
 
 def run_optimization(
@@ -1190,18 +1599,18 @@ def run_optimization(
 
     os.makedirs("models", exist_ok=True)
 
-    if tf.upper() == "M5":
-        pruner = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=9, reduction_factor=3)
-    else:
-        pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
-
+    # Unified pruner + sampler for all TFs (spec: TPE multivariate + Hyperband)
+    pruner = optuna.pruners.HyperbandPruner(min_resource=10, reduction_factor=3)
     sampler = optuna.samplers.TPESampler(
         multivariate=True,
-        group=True,
-        n_startup_trials=30,
         seed=42,
+        n_startup_trials=20,
     )
 
+    # Per-broker storage: all TF studies colocated so the Optuna dashboard
+    # can display every active study from a single --storage argument.
+    name    = get_optuna_study_name(tf, broker)
+    storage = get_optuna_storage_url(broker)
     study = optuna.create_study(
         study_name=name,
         storage=storage,
@@ -1214,58 +1623,11 @@ def run_optimization(
     feature_cols = list(get_feature_cols(df))
     _check_study_hash(study, tf=tf, broker=broker, feature_cols=feature_cols)
 
-    # ── Stage-2 warm-start: seed Optuna TPE with Stage-1 best params ─────────
-    # When --stage trading is passed, any previously saved Stage-1 JSON is
-    # enqueued as the first trial so TPE explores the confirmed-good region
-    # immediately rather than burning trials on cold-start random sampling.
     if warm_start_stage1:
-        from pathlib import Path
-        _s1_path = Path(f"models/stage1_{tf.lower()}_{broker}.json")
-        _db_warmstart_ok = False
-
-        # Primary: enqueue top-10 completed Stage-1 trials directly from the DB.
-        # This is more informative than a single best-params JSON because it
-        # seeds the TPE surrogate with a diverse set of high-quality starts.
-        try:
-            _s1_name    = _study_name(broker=broker, tier=_get_tier(account_size), tf=tf) + "_stage1"
-            _s1_study   = optuna.load_study(study_name=_s1_name, storage=storage)
-            _s1_trials  = [
-                t for t in _s1_study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE
-            ]
-            _s1_trials.sort(key=lambda t: t.value or float("-inf"), reverse=True)
-            _top_n = _s1_trials[:10]
-            if _top_n:
-                for _t in _top_n:
-                    study.enqueue_trial(_t.params)
-                logger.info(
-                    "Stage-2: warm-started with top-%d Stage-1 DB trials (best=%.3f).",
-                    len(_top_n), _top_n[0].value or float("nan"),
-                )
-                print(f"  Warm-starting from top-{len(_top_n)} Stage-1 DB trials "
-                      f"(best={_top_n[0].value:.3f}).\n")
-                _db_warmstart_ok = True
-        except Exception as _e:
-            logger.warning("Stage-2 DB warm-start failed (%s) — falling back to JSON.", _e)
-
-        # Fallback: use the saved JSON if DB fetch failed or returned nothing.
-        if not _db_warmstart_ok:
-            if _s1_path.exists():
-                try:
-                    _s1 = json.loads(_s1_path.read_text())
-                    study.enqueue_trial(_s1["params"])
-                    logger.info(
-                        "Stage-2: warm-started from %s (stage1 score=%.3f)",
-                        _s1_path, _s1.get("score", float("nan")),
-                    )
-                    print(f"  Warm-starting from Stage-1 JSON params (score={_s1.get('score', '?'):.3f}).\n")
-                except Exception as _e:
-                    logger.warning("Failed to load Stage-1 params for warm-start: %s", _e)
-            else:
-                logger.warning(
-                    "Stage-2 warm_start_stage1=True but no file found at %s. "
-                    "Run --stage xgb first.", _s1_path,
-                )
+        logger.warning(
+            "warm_start_stage1 is deprecated and ignored in unified mode. "
+            "The two-stage flow has been removed."
+        )
 
     already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     remaining    = max(0, n_trials - already_done)
@@ -1291,9 +1653,12 @@ def run_optimization(
 
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
+    _pipeline_opt = PipelineOptimizer(
+        tf=tf, broker=broker, account_size=account_size,
+        df=df, wfo_mode=wfo_mode,
+    )
     study.optimize(
-        make_objective(df=df, tf=tf, broker=broker,
-                       account_size=account_size, wfo_mode=wfo_mode),
+        _pipeline_opt.objective,
         n_trials=remaining,
         n_jobs=n_jobs,
         show_progress_bar=(n_jobs == 1),
@@ -1417,8 +1782,32 @@ def save_best_trial_cpcv(
 def get_best_params(balance: float = 15.0, broker: str = "standard", tf: str = "H1") -> dict:
     """Load best hyperparameters from the persisted SQLite study.
 
-    Fallback chain: tier-matched study → small-tier study → legacy study.db.
+    Fallback chain:
+        1. Unified per-TF study: study_{broker}_{tf}.db / {tf}_{broker}_single_pipeline
+        2. Tier-matched legacy study: study_{broker}.db
+        3. Small-tier legacy study
+        4. Legacy study.db
     """
+    # 1a. Canonical broker-level DB (current unified pipeline)
+    _new_name    = get_optuna_study_name(tf, broker)
+    _new_storage = get_optuna_storage_url(broker)
+    try:
+        _p = optuna.load_study(study_name=_new_name, storage=_new_storage).best_params
+        if _p:
+            return _p
+    except Exception:
+        pass
+
+    # 1b. Legacy per-TF DB (backward compat for studies created before patch 3)
+    _tf_db = _study_db_tf(broker, tf)
+    try:
+        _p = optuna.load_study(study_name=_new_name, storage=_tf_db).best_params
+        if _p:
+            logger.info("Loaded params from legacy per-TF DB %s", _tf_db)
+            return _p
+    except Exception:
+        pass
+
     tier    = _get_tier(balance)
     name    = _study_name(broker=broker, tier=tier, tf=tf)
     storage = _study_db(broker)
@@ -1554,8 +1943,13 @@ def run_wfa(
     df_trial   = df.copy()
     df_trial["kalman_return"] = kalman_col
 
-    xgb_kwargs = {k: v for k, v in params.items()
-                  if k not in ("obs_cov", "trans_cov", "n_states")}
+    # Exclude all non-XGB params (includes new unified pipeline params)
+    _NON_XGB = frozenset(("obs_cov", "trans_cov", "n_states", "persistence_threshold", "meta"))
+    xgb_kwargs = {k: v for k, v in params.items() if k not in _NON_XGB}
+    hmm_params_wfa = {
+        "n_states":              n_states,
+        "persistence_threshold": int(params.get("persistence_threshold", 6)),
+    }
 
     tf_embargo = CPCV_PURGE_BARS.get(tf.upper(), 24)
     result = execute_cpcv(
@@ -1565,6 +1959,7 @@ def run_wfa(
         balance=account_size,
         broker=broker,
         xgb_kwargs=xgb_kwargs,
+        hmm_params=hmm_params_wfa,
         n_splits=CPCV_N_BLOCKS,
         n_test_splits=CPCV_K_TEST,
         embargo_bars=tf_embargo,
@@ -1649,6 +2044,8 @@ def execute_cpcv(
     n_test_splits: int = 2,
     embargo_bars: int = 24,
     trial_number: int | None = None,
+    hmm_params: dict | None = None,
+    h1_gates: dict | None = None,
 ) -> dict:
     """Execute Combinatorial Purged CV with strict per-path HMM and Scaler fitting.
 
@@ -1667,14 +2064,27 @@ def execute_cpcv(
         purge_bars=embargo_bars,
     )
 
-    path_scores:    list = []
-    path_sharpes:   list = []
-    path_trades:    list = []
-    path_winrates:  list = []
-    path_drawdowns: list = []
-    path_returns:   list = []
+    path_scores:       list = []
+    path_sharpes:      list = []
+    path_trades:       list = []
+    path_winrates:     list = []
+    path_drawdowns:    list = []
+    path_returns:      list = []
+    path_pfs:          list = []
+    path_expectancies: list = []
+    path_mr_leaks:     list = []
+    # lifecycle parity telemetry accumulators
+    path_activation_events:        list = []
+    path_partial_close_events:     list = []
+    path_regime_forced_closes:     list = []
+    path_trail_updates:            list = []
+    path_avg_activation_pnl:       list = []
     n_valid_paths = 0
     min_trades = HARD_TRADE_FLOORS.get(tf.upper(), 10)
+
+    # H1 entry prob override: apply per-path via evaluator_config
+    _h1_ep = float((h1_gates or {}).get("h1_entry_prob", 0.0))
+    _h1_eval_cfg = {"h1_entry_prob": _h1_ep} if (tf.upper() == "H1" and _h1_ep > 0) else None
 
     for path_idx, (train_mask, test_mask) in enumerate(splitter.split()):
         try:
@@ -1683,8 +2093,15 @@ def execute_cpcv(
                 continue
 
             # 1. Fit HMM STRICTLY on the purged training blocks (no lookahead)
-            model_path, train_states, _ = fit_hmm(df_train, n_states=n_states, tf=tf)
-            if min(model_path.transmat_[i, i] for i in range(n_states)) < 0.60:
+            model_path, train_states, _ = fit_hmm(
+                df_train,
+                n_states=_enforce_three_states({"n_states": n_states}, "execute_cpcv"),
+                tf=tf,
+            )
+            # persistence_threshold [2,6] -> min-diagonal gate [0.40,0.60]
+            _pt = int((hmm_params or {}).get("persistence_threshold", 6))
+            _min_diag = 0.30 + _pt * 0.05
+            if min(model_path.transmat_[i, i] for i in range(n_states)) < _min_diag:
                 continue
 
             # 2. Predict states for the full dataset using the IS model
@@ -1755,6 +2172,7 @@ def execute_cpcv(
                 test_df, test_probs, test_states,
                 split_idx=None, account_size=balance, broker=broker, tf=tf,
                 hmm_transmat=model_path.transmat_,
+                evaluator_config=_h1_eval_cfg,
             )
 
             n_trades = int(path_result.get("n_trades", 0))
@@ -1794,6 +2212,16 @@ def execute_cpcv(
             path_winrates.append(float(path_result.get("win_rate", 0.0)))
             path_drawdowns.append(fdd)
             path_returns.append(float(path_result.get("total_return", 0.0)))
+            path_pfs.append(float(path_result.get("profit_factor", 1.0)))
+            path_expectancies.append(float(path_result.get("expected_payoff", 0.0)))
+            path_mr_leaks.append(int(path_result.get("mr_leak_count",
+                                                       path_result.get("mr_trades", 0))))
+            # lifecycle counters
+            path_activation_events.append(int(path_result.get("activation_events", 0)))
+            path_partial_close_events.append(int(path_result.get("partial_close_events", 0)))
+            path_regime_forced_closes.append(int(path_result.get("regime_shift_forced_closes", 0)))
+            path_trail_updates.append(int(path_result.get("trail_updates", 0)))
+            path_avg_activation_pnl.append(float(path_result.get("avg_activation_pnl_usd", 0.0)))
 
         except Exception as exc:
             logger.debug("CPCV path %d failed: %s", path_idx + 1, exc)
@@ -1836,21 +2264,43 @@ def execute_cpcv(
         tf, n_valid_paths, total_paths,
         med_score, std_score, path_penalty, final_score,
     )
+    # Per-path calmar for TF-specific objective
+    _path_calmars = [
+        (r / d if d > 1e-6 else (5.0 if r > 0 else 0.0))
+        for r, d in zip(path_returns, path_drawdowns)
+    ]
+
     return {
-        "cpcv_score":      final_score,
-        "n_valid_paths":   n_valid_paths,
-        "median_sharpe":   float(np.median(valid_sharpes)) if valid_sharpes else -10.0,
-        "std_sharpe":      float(np.std(valid_sharpes))    if len(valid_sharpes) > 1 else 0.0,
-        "median_trades":   int(np.median(path_trades) if path_trades else 0),
-        "median_win_rate": float(np.median(path_winrates) if path_winrates else 0.0),
-        "median_drawdown": float(np.median(path_drawdowns) if path_drawdowns else 0.0),
-        "median_return":   float(np.median(path_returns) if path_returns else 0.0),
-        "path_scores":     path_scores,
-        "path_sharpes":    path_sharpes,
-        "path_trades":     path_trades,
-        "path_winrates":   path_winrates,
-        "path_drawdowns":  path_drawdowns,
-        "path_returns":    path_returns,
+        "cpcv_score":        final_score,
+        "n_valid_paths":     n_valid_paths,
+        "median_sharpe":     float(np.median(valid_sharpes)) if valid_sharpes else -10.0,
+        "std_sharpe":        float(np.std(valid_sharpes))    if len(valid_sharpes) > 1 else 0.0,
+        "median_trades":     int(np.median(path_trades) if path_trades else 0),
+        "median_win_rate":   float(np.median(path_winrates) if path_winrates else 0.0),
+        "median_drawdown":   float(np.median(path_drawdowns) if path_drawdowns else 0.0),
+        "median_return":     float(np.median(path_returns) if path_returns else 0.0),
+        "median_pf":         float(np.median(path_pfs) if path_pfs else 1.0),
+        "median_expectancy": float(np.median(path_expectancies) if path_expectancies else 0.0),
+        "median_calmar":     float(np.clip(
+            np.median(_path_calmars) if _path_calmars else 0.0, -5.0, 5.0
+        )),
+        "total_mr_leaks":    int(sum(path_mr_leaks)),
+        # lifecycle parity telemetry
+        "total_activation_events":       int(sum(path_activation_events)),
+        "total_partial_close_events":    int(sum(path_partial_close_events)),
+        "total_regime_forced_closes":    int(sum(path_regime_forced_closes)),
+        "total_trail_updates":           int(sum(path_trail_updates)),
+        "avg_activation_pnl_usd":        round(
+            float(sum(path_avg_activation_pnl)) / max(len(path_avg_activation_pnl), 1), 4
+        ),
+        "path_scores":       path_scores,
+        "path_sharpes":      path_sharpes,
+        "path_trades":       path_trades,
+        "path_winrates":     path_winrates,
+        "path_drawdowns":    path_drawdowns,
+        "path_returns":      path_returns,
+        "path_pfs":          path_pfs,
+        "path_expectancies": path_expectancies,
     }
 
 
