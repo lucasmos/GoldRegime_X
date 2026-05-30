@@ -28,6 +28,8 @@ from src.engine_xgb import (
     train_xgb_ensemble, get_predictions_ensemble,
     save_xgb_ensemble, load_xgb_ensemble, export_onnx_ensemble, ENSEMBLE_PKL_PATH,
     get_ensemble_path, TF_TRAIN_RATIO, compute_regime_stats,
+    train_regime_models, get_regime_predictions,
+    save_regime_models, load_regime_models, TB_CONFIG,
 )
 from src.optimizer import (
     run_optimization, get_best_params, _score_result as _calc_score,
@@ -113,7 +115,11 @@ def _check_m5_readiness(tf: str, broker: str = "headway_cent") -> bool:
 
 
 def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
-    """Shared train logic for a single timeframe. Returns (result, model_hmm, states, X, metrics)."""
+    """Shared train logic for a single timeframe. Returns (result, model_hmm, states, X, metrics).
+
+    Uses regime-specific XGBoost models (TREND + SHOCK, no MR trading).
+    The `tf` kwarg is now correctly forwarded to fit_hmm for TF-aware HMM config.
+    """
     df = process_pipeline(
         obs_cov=params.get("obs_cov"),
         trans_cov=params.get("trans_cov"),
@@ -123,16 +129,15 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         broker=broker,
     )
     model_hmm, states, state_map = fit_hmm(
-        df, n_states=resolve_n_states(tf, params)
+        df, n_states=resolve_n_states(tf, params), tf=tf   # fix: tf= was missing before
     )
     X, y, df_aligned, feature_scaler = prepare_features(df, states, tf=tf)
     save_feature_scaler(feature_scaler, tf=tf, broker=broker)
-    models_ensemble, thresholds, metrics = train_xgb_ensemble(
-        X, y,
-        train_ratio=1.0,  # full-data training — WFO validation happened in optimize step
+
+    xgb_kwargs = dict(
         max_depth=params.get("max_depth", 4),
-        learning_rate=params.get("learning_rate", 0.1),
-        n_estimators=params.get("n_estimators", 200),
+        learning_rate=params.get("learning_rate", 0.05),
+        n_estimators=params.get("n_estimators", 500),
         subsample=params.get("subsample", 0.8),
         colsample_bytree=params.get("colsample_bytree", 0.8),
         min_child_weight=params.get("min_child_weight", 5),
@@ -141,16 +146,39 @@ def _train_for_tf(tf: str, balance: float, broker: str, params: dict):
         reg_lambda=params.get("reg_lambda", 1.0),
         scale_pos_weight=params.get("scale_pos_weight", 1.0),
     )
-    _, probabilities = get_predictions_ensemble(models_ensemble, thresholds, X)
+
     states_aligned = states[df.index.isin(df_aligned.index)]
+
+    # ── Regime-specific training ───────────────────────────────────────────
+    regime_result = train_regime_models(X, y, states_aligned, tf=tf, **xgb_kwargs)
+    save_regime_models(regime_result, tf=tf, broker=broker)
+
+    probabilities = get_regime_predictions(
+        X, states_aligned,
+        regime_result["trend_model"], regime_result["shock_model"],
+    )
+
+    metrics = {
+        "trend_n":       regime_result["trend_n"],
+        "shock_n":       regime_result["shock_n"],
+        "trend_metrics": regime_result["trend_metrics"],
+        "shock_metrics": regime_result["shock_metrics"],
+    }
+
+    # Legacy ensemble also saved for backward-compat exports (ONNX, MT5 sync)
+    models_ensemble, thresholds, ens_metrics = train_xgb_ensemble(
+        X, y, train_ratio=1.0, **xgb_kwargs
+    )
+    metrics.update(ens_metrics)
     metrics["regime_stats"] = compute_regime_stats(models_ensemble, thresholds, X, states_aligned)
+
     result = vectorized_backtest(
         df_aligned, probabilities, states_aligned,
-        split_idx=None,   # full-data model — no IS/OOS split; CPCV scores used for validation
+        split_idx=None,   # full-data model — CPCV scores used for validation
         account_size=balance,
         broker=broker,
         tf=tf,
-        hmm_transmat=model_hmm.transmat_,  # use real persistence values, consistent with optimizer CPCV
+        hmm_transmat=model_hmm.transmat_,
     )
     return result, model_hmm, state_map, models_ensemble, thresholds, metrics, df_aligned, states_aligned, X, probabilities
 
@@ -538,7 +566,7 @@ def cmd_export(args):
 def cmd_sync_validate(args):
     """Download recent MT5 bars then run the model validation gatekeeper."""
     from src.mt5_sync import sync_mt5_data
-    from src.validator import run_validation
+    from src.validator import run_validation, validate_strategy
 
     balance = _resolve_balance(args)
     tf      = args.tf.upper()
@@ -560,6 +588,12 @@ def cmd_sync_validate(args):
     except Exception as exc:
         logger.error("Validation error: %s", exc)
         sys.exit(1)
+
+    # ── Deployment gate (Phase F) ─────────────────────────────────────────
+    gate = validate_strategy(result, tf=tf)
+    gate_status = gate["status"]
+    gate_reason = gate["reason"]
+    gate_details = gate["details"]
 
     print(f"\n=== Validation Result [{tf}] ===")
     _fdd     = result.get("max_dd", 0.0)
@@ -585,6 +619,21 @@ def cmd_sync_validate(args):
     print(f"  Sharpe: {result['sharpe']:.3f} | Trades: {result['n_trades']} | WR: {result['win_rate']*100:.1f}%")
     print(f"  Status: {result['status'].upper()}")
     print(f"  {result['message']}")
+
+    # Gate result
+    if gate_status == "fail":
+        print(f"\n[DEPLOYMENT GATE] FAIL — reason: {gate_reason}")
+        print(f"  Details: {gate_details}")
+        print(
+            "\nABORTING: Deployment gate failed. "
+            "Retune with --mode optimize then --mode train before going live."
+        )
+        sys.exit(1)
+    if gate_status == "warn":
+        print(f"\n[DEPLOYMENT GATE] WARN — {gate_reason}  |  details: {gate_details}")
+        print("  WARNING: Borderline performance — consider re-optimising before live trading.")
+    else:
+        print(f"\n[DEPLOYMENT GATE] PASS — all checks OK  |  details: {gate_details}")
 
     if result["status"] == "fail":
         print(
@@ -1134,7 +1183,7 @@ def main():
     parser.add_argument(
         "--mode",
         choices=["process", "optimize", "train", "compare", "export", "report",
-                 "sync_validate", "demo", "live", "audit", "guardian", "listen",
+                 "sync_validate", "sync_validation", "demo", "live", "audit", "guardian", "listen",
                  "consolidate", "wfa", "sensitivity", "extract_consensus",
                  "montecarlo"],
         required=True,
@@ -1192,7 +1241,8 @@ def main():
         "compare":       cmd_compare,
         "export":        cmd_export,
         "report":        cmd_report,
-        "sync_validate": cmd_sync_validate,
+        "sync_validate":  cmd_sync_validate,
+        "sync_validation": cmd_sync_validate,
         "demo":          cmd_demo,
         "live":          cmd_live,
         "audit":         cmd_audit,

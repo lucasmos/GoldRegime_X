@@ -9,32 +9,36 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from src.engine_hmm import (
+    REGIME_TREND, REGIME_MR, REGIME_SHOCK,
+    CANONICAL_REGIME_ID, STATE_NAMES, STATE_POLICY,
+)
+
+# Canonical state integer IDs (sourced from engine_hmm to stay in sync)
+TREND_STATE = CANONICAL_REGIME_ID[REGIME_TREND]   # 0
+MR_STATE    = CANONICAL_REGIME_ID[REGIME_MR]       # 1
+SHOCK_STATE = CANONICAL_REGIME_ID[REGIME_SHOCK]    # 2
+
+# ── Trade-allowed policy (sourced from engine_hmm) ──────────────────────────
+# TREND  → True  (directional move, use trend_model)
+# MR     → False (strict no-trade: mean-reversion = noise regime)
+# SHOCK  → True  (explosive volatility, use shock_model)
+# This is the single canonical source of state-to-trade permission.
+
 # Minimum consecutive bars in a regime before entry is allowed.
-# H1: raised to 5 — requires 5 consecutive hours of stable regime before entry.
-# This prevents the rapid-oscillation pattern where HMM switches Bull↔Bear
-# every 1–2 days, causing 700+ trades/OOS-window and DD blowups.
-# M15/M5: unchanged at 2 — faster TFs need quicker confirmation.
 MIN_CONFIRMATION_BARS = {"H1": 2, "M15": 2, "M5": 2}
-MIN_CHOP_CONFIRM_BARS = {"H1": 4, "M15": 2, "M5": 2}
 
 # Minimum consecutive bars in a NEW (different) regime before regime-reversal
-# exit fires.  H1: raised to 5 to match entry confirmation logic — a single
-# regime blip during a multi-day H1 trend should not prematurely close the trade.
+# exit fires.
 MIN_EXIT_CONFIRM_BARS = {"H1": 2, "M15": 2, "M5": 2}
 
-# XGBoost probability threshold for trend and MR entries.
-# Thresholds are deliberately strict: XGB test accuracy is 50-52% (next-bar
-# direction), so only the highest-confidence bars have real signal.  Allowing
-# lower thresholds floods the engine with noise trades and destroys performance.
-# XGBoost probability thresholds (H1 only — M15/M5 bypass probability checks).
-# On lower timeframes XGB probabilities cluster near 50–55%, so strict gates
-# produce a "dead zone" that suppresses genuinely profitable volatility regimes.
+# XGBoost probability threshold for trend and SHOCK entries.
+# H1: probability check required. M15/M5: bypass (XGB probs cluster near 50-55%).
 ENTRY_PROB    = {"H1": 0.575}
-MR_ENTRY_PROB = {"H1": 0.575}
 
-# Z-Score thresholds for trend and MR entries.
+# Z-Score thresholds for TREND and SHOCK entries.
 MIN_TREND_ZSCORE = {"H1": 0.5, "M15": 1.0, "M5": 1.5}
-MIN_MR_ZSCORE    = {"H1": 1.0, "M15": 1.5, "M5": 2.0}
+MIN_SHOCK_ZSCORE = {"H1": 0.8, "M15": 1.2, "M5": 1.8}   # SHOCK needs higher VIX expansion
 
 # Dynamic ATR band thresholds (0 = lower band, 1 = upper band).
 # Prevent buying when overextended up or selling when overextended down.
@@ -106,7 +110,8 @@ class SignalEngine:
     that returns a :class:`SignalDecision` for both backtest and live paths.
     """
 
-    _REGIME_LABELS = {0: "Bull", 1: "Bear", 2: "Chop", 3: "Chop_High"}
+    # Regime label lookup: canonical int ID → semantic string
+    _REGIME_LABELS = STATE_NAMES   # {0: "TREND", 1: "MEAN_REVERSION", 2: "VOLATILITY_SHOCK"}
 
     def __init__(self, tf: str = "H1"):
         self.tf = tf.upper()
@@ -168,6 +173,13 @@ class SignalEngine:
 
         # ── Entry check (if flat) ──────────────────────────────────────────────
         if not current_position:
+            # Strict STATE_POLICY: MEAN_REVERSION is always no-trade.
+            if not STATE_POLICY.get(regime_label, False):
+                return SignalDecision(
+                    enter=False, exit=False, direction=0, confidence=prob,
+                    regime=regime_label, reason="state_disabled",
+                    position_size_multiplier=1.0, sl_atr_multiple=0.0, tp_atr_multiple=0.0,
+                )
             # Rolling probability window for M5 dynamic threshold.
             self._probs_window.append(prob)
             if len(self._probs_window) > 200:
@@ -227,14 +239,14 @@ class SignalEngine:
                         )
 
             if entry:
-                sig  = entry["signal"]
-                direction = 1 if sig in ("BUY", "MR_BUY") else -1
+                sig       = entry["signal"]
+                direction = 1 if sig == "BUY" else -1
                 return SignalDecision(
                     enter=True, exit=False,
                     direction=direction,
                     confidence=prob,
                     regime=regime_label,
-                    reason=f"entry_{sig.lower()}",
+                    reason=f"entry_{entry.get('regime', 'unknown').lower()}_{sig.lower()}",
                     position_size_multiplier=entry.get("size_multiplier", 1.0),
                     sl_atr_multiple=tf_config.get("sl_atr_multiple", 2.0),
                     tp_atr_multiple=tf_config.get("tp_atr_multiple", 1.5),
@@ -291,72 +303,86 @@ class SignalEngine:
         z_cutoff_bull: float | None = None,
         z_cutoff_bear: float | None = None,
     ) -> dict | None:
-        """Evaluate entry conditions utilizing Z-scores, Dynamic ATR bands, and conditional probabilities.
+        """Evaluate entry conditions for the current bar.
 
-        H1: Dual constraint — requires both high ML probability AND confirmed
-            volatility expansion (synth_vix_zscore).
-        M15/M5: Z-score/ATR-band only — probability check bypassed (defaults to
-            0.0 = always True) to avoid the dual-constraint dead zone caused by
-            XGB probabilities clustering near 50–55% on noisy lower timeframes.
+        Routing:
+            TREND  (state 0) → trend_model probability gate + VIX z-score
+            SHOCK  (state 2) → shock_model probability gate + higher VIX z-score
+            MR     (state 1) → always returns None (strict no-trade per STATE_POLICY)
 
-        z_cutoff_bull / z_cutoff_bear: optional per-call overrides for the
-            minimum synth_vix_zscore required for Bull/Bear trend entry.  When
-            provided they supersede MIN_TREND_ZSCORE for this call only.  Used
-            by sensitivity analysis to sweep effective Z thresholds.
+        z_cutoff_bull / z_cutoff_bear: optional per-call overrides for minimum
+            synth_vix_zscore used by sensitivity sweeps.  Supersede constants.
         """
         if self.in_trade:
             return None
 
+        state     = regime_info["state"]
+        bars      = regime_info["bars_in_regime"]
+        stability = regime_info["stability"]
+        label     = self._REGIME_LABELS.get(state, f"state_{state}")
+
+        # ── Strict STATE_POLICY gate ─────────────────────────────────────────────
+        # MEAN_REVERSION is unconditionally disabled.  Any other unknown state
+        # also defaults to no-trade.
+        if not STATE_POLICY.get(label, False):
+            return None   # reason tracked at evaluate_bar level
+
         eff_buy  = xgb_prob
         eff_sell = 1.0 - xgb_prob
 
-        state = regime_info["state"]
-        bars = regime_info["bars_in_regime"]
-        stability = regime_info["stability"]
+        # H1 probability gate; M15/M5 bypass (XGB probs cluster near 50-55%)
+        prob_req_buy  = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
+        prob_req_sell = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
 
-        # Effective Z thresholds — caller override takes precedence.
+        # Effective Z thresholds — caller override takes precedence
         trend_z_bull = (float(z_cutoff_bull) if z_cutoff_bull is not None
                         else MIN_TREND_ZSCORE.get(self.tf, 1.0))
         trend_z_bear = (abs(float(z_cutoff_bear)) if z_cutoff_bear is not None
                         else MIN_TREND_ZSCORE.get(self.tf, 1.0))
+        shock_z      = MIN_SHOCK_ZSCORE.get(self.tf, 1.0)
 
-        # H1 requires probability checks; M15/M5 bypass this (default 0.0 = always True)
-        prob_req_buy      = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
-        prob_req_sell     = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
-        mr_prob_req_buy   = eff_buy  >= MR_ENTRY_PROB.get(self.tf, 0.0)
-        mr_prob_req_sell  = eff_sell >= MR_ENTRY_PROB.get(self.tf, 0.0)
-
-        # ── Trend entry: Bull (0) ─────────────────────────────────────────────
-        if state == 0:
+        # ── TREND entry ───────────────────────────────────────────────────────────
+        if state == TREND_STATE:
+            # Direction is determined by XGB probability
+            # prob > 0.5 → upward trend predicted → BUY
+            # prob < 0.5 → downward trend predicted → SELL
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
+                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
                 and synth_vix_zscore >= trend_z_bull
                 and prob_req_buy
                 and atr_band_position < ATR_BAND_TREND_MAX
-                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
             ):
-                return {"signal": "BUY", "size_multiplier": 1.0}
-
-        # ── Trend entry: Bear (1) ─────────────────────────────────────────────
-        elif state == 1:
+                return {"signal": "BUY", "size_multiplier": 1.0, "regime": REGIME_TREND}
             if (
                 bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
+                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
                 and synth_vix_zscore >= trend_z_bear
                 and prob_req_sell
                 and atr_band_position > ATR_BAND_TREND_MIN
-                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
             ):
-                return {"signal": "SELL", "size_multiplier": 1.0}
+                return {"signal": "SELL", "size_multiplier": 1.0, "regime": REGIME_TREND}
 
-        # ── Mean-reversion entry: Chop (state >= 2) ───────────────────────────
-        elif state >= 2 and atr_band_position is not None:
-            if self.tf in ("M5", "M15"):
-                return None  # Chop/MR entries disabled for M5/M15 — 3-state HMM only trades Bull/Bear
-            if bars >= MIN_CHOP_CONFIRM_BARS.get(self.tf, 2):
-                if atr_band_position < 0.1 and synth_vix_zscore >= MIN_MR_ZSCORE.get(self.tf, 1.5) and mr_prob_req_buy:
-                    return {"signal": "MR_BUY", "size_multiplier": MR_SIZE_MULTIPLIER}
-                elif atr_band_position > 0.9 and synth_vix_zscore >= MIN_MR_ZSCORE.get(self.tf, 1.5) and mr_prob_req_sell:
-                    return {"signal": "MR_SELL", "size_multiplier": MR_SIZE_MULTIPLIER}
+        # ── VOLATILITY_SHOCK entry ────────────────────────────────────────────
+        elif state == SHOCK_STATE:
+            # SHOCK: require higher VIX expansion (shock_z) before entering.
+            # Use reduced position size — SHOCK regime is volatile, risk is elevated.
+            if (
+                bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
+                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
+                and synth_vix_zscore >= shock_z
+                and prob_req_buy
+                and atr_band_position < ATR_BAND_TREND_MAX
+            ):
+                return {"signal": "BUY",  "size_multiplier": 0.75, "regime": REGIME_SHOCK}
+            if (
+                bars >= MIN_CONFIRMATION_BARS.get(self.tf, 2)
+                and stability >= PERSISTENCE_MIN.get(self.tf, 0.55)
+                and synth_vix_zscore >= shock_z
+                and prob_req_sell
+                and atr_band_position > ATR_BAND_TREND_MIN
+            ):
+                return {"signal": "SELL", "size_multiplier": 0.75, "regime": REGIME_SHOCK}
 
         return None
 

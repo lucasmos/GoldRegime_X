@@ -41,7 +41,11 @@ from src.processor import (
     load_feature_scaler,
 )
 from src.engine_hmm import load_model as load_hmm, predict_states, get_model_path as hmm_model_path, MODEL_PATH as HMM_GENERIC_PATH
-from src.engine_xgb import load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path, ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH
+from src.engine_xgb import (
+    load_xgb_ensemble, prepare_features, get_predictions_ensemble, get_ensemble_path,
+    ENSEMBLE_PKL_PATH as XGB_GENERIC_PATH,
+    load_regime_models, get_regime_predictions,
+)
 from src.backtester import vectorized_backtest
 from src.risk_manager import BROKER_CONFIGS
 
@@ -180,22 +184,6 @@ def run_validation(
             "Run  python main.py --mode train  first."
         )
 
-    xgb_path = get_ensemble_path(tf, broker)
-    if not xgb_path.exists():
-        xgb_path = XGB_GENERIC_PATH
-        if xgb_path.exists():
-            logger.warning(
-                "No broker+TF XGB ensemble found for %s/%s; falling back to %s. "
-                "Run --mode train --tf %s --broker %s to create a dedicated model.", tf, broker, xgb_path, tf, broker
-            )
-    try:
-        models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
-    except FileNotFoundError:
-        raise FileNotFoundError(
-            "XGB ensemble not found at models/xgb_ensemble.pkl. "
-            "Run  python main.py --mode train  first."
-        )
-
     # Inference — load the same feature scaler used at training time
     states = predict_states(model_hmm, df)
     try:
@@ -209,7 +197,35 @@ def run_validation(
         _feat_scaler = None
     X, _, df_aligned, _   = prepare_features(df, states, feature_scaler=_feat_scaler, tf=tf)
     states_aligned        = states[df.index.isin(df_aligned.index)]
-    _, probabilities      = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
+
+    # Regime-first inference: use regime models when available; ensemble is fallback only
+    trend_model, shock_model = load_regime_models(tf=tf, broker=broker)
+    use_regime_models = (trend_model is not None) or (shock_model is not None)
+    if use_regime_models:
+        logger.info("Validation using regime models [%s/%s].", tf, broker)
+        probabilities = get_regime_predictions(
+            X, states_aligned, trend_model, shock_model, fallback_prob=0.50
+        )
+        xgb_meta: dict = {}
+    else:
+        logger.info("Regime models not found for [%s/%s]; falling back to ensemble.", tf, broker)
+        xgb_path = get_ensemble_path(tf, broker)
+        if not xgb_path.exists():
+            xgb_path = XGB_GENERIC_PATH
+            if xgb_path.exists():
+                logger.warning(
+                    "No broker+TF XGB ensemble found for %s/%s; falling back to %s. "
+                    "Run --mode train --tf %s --broker %s to create a dedicated model.",
+                    tf, broker, xgb_path, tf, broker,
+                )
+        try:
+            models_xgb, thresholds_xgb, xgb_meta = load_xgb_ensemble(xgb_path)
+        except FileNotFoundError:
+            raise FileNotFoundError(
+                "XGB ensemble not found at models/xgb_ensemble.pkl. "
+                "Run  python main.py --mode train  first."
+            )
+        _, probabilities = get_predictions_ensemble(models_xgb, thresholds_xgb, X)
 
     # Backtest the full synced window — no IS/OOS split
     _z = params.get("z_cutoff_bull")
@@ -227,16 +243,23 @@ def run_validation(
     sharpe   = result["sharpe_ratio"]
     n_trades = result["n_trades"]
     win_rate = result["win_rate"]
-    max_dd   = result.get("floating_max_drawdown", result["max_drawdown"])
+    floating_dd = float(result.get("floating_max_drawdown", result.get("max_drawdown", 0.0)))
+    max_drawdown = float(result.get("max_drawdown", floating_dd))
+    max_dd   = floating_dd  # backward-compat alias
     pf       = result.get("profit_factor", 1.0)
     payoff   = result.get("expected_payoff", 0.0)
     rf       = result.get("recovery_factor", 0.0)
     avg_eff  = result.get("avg_efficiency", 0.0)
     cost_eff = result.get("cost_efficiency", 0.0)
     total_return = result.get("total_return", 0.0)
+    mr_trades   = int(result.get("mr_trades", 0))
+    mr_leak_count = int(result.get("mr_leak_count", mr_trades))
+    from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_MR
+    _mr_id = CANONICAL_REGIME_ID[REGIME_MR]
+    regime_coverage = float(np.mean(states_aligned != _mr_id)) if len(states_aligned) else 0.0
 
     # Complex Criterion score — same formula as optimizer._score_result
-    _fdd = max_dd if max_dd > 0 else 0.0
+    _fdd = floating_dd if floating_dd > 0 else 0.0
     _net = result.get("total_return", 0.0)
     _rf_capped = min(_net / _fdd, 50.0) if _fdd > 0 else (50.0 if _net > 0 else 0.0)
     score = float((_rf_capped * 0.4) + (pf * 0.3) + (sharpe * 0.3))
@@ -297,20 +320,118 @@ def run_validation(
         logger.warning("VALIDATION %s: %s", status.upper(), message)
 
     return {
-        "sharpe":           sharpe,
-        "n_trades":         n_trades,
-        "win_rate":         win_rate,
-        "max_dd":           max_dd,
-        "profit_factor":    pf,
-        "expected_payoff":  payoff,
-        "recovery_factor":  rf,
-        "avg_efficiency":   avg_eff,
-        "cost_efficiency":  cost_eff,
-        "total_return":     total_return,
-        "score":            score,
-        "status":           status,
-        "message":          message,
+        "sharpe":                 sharpe,
+        "n_trades":               n_trades,
+        "win_rate":               win_rate,
+        "floating_max_drawdown":  floating_dd,
+        "max_drawdown":           max_drawdown,
+        "max_dd":                 floating_dd,
+        "mr_trades":              mr_trades,
+        "mr_leak_count":          mr_leak_count,
+        "regime_coverage":        regime_coverage,
+        "profit_factor":          pf,
+        "expected_payoff":        payoff,
+        "recovery_factor":        rf,
+        "avg_efficiency":         avg_eff,
+        "cost_efficiency":        cost_eff,
+        "total_return":           total_return,
+        "score":                  score,
+        "status":                 status,
+        "message":                message,
     }
+
+
+# ── Deployment Gate ───────────────────────────────────────────────────────────
+# Minimum per-TF trade counts for a strategy to be deployable.
+_MIN_TRADES_PER_TF = {"H1": 30, "M15": 60, "M5": 120}
+
+def validate_strategy(
+    result: dict,
+    tf: str,
+    metrics: dict | None = None,
+) -> dict:
+    """Deployment gate: hard-fail or warn based on backtest result quality.
+
+    Checks are applied in priority order:
+        FAIL  dd_cap_violated   — floating DD > 20%
+        FAIL  mr_leak           — any trade executed in MR regime
+        FAIL  min_trades        — too few trades for statistical significance
+        WARN  fold_instability  — high cross-fold Sharpe variance
+        WARN  regime_instability — MR coverage < 20% (degenerate HMM)
+
+    Args:
+        result:  Dict from ``vectorized_backtest`` (or CPCV aggregated dict).
+        tf:      Timeframe string ("H1", "M15", "M5") — used for min_trades.
+        metrics: Optional supplemental metrics dict (e.g. CPCV fold stats).
+                 Merged on top of ``result`` for look-up purposes.
+
+    Returns:
+        dict with keys:
+            status  — "pass" | "warn" | "fail"
+            reason  — canonical reason code or "" for pass
+            details — dict of the specific check values
+    """
+    _m = dict(result)
+    if metrics:
+        _m.update(metrics)
+
+    tf_up = tf.upper()
+    min_trades = _MIN_TRADES_PER_TF.get(tf_up, 30)
+
+    details: dict = {}
+    warnings: list[str] = []
+
+    # ── HARD FAIL CHECKS ─────────────────────────────────────────────────────
+    floating_dd = float(
+        _m.get("floating_max_drawdown", _m.get("max_drawdown", _m.get("max_dd", 0.0)))
+    )
+    details["floating_dd"] = floating_dd
+    if floating_dd > 0.20:
+        return {
+            "status":  "fail",
+            "reason":  "dd_cap_violated",
+            "details": {**details, "threshold": 0.20},
+        }
+
+    mr_leak = int(_m.get("mr_leak_count", _m.get("mr_trades", 0)))
+    details["mr_leak_count"] = mr_leak
+    if mr_leak > 0:
+        return {
+            "status":  "fail",
+            "reason":  "mr_leak",
+            "details": {**details, "mr_trades_found": mr_leak},
+        }
+
+    n_trades = int(_m.get("n_trades", 0))
+    details["n_trades"] = n_trades
+    if n_trades < min_trades:
+        return {
+            "status":  "fail",
+            "reason":  "min_trades",
+            "details": {**details, "required": min_trades},
+        }
+
+    # ── WARN CHECKS ──────────────────────────────────────────────────────────
+    fold_sharpe_std = float(_m.get("fold_sharpe_std", _m.get("std_sharpe", 0.0)))
+    details["fold_sharpe_std"] = fold_sharpe_std
+    if fold_sharpe_std > 1.5:
+        warnings.append("fold_instability")
+
+    # Regime coverage: fraction of bars that are TREND or SHOCK
+    # (less than 20% means the HMM collapsed to near-all-MR — degenerate)
+    regime_coverage = float(_m.get("regime_coverage", 1.0))
+    details["regime_coverage"] = regime_coverage
+    if regime_coverage < 0.20:
+        warnings.append("regime_instability")
+
+    if warnings:
+        return {
+            "status":  "warn",
+            "reason":  warnings[0],    # primary warning code
+            "details": {**details, "all_warnings": warnings},
+        }
+
+    return {"status": "pass", "reason": "", "details": details}
 
 
 def check_model_age(tf: str = "H1", broker: str = "headway_cent") -> float:

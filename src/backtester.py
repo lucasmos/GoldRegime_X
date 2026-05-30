@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from src.logger import setup_logger
 from src.risk_manager import BROKER_CONFIGS
+from src.engine_hmm import CANONICAL_REGIME_ID, REGIME_TREND, REGIME_MR, REGIME_SHOCK
 
 logger = setup_logger(__name__)
 
@@ -24,13 +25,17 @@ TF_MIN_EFFICIENCY = {"H1": 1.25, "M15": 2.50, "M5": 3.50}
 
 RISK_PER_TRADE = 0.01
 
-# ── Strict Probability Thresholds (mirrored from mt5_trader.py) ──────────────
-TF_PROB_THRESHOLD  = {"M5": 0.55, "M15": 0.55, "H1": 0.55}
-TF_SHORT_THRESHOLD = {"M5": 0.45, "M15": 0.45, "H1": 0.45}
+# ── Canonical HMM state integer IDs (sourced from engine_hmm) ──────────────────
+# TREND_STATE = 0, MR_STATE = 1, SHOCK_STATE = 2
+# These replace the old BULL_STATE/BEAR_STATE/CHOP_STATE constants.
+TREND_STATE = CANONICAL_REGIME_ID[REGIME_TREND]   # 0
+MR_STATE    = CANONICAL_REGIME_ID[REGIME_MR]       # 1
+SHOCK_STATE = CANONICAL_REGIME_ID[REGIME_SHOCK]    # 2
 
-BULL_STATE     = 0     # HMM Bull regime
-BEAR_STATE     = 1     # HMM Bear regime
-CHOP_STATE     = 2     # HMM Chop regime (no signals)
+# Legacy aliases kept to avoid breaking old notebooks/reports
+BULL_STATE  = TREND_STATE
+BEAR_STATE  = MR_STATE     # note: semantics changed — MR, not directional bear
+CHOP_STATE  = SHOCK_STATE
 
 # ── Live Execution Configs (mirrored from mt5_trader.py) ─────────────────────
 MAX_HOLD_BARS = 12
@@ -354,21 +359,24 @@ def _mr_attribution(
     hmm_states: np.ndarray,
     strategy_returns: np.ndarray,
 ) -> dict:
-    """Compute MR trade statistics separately from trend trades.
+    """Compute MR trade leak statistics.
 
-    Classifies each trade entry as 'trend' (HMM state < 2) or 'mr' (state >= 2),
-    then computes count, win rate, and total log-return for MR trades.
+    With the new TREND/MR/SHOCK taxonomy, MEAN_REVERSION (state 1) is a
+    strict no-trade regime.  This function counts any trades that leaked
+    through while in MR state — the count MUST be 0 in a valid strategy.
 
-    Returns dict with keys: mr_trades, mr_win_rate, mr_pnl.
+    Returns dict with keys: mr_trades (should be 0), mr_win_rate, mr_pnl,
+    mr_leak_count (same as mr_trades \u2014 for clarity in validator output).
     """
     prev_s   = np.concatenate([[0], signals[:-1]])
     is_entry = (signals != 0) & (signals != prev_s)
     if not is_entry.any():
-        return {"mr_trades": 0, "mr_win_rate": 0.0, "mr_pnl": 0.0}
+        return {"mr_trades": 0, "mr_win_rate": 0.0, "mr_pnl": 0.0, "mr_leak_count": 0}
 
-    trade_idx    = np.cumsum(is_entry)
-    entry_is_mr  = {int(trade_idx[i]): bool(hmm_states[i] >= CHOP_STATE)
-                    for i in np.where(is_entry)[0]}
+    trade_idx   = np.cumsum(is_entry)
+    # Identify trades that entered while in MR state
+    entry_is_mr = {int(trade_idx[i]): bool(hmm_states[i] == MR_STATE)
+                   for i in np.where(is_entry)[0]}
 
     in_trade  = signals != 0
     mr_pnls: list[float] = []
@@ -380,9 +388,10 @@ def _mr_attribution(
 
     n = len(mr_pnls)
     return {
-        "mr_trades":   n,
-        "mr_win_rate": float(sum(1 for r in mr_pnls if r > 0) / n) if n else 0.0,
-        "mr_pnl":      float(sum(mr_pnls)),
+        "mr_trades":    n,
+        "mr_win_rate":  float(sum(1 for r in mr_pnls if r > 0) / n) if n else 0.0,
+        "mr_pnl":       float(sum(mr_pnls)),
+        "mr_leak_count": n,
     }
 
 
@@ -462,8 +471,8 @@ def _run_bar_loop(
 
     # ── Per-TF configs ────────────────────────────────────────────────────────
     _tf_up       = tf.upper()
-    prob_thresh  = TF_PROB_THRESHOLD.get(_tf_up, 0.55)
-    short_thresh = TF_SHORT_THRESHOLD.get(_tf_up, 0.45)
+    prob_thresh  = 0.55    # legacy variable kept for any residual references
+    short_thresh = 0.45    # legacy variable kept for any residual references
     _trail_cfg   = ATR_TRAIL_CONFIG.get(_tf_up, ATR_TRAIL_CONFIG["H1"])
     _tp_sl_cfg   = TP_SL_CONFIG.get(_tf_up, TP_SL_CONFIG["H1"])
 

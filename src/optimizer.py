@@ -32,6 +32,7 @@ from src.engine_hmm import fit_hmm, predict_states
 from src.engine_xgb import (
     prepare_features, train_xgb_ensemble, get_predictions_ensemble,
     compute_regime_stats, get_feature_cols,
+    train_regime_models, get_regime_predictions,
 )
 from src.backtester import vectorized_backtest
 from src.risk_manager import SMALL_ACCOUNT_THRESHOLD
@@ -101,12 +102,12 @@ SEARCH_SPACES = {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
         "n_states":          (3,     4,    "int"),
-        "max_depth":         (4,     8,    "int"),   # raised ceiling: deeper trees for regime features
+        "max_depth":         (3,     6,    "int"),   # spec: 3..6
         "reg_alpha":         (1e-6,  0.5,  "log"),
-        "reg_lambda":        (0.01,  2.0,  "log"),   # lowered floor: allow hmm_state signal
-        "min_child_weight":  (1,     50,   "int"),   # lowered floor: allow finer splits on small vol buckets
-        "learning_rate":     (0.005, 0.15, "log"),
-        "n_estimators":      (50,    400,  "int"),
+        "reg_lambda":        (0.01,  2.0,  "log"),
+        "min_child_weight":  (1,     50,   "int"),
+        "learning_rate":     (0.01,  0.08, "log"),   # spec: 0.01..0.08
+        "n_estimators":      (200,   1200, "int"),   # spec: 200..1200
         "subsample":         (0.5,   0.9,  "float"),
         "colsample_bytree":  (0.4,   0.9,  "float"),
         "gamma":             (1e-6,  0.3,  "log"),
@@ -116,12 +117,12 @@ SEARCH_SPACES = {
         "obs_cov":           (0.5,   5.0,  "log"),
         "trans_cov":         (0.001, 0.03, "log"),
         "n_states":          (3,     4,    "int"),
-        "max_depth":         (3,     7,    "int"),
-        "reg_alpha":         (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
-        "reg_lambda":        (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
+        "max_depth":         (3,     8,    "int"),   # spec: 3..8
+        "reg_alpha":         (1e-6,  0.1,  "log"),
+        "reg_lambda":        (1e-6,  0.1,  "log"),
         "min_child_weight":  (3,     30,   "int"),
-        "learning_rate":     (0.005, 0.2,  "log"),
-        "n_estimators":      (100,   500,  "int"),
+        "learning_rate":     (0.01,  0.15, "log"),   # spec: 0.01..0.15
+        "n_estimators":      (300,   1500, "int"),   # spec: 300..1500
         "subsample":         (0.5,   0.9,  "float"),
         "colsample_bytree":  (0.5,   1.0,  "float"),
         "gamma":             (1e-6,  0.3,  "log"),
@@ -131,12 +132,12 @@ SEARCH_SPACES = {
         "obs_cov":           (0.05,  5.0,  "log"),
         "trans_cov":         (0.001, 0.1,  "log"),
         "n_states":          (3,     4,    "int"),
-        "max_depth":         (2,     4,    "int"),
-        "reg_alpha":         (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
-        "reg_lambda":        (1e-6,  0.1,  "log"),   # lowered: allow hmm OHE signal through
+        "max_depth":         (2,     5,    "int"),   # spec: 2..5
+        "reg_alpha":         (1e-6,  0.1,  "log"),
+        "reg_lambda":        (1e-6,  0.1,  "log"),
         "min_child_weight":  (5,     25,   "int"),
-        "learning_rate":     (0.01,  0.15, "log"),
-        "n_estimators":      (200,   600,  "int"),
+        "learning_rate":     (0.005, 0.05, "log"),   # spec: 0.005..0.05
+        "n_estimators":      (500,   2500, "int"),   # spec: 500..2500
         "subsample":         (0.55,  0.85, "float"),
         "colsample_bytree":  (0.4,   0.8,  "float"),
         "gamma":             (1e-6,  0.3,  "log"),
@@ -310,23 +311,44 @@ def _score_result(result: dict, tier: str = None, broker: str = None, tf: str = 
 
 
 def composite_score(metrics: dict) -> float:
-    """Weighted composite score with stability penalties (Phase 3).
+    """Weighted composite CPCV objective score (Phase E rebuild).
 
-    Combines deflated Sharpe, Calmar, profit factor, and expectancy with
-    optional penalties for low trade count, path instability, and cost erosion.
-    Used by Phase 3 optimizer tuning; backward-compatible (penalties default 0).
+    Formula:
+        0.35 * deflated_sharpe
+      + 0.25 * calmar
+      + 0.20 * profit_factor    (raw, not -1)
+      + 0.10 * expectancy
+      + 0.10 * stability_score
+      - penalties
+
+    Penalties:
+        trade_count_variance  — variance in per-fold trade counts (normalised)
+        fold_instability      — std-dev of per-fold scores
+        regime_instability    — penalise if MR leakage > 0
     """
+    deflated_sharpe = float(metrics.get("deflated_sharpe", metrics.get("sharpe", 0.0)))
+    calmar          = float(metrics.get("calmar", 0.0))
+    pf              = float(metrics.get("profit_factor", 1.0))
+    expectancy      = float(metrics.get("expectancy", 0.0))
+    stability       = float(metrics.get("stability_score",
+                             metrics.get("return_consistency", 0.0)))
+
     base = (
-        0.40 * float(metrics.get("deflated_sharpe", metrics.get("sharpe", 0.0))) +
-        0.30 * float(metrics.get("calmar", 0.0)) +
-        0.20 * float(metrics.get("profit_factor", 1.0) - 1.0) +
-        0.10 * float(metrics.get("expectancy", 0.0))
+        0.35 * np.clip(deflated_sharpe, -5.0, 5.0)
+      + 0.25 * np.clip(calmar,          -5.0, 5.0)
+      + 0.20 * np.clip(pf,               0.0, 5.0)
+      + 0.10 * np.clip(expectancy,       -2.0, 2.0)
+      + 0.10 * np.clip(stability,         0.0, 1.0)
     )
     penalties = 0.0
-    penalties += float(metrics.get("trade_count_penalty", 0.0))
-    penalties += float(metrics.get("path_instability_penalty", 0.0))
-    penalties += float(metrics.get("cost_erosion_penalty", 0.0))
-    return base - penalties
+    penalties += float(metrics.get("trade_count_variance",  0.0))
+    penalties += float(metrics.get("fold_instability",      0.0))
+    penalties += float(metrics.get("regime_instability",    0.0))
+    # Explicit MR leakage penalty: any MR trade leaks are a hard quality failure
+    mr_leak = int(metrics.get("mr_leak_count", 0))
+    if mr_leak > 0:
+        penalties += float(mr_leak) * 5.0   # 5 pts per leaked MR trade
+    return float(base - penalties)
 
 
 def compute_regime_duration(states: np.ndarray) -> np.ndarray:
@@ -450,13 +472,16 @@ def _run_single_window(
     for _tr, _val in _make_purged_inner_cv_splits(X_is, n_cv_folds, embargo_bars=tf_embargo):
         X_tr, y_tr = X_is.iloc[_tr], y_is.iloc[_tr]
         X_val      = X_is.iloc[_val]
+        st_tr  = states_is_al[np.isin(np.arange(len(states_is_al)), _tr)]
+        st_val = states_is_al[np.isin(np.arange(len(states_is_al)), _val)]
         if len(X_tr) < 200 or len(X_val) < 50:
             continue
         try:
-            _m, _t, _ = train_xgb_ensemble(X_tr, y_tr, train_ratio=1.0, **xgb_kwargs)
-            _, _p = get_predictions_ensemble(_m, _t, X_val)
+            _rm = train_regime_models(X_tr, y_tr, st_tr, tf=tf, **xgb_kwargs)
+            _p  = get_regime_predictions(X_val, st_val,
+                                         _rm["trend_model"], _rm["shock_model"])
             _dfv  = df_is_al[df_is_al.index.isin(X_val.index)]
-            _stv  = states_is_al[df_is_al.index.isin(X_val.index)]
+            _stv  = st_val
             if len(_dfv) < 20:
                 continue
             _r = vectorized_backtest(
@@ -470,24 +495,19 @@ def _run_single_window(
 
     mean_cv_sharpe = float(np.mean(cv_sharpes)) if cv_sharpes else 0.0
 
+    # Train regime-specific models on the full IS window
     try:
-        models_w, thresh_w, ens_metrics = train_xgb_ensemble(X_is, y_is, train_ratio=1.0, **xgb_kwargs)
+        regime_result = train_regime_models(X_is, y_is, states_is_al, tf=tf, **xgb_kwargs)
     except Exception as exc:
-        return _fail(f"XGB train: {exc}")
+        return _fail(f"XGB regime train: {exc}")
 
-    # Detect if XGBoost zeroed out the regime signal — a sign of over-regularisation
-    # that breaks the HMM→XGB connection.  For M5/M15 regime is OHE (state_0/1/2);
-    # for H1 it is the raw integer hmm_state.
-    feat_imp = ens_metrics.get("feature_importance", {})
-    if tf.upper() in ("M5", "M15"):
-        _regime_cols      = ("state_0", "state_1", "state_2")
-        regime_importance = sum(feat_imp.get(c, 0.0) for c in _regime_cols)
-        hmm_zeroed        = (regime_importance == 0.0)
-    else:
-        regime_importance = feat_imp.get("hmm_state", 1.0)
-        hmm_zeroed        = (float(regime_importance) == 0.0)
+    hmm_zeroed = (regime_result["trend_model"] is None and
+                  regime_result["shock_model"] is None)
 
-    _, probs_oos = get_predictions_ensemble(models_w, thresh_w, X_oos)
+    probs_oos = get_regime_predictions(
+        X_oos, states_oos_al,
+        regime_result["trend_model"], regime_result["shock_model"],
+    )
 
     if len(df_oos_al) < 20 or len(probs_oos) != len(df_oos_al):
         return _fail(f"OOS length mismatch: df={len(df_oos_al)} probs={len(probs_oos)}")
@@ -511,15 +531,9 @@ def _run_single_window(
         oos_score = _score_from_backtest(
             oos_result, tf=tf, account_size=balance, n_bars=oos_bars
         )
-        if tf.upper() in ("M5", "M15"):
-            # Graduated penalty: combined OHE importance < 1% → ×0.5; ==0 → ×0.25
-            if regime_importance < 0.01:
-                oos_score *= 0.5
-            if regime_importance == 0.0:
-                oos_score *= 0.5  # cumulative: 75% total reduction
-        else:
-            if hmm_zeroed:
-                oos_score *= 0.5  # XGB ignoring HMM regime = signal quality failure
+        if hmm_zeroed:
+            # Both regime models absent = complete signal quality failure
+            oos_score *= 0.5
         if mean_cv_sharpe < -1.0:
             oos_score *= 0.5
 
@@ -771,6 +785,7 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
                 n_splits=CPCV_N_BLOCKS,
                 n_test_splits=CPCV_K_TEST,
                 embargo_bars=tf_embargo,
+                trial_number=trial.number,
             )
 
             score         = cpcv_result["cpcv_score"]
@@ -778,22 +793,28 @@ def make_objective(df: pd.DataFrame, tf: str, broker: str,
             std_sharpe    = cpcv_result["std_sharpe"]
             median_trades = cpcv_result["median_trades"]
 
+            med_dd = float(np.median(cpcv_result.get("path_drawdowns", [0.0])))
+            p75_dd = float(np.percentile(cpcv_result.get("path_drawdowns", [0.0]), 75))
+
             # Store metrics for Optuna history
-            trial.set_user_attr("n_valid_paths", n_valid_paths)
-            trial.set_user_attr("median_trades",   median_trades)
-            trial.set_user_attr("std_sharpe",      std_sharpe)
-            trial.set_user_attr("median_sharpe",   cpcv_result["median_sharpe"])
+            trial.set_user_attr("n_valid_paths",    n_valid_paths)
+            trial.set_user_attr("median_trades",    median_trades)
+            trial.set_user_attr("std_sharpe",       std_sharpe)
+            trial.set_user_attr("median_sharpe",    cpcv_result["median_sharpe"])
+            trial.set_user_attr("median_drawdown",  med_dd)
+            trial.set_user_attr("p75_drawdown",     p75_dd)
 
             logger.info(
-                "Trial %d [%s/%s]: score=%.3f | valid_paths=%d/%d | "
-                "std_sharpe=%.3f | median_trades=%d",
+                "Trial %d [%s/%s]: score=%.3f | valid_paths=%d/%d | std_sharpe=%.3f | "
+                "median_trades=%d | med_dd=%.3f | p75_dd=%.3f",
                 trial.number, tf, broker, score, n_valid_paths, _N_PATHS,
-                std_sharpe, median_trades,
+                std_sharpe, median_trades, med_dd, p75_dd,
             )
             append_trial_score(
                 f"Trial {trial.number} [{tf}/{broker}]: score={score:.3f} | "
                 f"valid_paths={n_valid_paths}/{_N_PATHS} | "
-                f"std_sharpe={std_sharpe:.3f} | median_trades={median_trades}"
+                f"std_sharpe={std_sharpe:.3f} | median_trades={median_trades} | "
+                f"med_dd={med_dd:.3f} | p75_dd={p75_dd:.3f}"
             )
 
             return score
@@ -1174,12 +1195,20 @@ def run_optimization(
     else:
         pruner = optuna.pruners.MedianPruner(n_startup_trials=10, n_warmup_steps=5)
 
+    sampler = optuna.samplers.TPESampler(
+        multivariate=True,
+        group=True,
+        n_startup_trials=30,
+        seed=42,
+    )
+
     study = optuna.create_study(
         study_name=name,
         storage=storage,
         direction="maximize",
         load_if_exists=True,
         pruner=pruner,
+        sampler=sampler,
     )
 
     feature_cols = list(get_feature_cols(df))
@@ -1192,22 +1221,51 @@ def run_optimization(
     if warm_start_stage1:
         from pathlib import Path
         _s1_path = Path(f"models/stage1_{tf.lower()}_{broker}.json")
-        if _s1_path.exists():
-            try:
-                _s1 = json.loads(_s1_path.read_text())
-                study.enqueue_trial(_s1["params"])
+        _db_warmstart_ok = False
+
+        # Primary: enqueue top-10 completed Stage-1 trials directly from the DB.
+        # This is more informative than a single best-params JSON because it
+        # seeds the TPE surrogate with a diverse set of high-quality starts.
+        try:
+            _s1_name    = _study_name(broker=broker, tier=_get_tier(account_size), tf=tf) + "_stage1"
+            _s1_study   = optuna.load_study(study_name=_s1_name, storage=storage)
+            _s1_trials  = [
+                t for t in _s1_study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE
+            ]
+            _s1_trials.sort(key=lambda t: t.value or float("-inf"), reverse=True)
+            _top_n = _s1_trials[:10]
+            if _top_n:
+                for _t in _top_n:
+                    study.enqueue_trial(_t.params)
                 logger.info(
-                    "Stage-2: warm-started from %s (stage1 score=%.3f)",
-                    _s1_path, _s1.get("score", float("nan")),
+                    "Stage-2: warm-started with top-%d Stage-1 DB trials (best=%.3f).",
+                    len(_top_n), _top_n[0].value or float("nan"),
                 )
-                print(f"  Warm-starting from Stage-1 params (score={_s1.get('score', '?'):.3f}).\n")
-            except Exception as _e:
-                logger.warning("Failed to load Stage-1 params for warm-start: %s", _e)
-        else:
-            logger.warning(
-                "Stage-2 warm_start_stage1=True but no file found at %s. "
-                "Run --stage xgb first.", _s1_path,
-            )
+                print(f"  Warm-starting from top-{len(_top_n)} Stage-1 DB trials "
+                      f"(best={_top_n[0].value:.3f}).\n")
+                _db_warmstart_ok = True
+        except Exception as _e:
+            logger.warning("Stage-2 DB warm-start failed (%s) — falling back to JSON.", _e)
+
+        # Fallback: use the saved JSON if DB fetch failed or returned nothing.
+        if not _db_warmstart_ok:
+            if _s1_path.exists():
+                try:
+                    _s1 = json.loads(_s1_path.read_text())
+                    study.enqueue_trial(_s1["params"])
+                    logger.info(
+                        "Stage-2: warm-started from %s (stage1 score=%.3f)",
+                        _s1_path, _s1.get("score", float("nan")),
+                    )
+                    print(f"  Warm-starting from Stage-1 JSON params (score={_s1.get('score', '?'):.3f}).\n")
+                except Exception as _e:
+                    logger.warning("Failed to load Stage-1 params for warm-start: %s", _e)
+            else:
+                logger.warning(
+                    "Stage-2 warm_start_stage1=True but no file found at %s. "
+                    "Run --stage xgb first.", _s1_path,
+                )
 
     already_done = len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE])
     remaining    = max(0, n_trials - already_done)
@@ -1590,6 +1648,7 @@ def execute_cpcv(
     n_splits: int = 6,
     n_test_splits: int = 2,
     embargo_bars: int = 24,
+    trial_number: int | None = None,
 ) -> dict:
     """Execute Combinatorial Purged CV with strict per-path HMM and Scaler fitting.
 
@@ -1647,33 +1706,23 @@ def execute_cpcv(
             if train_mask_al.sum() < 100 or test_mask_al.sum() < 50:
                 continue
 
-            # 4. Train XGBoost on the training paths (train_ratio=1.0)
+            # 4. Train regime-specific models on the training paths
             X_tr, y_tr = X_all.iloc[train_mask_al], y_all.iloc[train_mask_al]
-            models_ens, thresholds, ens_metrics = train_xgb_ensemble(
-                X_tr, y_tr, train_ratio=1.0, **xgb_kwargs
+            states_tr_al = _aligned_states_from_prepare(df_full, all_states, df_all_aligned)
+            states_tr_aligned = states_tr_al[train_mask_al]
+
+            regime_result_cpcv = train_regime_models(
+                X_tr, y_tr, states_tr_aligned, tf=tf, **xgb_kwargs
             )
+            trend_model_c = regime_result_cpcv["trend_model"]
+            shock_model_c = regime_result_cpcv["shock_model"]
 
-            # Penalise immediately if the model zeroed out regime signal.
-            # For M15/M5, HMM state is OHE → check state_0/1/2; for H1 check hmm_state.
-            feat_imp_cpcv = ens_metrics.get("feature_importance", {})
-            if tf.upper() in ("M5", "M15"):
-                _regime_imp = sum(
-                    feat_imp_cpcv.get(c, 0.0) for c in ("state_0", "state_1", "state_2")
-                )
-            else:
-                _regime_imp = float(feat_imp_cpcv.get("hmm_state", 1.0))
-            if _regime_imp == 0.0:
-                return {
-                    "cpcv_score": -50.0, "n_valid_paths": 0,
-                    "median_sharpe": -10.0, "std_sharpe": 0.0,
-                    "median_trades": 0, "path_scores": [],
-                }
+            # hmm_zeroed if both models absent (penalised per-path below)
+            _regime_imp = 0.0 if (trend_model_c is None and shock_model_c is None) else 1.0
 
-            # 5. Get predictions and backtest on the OOS test paths
-            _, probs_all = get_predictions_ensemble(models_ens, thresholds, X_all)
-            # Use _aligned_states_from_prepare so M15/M5 (OHE removes hmm_state
-            # column from df_all_aligned) never cause a KeyError here.
+            # 5. Merge probabilities then backtest on the OOS test paths
             states_all_al = _aligned_states_from_prepare(df_full, all_states, df_all_aligned)
+            probs_all = get_regime_predictions(X_all, states_all_al, trend_model_c, shock_model_c)
 
             test_df     = df_all_aligned.iloc[test_mask_al]
             test_probs  = probs_all[test_mask_al]
@@ -1708,37 +1757,42 @@ def execute_cpcv(
                 hmm_transmat=model_path.transmat_,
             )
 
-            n_trades = path_result.get("n_trades", 0)
-            fdd = path_result.get("floating_max_drawdown", path_result.get("max_drawdown", 0.0))
+            n_trades = int(path_result.get("n_trades", 0))
+            fdd = float(path_result.get("floating_max_drawdown", path_result.get("max_drawdown", 0.0)))
 
-            if n_trades < min_trades or fdd > CPCV_MAX_FLOAT_DD:
-                path_scores.append(-50.0)
-                path_sharpes.append(-10.0)
-                path_trades.append(n_trades)
-                path_winrates.append(0.0)
-                path_drawdowns.append(float(fdd))
-                path_returns.append(0.0)
-                continue
-
-            n_valid_paths += 1
-            # Phase 3: use composite_score for M15/M5 (multi-metric objective
-            # with stability penalties); _score_result for H1.
+            # Compute base score using the same composite logic as before.
             if tf.upper() in ("M15", "M5"):
-                _calmar = (path_result.get("total_return", 0.0) /
-                           max(path_result.get("max_drawdown", 1e-6), 1e-6))
+                _calmar = path_result.get("total_return", 0.0) / max(path_result.get("max_drawdown", 1e-6), 1e-6)
                 _cs_metrics = {
-                    "sharpe":        path_result.get("sharpe_ratio", 0.0),
+                    "sharpe":        float(path_result.get("sharpe_ratio", 0.0)),
                     "calmar":        float(np.clip(_calmar, -5.0, 5.0)),
-                    "profit_factor": path_result.get("profit_factor", 1.0),
-                    "expectancy":    path_result.get("expected_payoff", 0.0),
+                    "profit_factor": float(path_result.get("profit_factor", 1.0)),
+                    "expectancy":    float(path_result.get("expected_payoff", 0.0)),
                 }
-                path_scores.append(composite_score(_cs_metrics))
+                base_score = float(composite_score(_cs_metrics))
             else:
-                path_scores.append(_score_result(path_result, broker=broker, tf=tf))
-            path_sharpes.append(path_result.get("sharpe_ratio", 0.0))
+                base_score = float(_score_result(path_result, broker=broker, tf=tf))
+
+            # Continuous penalties — graded so Optuna gets a gradient even for
+            # sub-threshold paths.  Hard validity flag is kept strict (20% DD cap).
+            trade_shortfall = max(0.0, float(min_trades - n_trades)) / max(float(min_trades), 1.0)
+            dd_excess = max(0.0, fdd - CPCV_MAX_FLOAT_DD)
+
+            regime_penalty = 0.0
+            if _regime_imp == 0.0:
+                regime_penalty = 2.0
+
+            path_score = base_score - (2.0 * trade_shortfall) - (8.0 * dd_excess) - regime_penalty
+
+            is_valid = (n_trades >= min_trades) and (fdd <= CPCV_MAX_FLOAT_DD)
+            if is_valid:
+                n_valid_paths += 1
+
+            path_scores.append(path_score)
+            path_sharpes.append(float(path_result.get("sharpe_ratio", 0.0)))
             path_trades.append(n_trades)
             path_winrates.append(float(path_result.get("win_rate", 0.0)))
-            path_drawdowns.append(float(fdd))
+            path_drawdowns.append(fdd)
             path_returns.append(float(path_result.get("total_return", 0.0)))
 
         except Exception as exc:
@@ -1746,39 +1800,41 @@ def execute_cpcv(
             continue
 
     # ── Progressive CPCV Scoring ─────────────────────────────────────────────
-    # 1. Hard Floor: reject outright if fewer than 4/6 paths survived.
-    #    Below this threshold the gradient is meaningless for Optuna.
-    if n_valid_paths < 4:
-        logger.warning(
-            "CPCV [%s]: only %d/%d valid paths — hard floor, rejecting trial.",
-            tf, n_valid_paths, int(comb(CPCV_N_BLOCKS, CPCV_K_TEST)),
-        )
-        return {
-            "cpcv_score": -50.0, "n_valid_paths": n_valid_paths,
-            "median_sharpe": -10.0, "std_sharpe": 0.0,
-            "median_trades": int(np.median(path_trades) if path_trades else 0),
-            "path_scores": path_scores,
-        }
+    # Adaptive minimum valid paths: strict only after Optuna has enough data
+    # to build a reliable surrogate (trial >= 80); during warm-up accept fewer
+    # valid paths so the study still gets informative gradient.
+    total_paths = int(comb(CPCV_N_BLOCKS, CPCV_K_TEST))
 
-    # 2. Base Score: median across ALL path scores (including -50 sentinels for
-    #    invalid paths) minus a variance penalty.  Sentinel values naturally
-    #    drag the median downward when paths fail, complementing the explicit
-    #    path penalty below.
-    _med_score = float(np.median(path_scores))
-    _std_score = float(np.std(path_scores))
-    base_score = _med_score - (0.25 * _std_score)
+    if trial_number is None:
+        min_valid_required = 3
+    elif trial_number < 30:
+        min_valid_required = 1
+    elif trial_number < 80:
+        min_valid_required = 2
+    else:
+        min_valid_required = 3
 
-    # 3. Path Penalty: subtract 2.0 per missing path to force Optuna to seek
-    #    6/6.  A 4/6 trial incurs −4.0; a 5/6 trial incurs −2.0; 6/6 is 0.0.
-    path_penalty = (6 - n_valid_paths) * 2.0
+    med_score = float(np.median(path_scores)) if path_scores else -50.0
+    std_score = float(np.std(path_scores))    if path_scores else 0.0
+    base_score = med_score - (0.25 * std_score)
+
+    # 1.5 per invalid path — graded so partial recovery is rewarded.
+    path_penalty = float(total_paths - n_valid_paths) * 1.5
     final_score  = base_score - path_penalty
+
+    if n_valid_paths < min_valid_required:
+        final_score -= 5.0
+        logger.warning(
+            "CPCV [%s]: only %d/%d valid paths (required=%d at trial=%s) - soft fail.",
+            tf, n_valid_paths, total_paths, min_valid_required, str(trial_number),
+        )
 
     valid_sharpes = [s for s in path_sharpes if s > -9.0]
     logger.info(
         "CPCV [%s]: %d/%d valid paths | median_score=%.3f std=%.3f | "
         "path_penalty=%.1f | final_score=%.3f",
-        tf, n_valid_paths, int(comb(CPCV_N_BLOCKS, CPCV_K_TEST)),
-        _med_score, _std_score, path_penalty, final_score,
+        tf, n_valid_paths, total_paths,
+        med_score, std_score, path_penalty, final_score,
     )
     return {
         "cpcv_score":      final_score,
