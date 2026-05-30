@@ -199,7 +199,8 @@ class SignalEngine:
 
             entry = self.should_enter(regime_info, prob, vix_z, atr_bnd,
                                       z_cutoff_bull=tf_config.get("z_cutoff_bull"),
-                                      z_cutoff_bear=tf_config.get("z_cutoff_bear"))
+                                      z_cutoff_bear=tf_config.get("z_cutoff_bear"),
+                                      h1_entry_prob=tf_config.get("h1_entry_prob"))
 
             # Phase 3 — M15: continuation quality gate.
             # Neutral fallbacks (1.0) pass the gate when features are absent
@@ -302,6 +303,7 @@ class SignalEngine:
         atr_band_position: float,
         z_cutoff_bull: float | None = None,
         z_cutoff_bear: float | None = None,
+        h1_entry_prob: float | None = None,
     ) -> dict | None:
         """Evaluate entry conditions for the current bar.
 
@@ -330,9 +332,18 @@ class SignalEngine:
         eff_buy  = xgb_prob
         eff_sell = 1.0 - xgb_prob
 
-        # H1 probability gate; M15/M5 bypass (XGB probs cluster near 50-55%)
-        prob_req_buy  = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
-        prob_req_sell = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
+        # H1 probability gate: use tunable per-run threshold when provided,
+        # otherwise fall back to ENTRY_PROB constant.
+        # M15/M5: bypass (XGB probs cluster near 50-55%).
+        if self.tf == "H1":
+            buy_thr, sell_thr = self._effective_h1_prob_thresholds(
+                {"h1_entry_prob": h1_entry_prob} if h1_entry_prob is not None else None
+            )
+            prob_req_buy  = eff_buy  >= buy_thr
+            prob_req_sell = eff_sell >= sell_thr
+        else:
+            prob_req_buy  = eff_buy  >= ENTRY_PROB.get(self.tf, 0.0)
+            prob_req_sell = eff_sell >= ENTRY_PROB.get(self.tf, 0.0)
 
         # Effective Z thresholds — caller override takes precedence
         trend_z_bull = (float(z_cutoff_bull) if z_cutoff_bull is not None
@@ -447,6 +458,22 @@ class SignalEngine:
         self._probs_window = []
 
     # ── Phase 3: M15/M5 specialization helpers ────────────────────────────────
+
+    def _effective_h1_prob_thresholds(self, tf_config: dict | None = None) -> "tuple[float, float]":
+        """Return (buy_thr, sell_thr) for H1 entry gate, respecting per-run overrides.
+
+        Priority: h1_entry_prob_buy/sell > h1_entry_prob > ENTRY_PROB constant.
+        Both thresholds are clamped to [0.50, 0.90].
+        """
+        tf_config   = tf_config or {}
+        default_thr = float(ENTRY_PROB.get("H1", 0.575))
+        buy_thr  = float(tf_config.get("h1_entry_prob_buy",
+                         tf_config.get("h1_entry_prob", default_thr)))
+        sell_thr = float(tf_config.get("h1_entry_prob_sell",
+                         tf_config.get("h1_entry_prob", default_thr)))
+        buy_thr  = min(max(buy_thr,  0.50), 0.90)
+        sell_thr = min(max(sell_thr, 0.50), 0.90)
+        return buy_thr, sell_thr
 
     def dynamic_prob_threshold(
         self, probs_window: np.ndarray, percentile: float = 90.0

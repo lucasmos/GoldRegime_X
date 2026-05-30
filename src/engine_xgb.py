@@ -81,6 +81,42 @@ DXY_FEATURE     = USDCHF_FEATURE   # legacy alias -- kept so old imports don't c
 # Volatility bucket labels (ATR tertiles: low / med / high)
 VOL_BUCKETS = ["low", "med", "high"]
 
+
+def _validate_state_feature_schema(df: "pd.DataFrame", tf: str) -> None:
+    """Raise if the HMM state feature columns violate the canonical 3-state contract.
+
+    H1  : must have integer 'hmm_state'; 'state_3' is forbidden.
+    M15/M5: must have exactly 'state_0', 'state_1', 'state_2'; 'state_3' is forbidden.
+
+    Called immediately after OHE / feature construction in prepare_features.
+    """
+    tfu = tf.upper()
+    if tfu == "H1":
+        if "hmm_state" not in df.columns:
+            raise ValueError(
+                "H1 feature schema error: 'hmm_state' column is missing. "
+                "Expected integer column with values in {0,1,2}."
+            )
+        if "state_3" in df.columns:
+            raise ValueError(
+                "H1 feature schema error: unexpected 'state_3' column detected. "
+                "4-state HMM output has leaked into features. Re-run with n_states=3."
+            )
+        return
+    # M15 / M5
+    required = {"state_0", "state_1", "state_2"}
+    missing  = sorted(c for c in required if c not in df.columns)
+    if missing:
+        raise ValueError(
+            f"{tfu} feature schema error: missing OHE columns {missing}. "
+            f"Expected state_0, state_1, state_2 from 3-state HMM output."
+        )
+    if "state_3" in df.columns:
+        raise ValueError(
+            f"{tfu} feature schema error: unexpected 'state_3' column detected. "
+            f"4-state HMM output has leaked into features. Re-run with n_states=3."
+        )
+
 # Timeframe-specific IS/OOS split ratios.
 # H1 has a smaller dataset (~125K bars but 21 years of hourly data) -- 70/30 gives
 # a more realistic OOS window without starving the scaler fit.
@@ -233,6 +269,9 @@ def prepare_features(df: pd.DataFrame, hmm_states: np.ndarray, feature_scaler=No
             if _col not in df.columns:
                 df[_col] = 0
 
+    # Validate HMM state feature schema against canonical 3-state contract.
+    _validate_state_feature_schema(df, tf)
+
     df["prev_log_return"] = df["log_return"].shift(1)
 
     # TF-specific target: label 1 when the *next N bars* cumulative return
@@ -321,6 +360,7 @@ def train_xgb(
     colsample_bytree: float = 0.8,
     scale_pos_weight: float = 1.0,
     train_ratio: float = 0.8,
+    training_context: str = "global",
 ):
     split_idx = int(len(X) * train_ratio)
     has_holdout = split_idx < len(X)
@@ -381,13 +421,22 @@ def train_xgb(
     train_acc = accuracy_score(y_train, model.predict(X_train))
     test_acc  = accuracy_score(y_eval, model.predict(X_eval))
     importance = dict(zip(list(X.columns), model.feature_importances_))
-    if importance.get("hmm_state", 1.0) == 0.0:
-        logger.warning(
-            "hmm_state importance=0: XGBoost ignores the HMM regime. "
-            "The regime-aligned filter gates signals on a feature XGB deems "
-            "uninformative -- likely caused by heavy regularisation or n_states=2. "
-            "Consider re-optimising with n_states>=3 or lower reg_alpha/gamma."
-        )
+    _hmm_imp    = importance.get("hmm_state", None)
+    _hmm_unique = X["hmm_state"].nunique() if "hmm_state" in X.columns else None
+    if _hmm_imp == 0.0:
+        if training_context == "regime_split" or _hmm_unique == 1:
+            # Expected: in regime-split training the hmm_state column is
+            # constant within the subset (all rows share the same regime),
+            # so XGBoost correctly assigns it zero importance.
+            logger.info(
+                "hmm_state importance=0 is expected in regime-split training "
+                "(state is constant within the regime subset)."
+            )
+        else:
+            logger.warning(
+                "hmm_state importance=0 in global training: regime signal may be "
+                "ineffective. Check regularization (reg_alpha/gamma) and n_states."
+            )
 
     logger.info("XGB Train Acc: %.4f | Test Acc: %.4f", train_acc, test_acc)
     logger.info("Feature importance: %s", importance)
@@ -747,7 +796,7 @@ def train_regime_models(
     results['trend_n'] = int(trend_mask.sum())
     if results['trend_n'] >= _MIN_SAMPLES:
         try:
-            tm, tm_metrics = train_xgb(X[trend_mask], y[trend_mask], train_ratio=1.0, **xgb_kwargs)
+            tm, tm_metrics = train_xgb(X[trend_mask], y[trend_mask], train_ratio=1.0, training_context="regime_split", **xgb_kwargs)
             results['trend_model']   = tm
             results['trend_metrics'] = tm_metrics
             logger.info('[%s] TREND model: n=%d  train_acc=%.4f',
@@ -763,7 +812,7 @@ def train_regime_models(
     results['shock_n'] = int(shock_mask.sum())
     if results['shock_n'] >= _MIN_SAMPLES:
         try:
-            sm, sm_metrics = train_xgb(X[shock_mask], y[shock_mask], train_ratio=1.0, **xgb_kwargs)
+            sm, sm_metrics = train_xgb(X[shock_mask], y[shock_mask], train_ratio=1.0, training_context="regime_split", **xgb_kwargs)
             results['shock_model']   = sm
             results['shock_metrics'] = sm_metrics
             logger.info('[%s] SHOCK model: n=%d  train_acc=%.4f',

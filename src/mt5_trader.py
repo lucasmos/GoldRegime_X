@@ -44,6 +44,7 @@ from src.engine_xgb import (
 )
 from src.risk_manager import AdaptiveRiskManager, BROKER_CONFIGS, CENT_MULTIPLIER, DailyEquityGate
 from src.signal_engine import SignalEngine, should_apply_prob_gate
+from src.trade_lifecycle import config_for_tf, floating_pnl_usd
 
 logger = setup_logger(__name__)
 
@@ -1135,9 +1136,9 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
     # ATR-linked trailing stop applies to all TFs unconditionally.
     # The legacy profit_target CLI param is kept for backward compat but is no
     # longer used — the ATR trail supersedes the old fixed-exit logic.
-    _trail_cfg     = ATR_TRAIL_CONFIG.get(tf.upper(), ATR_TRAIL_CONFIG["H1"])
-    _atr_mult_log  = _trail_cfg["trail_mult"]
-    _activ_pnl_log = _trail_cfg["activation_pnl"]
+    _lc_cfg        = config_for_tf(tf)
+    _atr_mult_log  = _lc_cfg.trail_mult
+    _activ_pnl_log = _lc_cfg.activation_pnl_usd
     logger.info(
         "ATR Trailing Stop — activation $%.2f | "
         "multiplier %.1fx ATR [%s] | partial close (lot>%.2f).",
@@ -1263,12 +1264,12 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 # Close individual positions that reach the $4 scalp target.
                 # If regime hasn't changed and daily cap not hit, allow re-entry.
                 if tf.upper() == "M5" and signal_tracker["tickets"]:
-                    _scalp_target = ATR_TRAIL_CONFIG["M5"].get("scalp_target", 4.00)
+                    _scalp_target = config_for_tf("M5").scalp_target_usd
                     for _st in list(signal_tracker["tickets"]):
                         _sp = mt5.positions_get(ticket=_st)
                         if not _sp:
                             continue
-                        _s_pnl = _sp[0].profit / _pnl_divisor
+                        _s_pnl = floating_pnl_usd(_sp[0].profit, broker)
                         if _s_pnl >= _scalp_target:
                             _close_position(_st, mt5, comment="GRX_Fixed_Scalp_Target", magic=magic)
                             logger.info(
@@ -1286,9 +1287,8 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                 #   move SL to breakeven+2×spread; optionally close 50% volume.
                 # Phase 2 (every poll): trail SL at price ∓ (ATR_mult × cached ATR).
                 if signal_tracker["tickets"]:
-                    _trail_cfg_inner = ATR_TRAIL_CONFIG.get(tf.upper(), ATR_TRAIL_CONFIG["H1"])
-                    _atr_mult  = _trail_cfg_inner["trail_mult"]
-                    _activ_pnl = _trail_cfg_inner["activation_pnl"]
+                    _atr_mult  = _lc_cfg.trail_mult
+                    _activ_pnl = _lc_cfg.activation_pnl_usd
                     _atr_cache = signal_tracker.get("atr_price", 0.0)
                     _open_pos  = [
                         p for p in (mt5.positions_get(symbol=DEFAULT_SYMBOL) or [])
@@ -1296,7 +1296,7 @@ def _run_loop_inner(tf: str, broker: str, account_size: float, mt5,
                         and p.ticket in set(signal_tracker["tickets"])
                     ]
                     for _pos in _open_pos:
-                        _cur    = _pos.profit / _pnl_divisor
+                        _cur    = floating_pnl_usd(_pos.profit, broker)
                         _ticket = _pos.ticket
                         _atr_st = atr_state_tracker.setdefault(
                             _ticket,

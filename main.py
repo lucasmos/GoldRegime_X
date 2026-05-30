@@ -54,12 +54,18 @@ def _resolve_balance(args) -> float:
 def resolve_n_states(tf: str, params: dict) -> int:
     """Return the canonical n_states for *tf* in both optimize and train paths.
 
-    M5 and M15 are fixed at 3 (Bull/Bear/Chop) so CPCV and training always
-    produce identical HMM structures.  H1 is Optuna-tuned (default 3).
+    The canonical regime contract mandates exactly 3 states for ALL timeframes:
+    TREND (0), MEAN_REVERSION (1), VOLATILITY_SHOCK (2).
+    Passing any other value raises immediately so mis-configured runs fail fast.
     """
-    if tf.upper() in ("M5", "M15"):
-        return 3
-    return int(params.get("n_states", 3))
+    requested = int(params.get("n_states", 3))
+    if requested != 3:
+        raise ValueError(
+            f"n_states must be 3 for all TFs (canonical regime contract). "
+            f"Received {requested} for {tf}. "
+            f"Supported states: TREND(0), MEAN_REVERSION(1), VOLATILITY_SHOCK(2)."
+        )
+    return 3
 
 
 _M5_EXPIRY_HOURS   = 120   # 5 days
@@ -288,6 +294,15 @@ def cmd_process(args):
             logger.error("Unknown timeframe '%s'. Valid: %s", tf, list(TF_CONFIG))
             continue
         reconfigure_for_tf(tf)
+
+        # Auto-sync raw CSV from MT5 before processing (same as cmd_optimize does).
+        # Silently skipped when MT5 is unavailable.
+        try:
+            from src.mt5_sync import ensure_data_updated
+            ensure_data_updated(tf=tf, symbol="XAUUSD")
+        except Exception as _sync_exc:
+            logger.warning("Auto-sync skipped (%s). Continuing with existing data.", _sync_exc)
+
         try:
             df = process_pipeline(save=True, tf=tf, save_models=True, broker=args.broker)
             logger.info(
@@ -333,24 +348,30 @@ def cmd_optimize(args):
             sys.exit(1)
         df = pd.read_parquet(processed_path)
 
-        if stage == "xgb":
-            # ── Stage-1: fast single hold-out XGB exploration (no CPCV) ─────
-            study = run_optimization_stage1(
-                df=df, tf=tf, broker=broker,
-                account_size=balance, n_trials=args.trials,
+        if stage is not None:
+            print(
+                f"\n[DEPRECATED] --stage {stage!r} is ignored. "
+                "Running unified single-stage pipeline optimization.\n"
             )
-        else:
-            # ── Stage-2 / joint: full CPCV optimization ───────────────────────
-            study = run_optimization(
-                df=df,
-                tf=tf,
-                broker=broker,
-                account_size=balance,
-                n_trials=args.trials,
-                wfo_mode=wfo_mode,
-                n_jobs=args.n_jobs,
-                warm_start_stage1=(stage == "trading"),
-            )
+        # Unified single-stage CPCV pipeline for all TFs
+        if getattr(args, "reset_study", False):
+            from src.optimizer import get_optuna_storage_url, get_optuna_study_name
+            import os, pathlib
+            _db_path = pathlib.Path(get_optuna_storage_url(broker).replace("sqlite:///", ""))
+            if _db_path.exists():
+                logger.info("--reset_study: deleting %s", _db_path)
+                os.remove(_db_path)
+            else:
+                logger.info("--reset_study: no existing db at %s, skipping delete", _db_path)
+        study = run_optimization(
+            df=df,
+            tf=tf,
+            broker=broker,
+            account_size=balance,
+            n_trials=args.trials,
+            wfo_mode=wfo_mode,
+            n_jobs=args.n_jobs,
+        )
 
         print(f"\n=== Best Result [{tf}] ===")
         print(f"Score:         {study.best_value:.3f}")
@@ -358,6 +379,16 @@ def cmd_optimize(args):
         print("Best Params:")
         for k, v in study.best_params.items():
             print(f"  {k}: {v}")
+
+        from src.optimizer import get_optuna_storage_url, get_optuna_study_name
+        _db_url    = get_optuna_storage_url(broker)
+        _study_nm  = get_optuna_study_name(tf, broker)
+        print("\nOptuna live dashboard")
+        print(f"  Storage : {_db_url}")
+        print(f"  Study   : {_study_nm}")
+        print("  Run in another terminal:")
+        print(f"    optuna-dashboard {_db_url} --host 127.0.0.1 --port 8080")
+        print("  Then open: http://localhost:8080/")
 
         if tf == "M5":
             meta_path = _m5_meta_path(broker)
@@ -412,11 +443,11 @@ def cmd_train(args):
     arm = AdaptiveRiskManager(balance, broker=broker)
     cpcv_score = None
     try:
-        from src.optimizer import get_best_params as _gbp
-        _study = __import__("optuna").load_study(
-            study_name=None,
-            storage=f"sqlite:///models/study_{broker}.db",
-        )
+        import optuna as _optuna
+        from src.optimizer import get_optuna_storage_url, get_optuna_study_name
+        _storage   = get_optuna_storage_url(broker)
+        _study_nm  = get_optuna_study_name(tf, broker)
+        _study     = _optuna.load_study(study_name=_study_nm, storage=_storage)
         cpcv_score = _study.best_value
     except Exception:
         pass
@@ -1178,6 +1209,28 @@ def cmd_montecarlo(args):
         print("  [!] WARNING: 95th-pctl MaxDD >30% — sequence risk is elevated.")
 
 
+def _validate_h1_args(args) -> None:
+    """Fail-fast validation for H1 gate/floor CLI overrides.
+
+    Called before mode dispatch so invalid ranges produce a clear error rather
+    than a cryptic crash inside the optimizer or signal engine.
+    """
+    checks = [
+        ("h1_entry_prob",         0.50, 0.90,  "[0.50, 0.90]"),
+        ("h1_min_median_sharpe",  -1.0, 2.0,   "[-1.0, 2.0]"),
+        ("h1_min_median_pf",       0.5, 3.0,   "[0.5, 3.0]"),
+        ("h1_max_trades_per_100",  0.5, 20.0,  "[0.5, 20.0]"),
+    ]
+    for attr, lo, hi, rng in checks:
+        val = getattr(args, attr, None)
+        if val is not None and not (lo <= val <= hi):
+            print(
+                f"\nERROR: --{attr} {val} is out of valid range {rng}.\n"
+                f"Fix: pass a value within {rng} or omit the flag to use the default.\n"
+            )
+            sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Gold Regime X — Hybrid ML Trading System")
     parser.add_argument(
@@ -1225,15 +1278,39 @@ def main():
     parser.add_argument(
         "--stage", type=str, default=None, choices=["xgb", "trading"],
         help=(
-            "Two-stage optimisation mode for --mode optimize.\n"
-            "  xgb     : Stage-1 — fast single hold-out XGB exploration (no CPCV, ~5x faster).\n"
-            "            Saves best params to models/stage1_{tf}_{broker}.json.\n"
-            "  trading : Stage-2 — full CPCV optimization warm-started from Stage-1 params.\n"
-            "If omitted, runs the standard joint optimization (same as before)."
+            "[DEPRECATED] --stage is deprecated and ignored. "
+            "Unified single-stage CPCV optimization is always used. "
+            "Accepted for backward compatibility only."
         ),
+    )
+    # ── H1 profitability safeguards (override optimizer defaults) ─────────────
+    parser.add_argument(
+        "--h1_entry_prob", type=float, default=None,
+        help="H1 XGBoost entry probability gate override [0.50, 0.90] (default 0.575). "
+             "Passed as fixed override to live/demo; also primes the search range start for optimize.",
+    )
+    parser.add_argument(
+        "--h1_min_median_sharpe", type=float, default=None,
+        help="H1 minimum acceptable median CPCV Sharpe floor. Trials below are penalized. "
+             "Default 0.10. Valid range [-1.0, 2.0].",
+    )
+    parser.add_argument(
+        "--h1_min_median_pf", type=float, default=None,
+        help="H1 minimum acceptable median profit factor. Default 1.02. Valid range [0.5, 3.0].",
+    )
+    parser.add_argument(
+        "--h1_max_trades_per_100", type=float, default=None,
+        help="H1 maximum trades per 100 bars before turnover penalty fires. "
+             "Default 4.0. Valid range [0.5, 20.0].",
+    )
+    parser.add_argument(
+        "--reset_study", action="store_true", default=False,
+        help="Delete the Optuna study DB for the given broker before optimizing. "
+             "Required when the search space or feature set has changed.",
     )
 
     args = parser.parse_args()
+    _validate_h1_args(args)
     {
         "process":       cmd_process,
         "optimize":      cmd_optimize,

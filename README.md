@@ -274,7 +274,7 @@ python main.py --mode consolidate
 
 ### Phase 1 — Build and optimise the model
 
-Model optimisation uses a **two-stage workflow** for best results. Stage 1 is a fast XGB-only
+Model optimisation uses a **unified single-stage workflow**. A single
 exploration (∼5× faster, no CPCV) that saves the best params to `models/stage1_{tf}_{broker}.json`.
 Stage 2 runs the full CPCV optimization warm-started from those params. Both stages are safe to
 interrupt and resume. Run `--mode train` after both stages to commit the final model to disk.
@@ -289,7 +289,7 @@ python main.py --mode process --tf H1
 # === STAGE 1: Fast XGB Exploration (no CPCV, ~5x faster) ===
 # Explores the hyperparameter landscape with a single IS/OOS split.
 # Saves best params to models/stage1_h1_headway_cent.json.
-python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage xgb --trials 60
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 100
 
 # === STAGE 2: Full CPCV Optimization (warm-started from Stage 1) ===
 # Runs C(4,2)=6 CPCV path evaluation, seeded from Stage 1 params.
@@ -375,7 +375,7 @@ python main.py --mode wfa           --tf H1 --broker headway_cent --balance 15
 
 # If sync_validate fails or WFE < 50% — re-run the two-stage optimize + retrain:
 # Stage 1: re-run fast XGB exploration (resumes existing study, adds trials on top)
-python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage xgb --trials 60
+python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --trials 100
 # Stage 2: re-run full CPCV (warm-started from updated Stage 1 params)
 python main.py --mode optimize --tf H1 --broker headway_cent --balance 15 --stage trading --trials 130
 # Commit: retrain final model with new best params
@@ -421,7 +421,7 @@ python main.py --mode <MODE> [OPTIONS]
 | `--tf` | str | `H1` | Timeframe: `H1`, `M15`, `M5` (or comma-separated for `compare`/`guardian`) |
 | `--broker` | str | `standard` | `headway_cent` or `standard` |
 | `--balance` | float | 15 | Account size in **real USD** |
-| `--trials` | int | 250 | Total Optuna trial target (joint mode). Recommended joint: H1=400, M15=600, M5=1000. Two-stage: see `--stage` |
+| `--trials` | int | 250 | Total Optuna trial target. Recommended: H1=400, M15=600, M5=1000. |
 | `--stage` | str | `None` | Two-stage optimize: `xgb` = Stage 1 fast XGB exploration (no CPCV, ∼5× faster, saves `stage1_{tf}_{broker}.json`); `trading` = Stage 2 full CPCV warm-started from Stage 1. Omit to run standard joint optimization |
 | `--period` | str | `3m` | Lookback for MT5 sync: `3m`, `6m`, `12m` |
 | `--interval` | int | 3600 | Guardian check interval in seconds |
@@ -887,7 +887,101 @@ The 0.20 multiplier (up from 0.15) aligns with the wider score range (−5 to +5
 | M5 activity bonus | OOS trades > 300 → score × 1.2; OOS trades < 150 → score × 0.5 |
 | n_states restriction | All TFs: `{3, 4}` |
 | No threshold search | SignalEngine thresholds are hardcoded TF constants — not Optuna parameters |
-| Per-broker study isolation | `study_headway_cent.db` and `study_standard.db` never interfere |
+| Per-broker study isolation | All TF studies for a broker are colocated in `study_{broker}.db` (e.g. `study_headway_cent.db`). Use `optuna-dashboard sqlite:///models/study_headway_cent.db` to view all active studies. |
+
+---
+
+## Canonical Regime Contract
+
+All timeframes (H1, M15, M5) use **exactly 3 HMM states**. This is a hard architectural invariant, not a tunable parameter.
+
+| ID | Label | Trading Allowed |
+|----|-------|----------------|
+| 0  | `TREND` | Yes |
+| 1  | `MEAN_REVERSION` | No (strict no-trade) |
+| 2  | `VOLATILITY_SHOCK` | Yes |
+
+### Enforcement layers
+
+1. **`optimizer.py`** — `n_states` is never suggested by Optuna. It is pinned to `3` unconditionally for H1, M15, and M5. `SEARCH_SPACES[tf]["n_states"]` records `(3, 3, "int")`. `_enforce_three_states(params, context)` raises `ValueError` at every `fit_hmm` call site.
+2. **`main.py` / `optimizer.py` `resolve_n_states`** — any call with `n_states != 3` raises `ValueError` immediately with a descriptive message.
+3. **`engine_hmm.py`** — `_assert_canonical_states(states, context)` is called after `fit_hmm` and `predict_states`. If any state id outside `{0,1,2}` is found a `RuntimeError` is raised. `_log_transition_matrix` always renders a 3×3 matrix with semantic labels (never numeric fallback columns).
+4. **`engine_xgb.py`** — `_validate_state_feature_schema(df, tf)` is called inside `prepare_features`. For H1 it requires `hmm_state` and forbids `state_3`. For M15/M5 it requires `state_0`, `state_1`, `state_2` and forbids `state_3`.
+
+### Rejected inputs
+
+- `n_states=4` or `n_states=5`: `ValueError` at `resolve_n_states` / `_enforce_three_states`
+- Any HMM producing state id 3+: `RuntimeError` at `_assert_canonical_states`
+- Feature matrix with `state_3` column: `ValueError` at `_validate_state_feature_schema`
+
+### Legacy note
+
+Legacy 4/5-state trials may exist in a resumed Optuna study from before this patch. They do not affect new trials (all new fits use `n_states=3`). The `_assert_canonical_states` guard ensures that if a legacy model file is loaded and somehow predicts state 3, it is caught immediately at inference time.
+
+---
+
+## H1 Profitability Safeguards
+
+H1 is scored with additional hard-floor penalties and a tunable entry-gate to reduce persistent negative Sharpe trials while preserving CPCV robustness.
+
+### Hard-Floor Penalties
+
+Three floors are checked per CPCV path aggregation. A breach applies `penalty = 10.0 + (floor − metric) × 10.0`:
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `h1_min_median_sharpe` | `0.10` | Median CPCV Sharpe must exceed this |
+| `h1_min_median_expectancy` | `0.0` | Median per-trade expectancy ($) must exceed this |
+| `h1_min_median_pf` | `1.02` | Median profit factor must exceed this |
+
+Reason codes such as `floor_sharpe:0.032<0.100` appear in the structured trial log:
+
+```
+trial=7 tf=H1 base=0.1812 p_var=0.0000 p_inst=0.0000 p_dd=0.0000 p_mr=0.0000 p_floor=12.3200 p_turn=0.0000 final=-12.1388 reasons=floor_sharpe:0.032<0.100|floor_pf:0.98<1.02
+```
+
+### Turnover Penalty
+
+Excessive H1 trade churn (measured as trades per 100 bars across CPCV test windows) is penalised:
+
+| Param | Default | Meaning |
+|-------|---------|---------|
+| `h1_max_trades_per_100` | `4.0` | Trades per 100 bars before penalty fires |
+
+Penalty scales linearly: `(trades_per_100 − max) × 2.0`. Not applied on M15/M5.
+
+### Tunable Entry Gate
+
+H1 entry uses a tunable probability threshold for the XGBoost regime classifier. During optimization, `h1_entry_prob` is an Optuna parameter (range `[0.57, 0.66]`). In live/demo mode it can be overridden at the CLI:
+
+```bash
+# Run optimization with custom floor overrides
+python main.py --mode optimize --tf H1 --broker headway_cent --trials 200 \
+    --h1_min_median_sharpe 0.12 \
+    --h1_min_median_pf 1.05 \
+    --h1_max_trades_per_100 3.5
+
+# Run demo with fixed entry gate override
+python main.py --mode demo --tf H1 --broker headway_cent \
+    --h1_entry_prob 0.62
+```
+
+### CLI Reference
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--h1_entry_prob` | float | `0.575` | XGBoost entry probability gate for H1. Range `[0.50, 0.90]`. |
+| `--h1_min_median_sharpe` | float | `0.10` | H1 Sharpe floor. Range `[-1.0, 2.0]`. |
+| `--h1_min_median_pf` | float | `1.02` | H1 profit-factor floor. Range `[0.5, 3.0]`. |
+| `--h1_max_trades_per_100` | float | `4.0` | H1 max trades/100 bars. Range `[0.5, 20.0]`. |
+
+All flags are validated at startup — out-of-range values exit immediately with a descriptive message.
+
+### Asymmetric Buy/Sell Thresholds (advanced)
+
+For programmatic use (not CLI), pass `h1_entry_prob_buy` and `h1_entry_prob_sell` separately via `evaluator_config` in `vectorized_backtest`. Both are clamped to `[0.50, 0.90]`.
+
+---
 | CPCV per trial | Every Optuna trial evaluates all C(4,2)=6 combinatorial purged paths — not a single IS/OOS split; `CPCV_MAX_FLOAT_DD=0.20` prunes paths with > 20% floating DD |
 | OOS scaler consistency | OOS features are always scaled with the IS-fitted scaler (no data leakage) |
 | State alignment | `states_oos` and `states_is_cv` are re-aligned to `df_aligned.index` after NaN drops |
@@ -924,6 +1018,7 @@ STAGE1_TRIALS = {"H1": 60, "M15": 100, "M5": 150}
 >
 > ```bash
 > del models\study_headway_cent.db
+> del models\study_headway_cent_h1.db   # legacy per-TF DB if it exists
 > del models\study_standard.db
 > ```
 

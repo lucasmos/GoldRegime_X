@@ -40,6 +40,25 @@ STATE_NAMES_3 = STATE_NAMES
 STATE_NAMES_2 = {0: REGIME_TREND, 1: REGIME_MR}
 STATE_NAMES_4 = {0: REGIME_TREND, 1: REGIME_MR, 2: REGIME_SHOCK, 3: REGIME_SHOCK}
 
+# ── Canonical-state contract enforcement ──────────────────────────────────────
+_CANONICAL_STATE_IDS: frozenset = frozenset({0, 1, 2})
+
+
+def _assert_canonical_states(states: np.ndarray, context: str) -> None:
+    """Raise if any state id is outside {0, 1, 2}.
+
+    Call this after every fit_hmm / predict_states so 4-state drift cannot
+    propagate silently into features, backtest, or trial scoring.
+    """
+    uniq = sorted({int(x) for x in np.asarray(states).tolist()})
+    bad = [u for u in uniq if u not in _CANONICAL_STATE_IDS]
+    if bad:
+        raise RuntimeError(
+            f"{context}: non-canonical state ids detected: {bad}. "
+            f"Only {{0=TREND, 1=MEAN_REVERSION, 2=VOLATILITY_SHOCK}} are allowed. "
+            f"All unique ids found: {uniq}."
+        )
+
 # ── Regime classification thresholds (applied to StandardScaler-normalised stats) ─
 # vol_mean:    means_[i, 1] — normalised average volatility of state i.
 # ret_disp:    sqrt(covars_[i, 0, 0]) — normalised std of return feature.
@@ -215,25 +234,32 @@ def _save_regime_diagnostics(
 
 def _log_transition_matrix(model: GaussianHMM, state_names: dict):
     n = model.n_components
+    if n != 3:
+        raise RuntimeError(
+            f"_log_transition_matrix: expected 3 states, got {n}. "
+            f"Canonical contract requires exactly TREND/MEAN_REVERSION/VOLATILITY_SHOCK."
+        )
+    # Always log in canonical order 0→1→2 with semantic labels — never numeric fallback.
+    _labels = [STATE_NAMES.get(j, f"UNKNOWN_{j}") for j in range(n)]
     logger.info("Transition Matrix:")
-    header = "         " + "  ".join(f"{state_names.get(j, str(j)):>8}" for j in range(n))
+    header = "         " + "  ".join(f"{lbl:>16}" for lbl in _labels)
     logger.info(header)
     for i in range(n):
-        row = f"{state_names.get(i, str(i)):>8} " + "  ".join(
+        row = f"{_labels[i]:>16} " + "  ".join(
             f"{model.transmat_[i, j]:8.4f}" for j in range(n)
         )
         logger.info(row)
         if model.transmat_[i, i] < 0.85:
             logger.warning(
                 "State %s persistence %.3f < 0.85 -- consider higher Kalman smoothing",
-                state_names.get(i, str(i)), model.transmat_[i, i],
+                _labels[i], model.transmat_[i, i],
             )
 
     logger.info("State means (scaled: kalman_return, volatility, rsi_slope):")
     for i in range(n):
         logger.info(
             "  %s: return=%.6f, vol=%.6f, rsi_slope=%.6f",
-            state_names.get(i, str(i)), model.means_[i, 0], model.means_[i, 1], model.means_[i, 2],
+            _labels[i], model.means_[i, 0], model.means_[i, 1], model.means_[i, 2],
         )
 
 
@@ -325,6 +351,8 @@ def fit_hmm(
     raw_states = model.predict(X)
 
     states, state_names, remap = _classify_hmm_states(model, raw_states, n_states)
+    # Enforce canonical contract: no state id outside {0,1,2} is allowed.
+    _assert_canonical_states(states, f"fit_hmm[{tf}]")
     # Store the remap on the model so predict_states can reproduce IS labels exactly.
     model._regime_remap = remap
 
@@ -390,6 +418,7 @@ def predict_states(model: GaussianHMM, df: pd.DataFrame, tf: str = "H1") -> np.n
     if len(states) >= kernel:
         states = medfilt(states.astype(np.float64), kernel_size=kernel).astype(np.int32)
 
+    _assert_canonical_states(states, f"predict_states[{tf}]")
     return states
 
 
