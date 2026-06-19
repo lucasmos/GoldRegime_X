@@ -126,16 +126,18 @@ def _classify_hmm_states(
         }
 
     def _classify_state(stats: dict) -> str:
-        if (
-            stats["persistence"] >= _TREND_PERSIST
-            and stats["entropy"] <= _TREND_ENTROPY
-        ):
-            return REGIME_TREND
+        # Evaluate SHOCK first: volatility-shock regimes can still be very
+        # persistent, so TREND-first logic can collapse all states into TREND.
         if (
             stats["volatility"] >= _SHOCK_VOL_THR
             or stats["ret_disp"] >= _SHOCK_DISP_THR
         ):
             return REGIME_SHOCK
+        if (
+            stats["persistence"] >= _TREND_PERSIST
+            and stats["entropy"] <= _TREND_ENTROPY
+        ):
+            return REGIME_TREND
         return REGIME_MR
 
     assigned: dict[int, str] = {i: _classify_state(per_state[i]) for i in range(n_states)}
