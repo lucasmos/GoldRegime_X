@@ -32,3 +32,5 @@ mql5/*.ex5
 # IDE
 .vscode/settings.json
 .idea/
+nul
+.kilo/
