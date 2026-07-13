@@ -1,82 +1,85 @@
 # Explorer Audit
 
 * File: `pipeline_verification_bundle\GoldRegimeX_Explorer_fixed.ipynb`
-* Total cells: 58
+* Total cells: 61
 
 ## Stage → Cell map (execution order proxy)
 
-* **Candidate Generation**: 8, 19, 26, 27, 28, 29, 30, 33, 34, 35, 40, 41, 42, 43, 44, 55, 56
-* **Feature Engineering**: 5, 9, 15, 19, 20, 27, 29, 33, 39, 43, 49, 51, 53
-* **Triple Barrier Method**: 5, 20, 28, 32, 33, 39, 40, 43, 46, 49, 55
-* **Session Filtering**: 5, 6, 8, 19, 20, 21, 22, 27, 28, 30, 46, 47, 48, 52, 55, 56
-* **HMM**: 1, 2, 5, 7, 8, 11, 15, 17, 18, 19, 20, 21, 22, 23, 27, 28, 29, 30, 32, 33, 35, 37, 39, 40, 42, 43, 44, 46, 50, 55
-* **XGBoost**: 1, 7, 24, 28, 29, 32, 33, 38, 39, 40, 43, 44, 46, 50, 51
-* **Probability threshold**: 17, 24, 29, 36, 42, 43
-* **Risk Manager**: 1, 19, 22, 28, 32, 33, 43
-* **Execution**: 1, 8, 9, 15, 19, 21, 22, 24, 27, 28, 29, 30, 33, 35, 41, 42, 43, 53, 55
+* **Candidate Generation**: 10, 21, 28, 29, 30, 31, 32, 35, 36, 37, 42, 43, 44, 45, 46, 57, 58
+* **Feature Engineering**: 7, 11, 17, 21, 22, 29, 31, 35, 41, 45, 51, 53, 55
+* **Triple Barrier Method**: 7, 22, 30, 34, 35, 41, 42, 45, 48, 51, 57
+* **Session Filtering**: 1, 2, 7, 8, 10, 21, 22, 23, 24, 29, 30, 32, 48, 49, 50, 54, 57, 58
+* **HMM**: 3, 4, 7, 9, 10, 13, 17, 19, 20, 21, 22, 23, 24, 25, 29, 30, 31, 32, 34, 35, 37, 39, 41, 42, 44, 45, 46, 48, 52, 57
+* **XGBoost**: 3, 9, 26, 30, 31, 34, 35, 40, 41, 42, 45, 46, 48, 52, 53
+* **Probability threshold**: 19, 26, 31, 38, 44, 45
+* **Risk Manager**: 3, 21, 24, 30, 34, 35, 45
+* **Execution**: 3, 10, 11, 17, 21, 23, 24, 26, 29, 30, 31, 32, 35, 37, 43, 44, 45, 55, 57
 
 ## Per-cell summary
 
 | Cell | Type | Stages | Defined | First line |
 | ---: | ---- | ------ | ------- | ---------- |
 | 0 | markdown |  |  | `# GoldRegime X - Iteration 2: Fast Sensitivity Plateau Lab (M5/M15)` |
-| 1 | code | HMM, XGBoost, Risk Manager, Execution | _here, _project_root, _project_root_str, _prev_py_path | `import os` |
-| 2 | code | HMM | RANDOM_STATE, EXEC_TF, TREND_TF, INITIAL_BALANCE_CENTS, SPREAD_CAP_POINTS, STOP_LOSS_PIPS… | `# -----------------------------` |
-| 3 | code |  | load_optimized_strategies, ML_TARGET_PARAMS | `# ---------------------------------------------------------` |
-| 4 | code |  | _normalize_ohlcv, read_xau_raw, read_mt4_csv, read_master_close, load_panel | `# -----------------------------` |
-| 5 | code | Feature Engineering, Triple Barrier Method, Session Filtering, HMM | ema, true_range, atr, rsi, adx, synth_vix_zscore… | `# ---------------------------------------------------------` |
-| 6 | code | Session Filtering | CPCVPurgedEmbargo | `# -----------------------------` |
-| 7 | code | HMM, XGBoost | HMMXGBComposite | `# -----------------------------` |
-| 8 | code | Candidate Generation, Session Filtering, HMM, Execution | POSITION_A, POSITION_B, LEG_C_ATR_STOP, LEG_C_ATR_TARGET, PIP_SIZE_PRICE, PIP_VALUE_CENTS_PER_1LOT… | `# -----------------------------` |
-| 9 | code | Feature Engineering, Execution | _empty_combo_result, _ML_FOLD_CACHE, _get_or_compute_ml_folds, evaluate_combo_cpcv, run_grid_parallel | `# -----------------------------` |
-| 10 | code |  | build_coarse_grid, build_refined_grid_from_top, plot_plateau_heatmaps, select_plateau_center | `# -----------------------------` |
-| 11 | code | HMM | m5_is, m5_oos, split_time, m15_all_sorted, m5_train, m5_oos… | `# -----------------------------` |
-| 12 | code |  | coarse_grid, coarse_results_dict, coarse_results | `# -----------------------------` |
-| 13 | code |  | fine_results_dict, fine_results | `# -----------------------------` |
-| 14 | code |  |  | `# -----------------------------` |
-| 15 | code | Feature Engineering, HMM, Execution | _safe_float, _safe_int, _normalize_metrics, train_ml_model, evaluate_ml_model, _select_center_with_fallback… | `# -----------------------------` |
-| 16 | code |  | run_mode_v2, all_rows, trades_by_mode, dual_tf_summary, dual_tf_summary | `# -----------------------------` |
-| 17 | code | HMM, Probability threshold |  | `# -----------------------------` |
-| 18 | code | HMM | ProductionRiskCircuitBreaker | `# -----------------------------` |
-| 19 | code | Candidate Generation, Feature Engineering, Session Filtering, HMM, Risk Manager, Execution | diagnostics, candidate_reports, PipelineFunnel, FeatureLossAudit, RejectionBreakdown | `# ============================================================` |
-| 20 | code | Feature Engineering, Triple Barrier Method, Session Filtering, HMM | _count_after_dropna, build_features_with_trace | `# ============================================================` |
-| 21 | code | Session Filtering, HMM, Execution | generate_signals_diagnostic, diagnostic_signal_trace | `# ============================================================` |
-| 22 | code | Session Filtering, HMM, Risk Manager, Execution | diagnostic_backtest_trace | `# ============================================================` |
-| 23 | code | HMM | hmm_diagnostics | `# ============================================================` |
-| 24 | code | XGBoost, Probability threshold, Execution | probability_distribution, threshold_sensitivity | `# ============================================================` |
-| 25 | code |  | calibration_metrics | `# ============================================================` |
-| 26 | code | Candidate Generation | compare_strategy_tester_signals | `# ============================================================` |
-| 27 | code | Candidate Generation, Feature Engineering, Session Filtering, HMM, Execution | all_diagnostics | `# ============================================================` |
-| 28 | code | Candidate Generation, Triple Barrier Method, Session Filtering, HMM, XGBoost, Risk Manager, Execution | print_funnel, print_labels, print_hmm, print_prob_dist, print_thresh_sens, print_feature_audit… | `# ============================================================` |
-| 29 | code | Candidate Generation, Feature Engineering, HMM, XGBoost, Probability threshold, Execution | build_comparison_table, comp, reference_tf, target_tf, ref, tgt… | `# ============================================================` |
-| 30 | code | Candidate Generation, Session Filtering, HMM, Execution | comp | `# ============================================================` |
-| 31 | markdown |  |  | `## Traceability Layer (Added)` |
-| 32 | code | Triple Barrier Method, HMM, XGBoost, Risk Manager | CandidateTrade, make_candidate_id, parameter_set_id, RejectionReason | `# ============================================================` |
-| 33 | code | Candidate Generation, Feature Engineering, Triple Barrier Method, HMM, XGBoost, Risk Manager, Execution | PipelineProfiler, PIPELINE_STAGES, profiler | `# ============================================================` |
-| 34 | code | Candidate Generation | attach_candidate_ids, assert_candidate_id_preserved | `# ============================================================` |
-| 35 | code | Candidate Generation, HMM, Execution | run_ml_filtered_backtest_traced | `# ============================================================` |
-| 36 | code | Probability threshold | probability_diagnostics_full, probability_drift_report | `# ============================================================` |
-| 37 | code | HMM | hmm_diagnostics_v2 | `# ============================================================` |
-| 38 | code | XGBoost | calibration_metrics_v2 | `# ============================================================` |
-| 39 | code | Feature Engineering, Triple Barrier Method, HMM, XGBoost | get_candidate_lifecycle | `# ============================================================` |
-| 40 | code | Candidate Generation, Triple Barrier Method, HMM, XGBoost | build_st_explorer_consistency_table | `# ============================================================` |
-| 41 | code | Candidate Generation, Execution | build_timeframe_report | `# ============================================================` |
-| 42 | code | Candidate Generation, HMM, Probability threshold, Execution | RootCauseAnalyzer | `# ============================================================` |
-| 43 | code | Candidate Generation, Feature Engineering, Triple Barrier Method, HMM, XGBoost, Probability threshold, Risk Manager, Execution | all_diag_v2, all_candidates_by_tf | `# ============================================================` |
-| 44 | code | Candidate Generation, HMM, XGBoost | drift_df, consistency_table, timeframe_report, rca, thresholds_by_tf, root_cause_df | `# ============================================================` |
-| 45 | markdown |  |  | `## Pipeline Verification & Certification (Added)` |
-| 46 | code | Triple Barrier Method, Session Filtering, HMM, XGBoost | VERIFY_PIPELINE | `# ============================================================` |
-| 47 | code | Session Filtering |  | `# ============================================================` |
-| 48 | code | Session Filtering |  | `# ============================================================` |
-| 49 | code | Feature Engineering, Triple Barrier Method |  | `# ============================================================` |
-| 50 | code | HMM, XGBoost |  | `# ============================================================` |
-| 51 | code | Feature Engineering, XGBoost |  | `# ============================================================` |
-| 52 | code | Session Filtering |  | `# ============================================================` |
-| 53 | code | Feature Engineering, Execution |  | `# ============================================================` |
-| 54 | code |  |  | `# ============================================================` |
-| 55 | code | Candidate Generation, Triple Barrier Method, Session Filtering, HMM, Execution |  | `# ============================================================` |
-| 56 | code | Candidate Generation, Session Filtering |  | `# ============================================================` |
-| 57 | code |  |  | `# ============================================================` |
+| 1 | code | Session Filtering | OBS_OUTPUT_DIR, obs, logger, model_uuid_tracker, pipeline_manifest | `# --- Pipeline Observability init (tag: pipeline_observability_v1) --------` |
+| 2 | code | Session Filtering | _manifest_path | `# --- Pipeline Manifest validation (tag: pipeline_observability_v1) -------` |
+| 3 | code | HMM, XGBoost, Risk Manager, Execution | _here, _project_root, _project_root_str, _prev_py_path | `import os` |
+| 4 | code | HMM | RANDOM_STATE, EXEC_TF, TREND_TF, INITIAL_BALANCE_CENTS, SPREAD_CAP_POINTS, STOP_LOSS_PIPS… | `# -----------------------------` |
+| 5 | code |  | load_optimized_strategies, ML_TARGET_PARAMS | `# ---------------------------------------------------------` |
+| 6 | code |  | _normalize_ohlcv, read_xau_raw, read_mt4_csv, read_master_close, load_panel | `# -----------------------------` |
+| 7 | code | Feature Engineering, Triple Barrier Method, Session Filtering, HMM | ema, true_range, atr, rsi, adx, synth_vix_zscore… | `# ---------------------------------------------------------` |
+| 8 | code | Session Filtering | CPCVPurgedEmbargo | `# -----------------------------` |
+| 9 | code | HMM, XGBoost | HMMXGBComposite | `# -----------------------------` |
+| 10 | code | Candidate Generation, Session Filtering, HMM, Execution | POSITION_A, POSITION_B, LEG_C_ATR_STOP, LEG_C_ATR_TARGET, PIP_SIZE_PRICE, PIP_VALUE_CENTS_PER_1LOT… | `# -----------------------------` |
+| 11 | code | Feature Engineering, Execution | _empty_combo_result, _ML_FOLD_CACHE, _get_or_compute_ml_folds, evaluate_combo_cpcv, run_grid_parallel | `# -----------------------------` |
+| 12 | code |  | build_coarse_grid, build_refined_grid_from_top, plot_plateau_heatmaps, select_plateau_center | `# -----------------------------` |
+| 13 | code | HMM | m5_is, m5_oos, split_time, m15_all_sorted, m5_train, m5_oos… | `# -----------------------------` |
+| 14 | code |  | coarse_grid, coarse_results_dict, coarse_results | `# -----------------------------` |
+| 15 | code |  | fine_results_dict, fine_results | `# -----------------------------` |
+| 16 | code |  |  | `# -----------------------------` |
+| 17 | code | Feature Engineering, HMM, Execution | _safe_float, _safe_int, _normalize_metrics, train_ml_model, evaluate_ml_model, _select_center_with_fallback… | `# -----------------------------` |
+| 18 | code |  | run_mode_v2, all_rows, trades_by_mode, dual_tf_summary, dual_tf_summary | `# -----------------------------` |
+| 19 | code | HMM, Probability threshold |  | `# -----------------------------` |
+| 20 | code | HMM | ProductionRiskCircuitBreaker | `# -----------------------------` |
+| 21 | code | Candidate Generation, Feature Engineering, Session Filtering, HMM, Risk Manager, Execution | diagnostics, candidate_reports, PipelineFunnel, FeatureLossAudit, RejectionBreakdown | `# ============================================================` |
+| 22 | code | Feature Engineering, Triple Barrier Method, Session Filtering, HMM | _count_after_dropna, build_features_with_trace | `# ============================================================` |
+| 23 | code | Session Filtering, HMM, Execution | generate_signals_diagnostic, diagnostic_signal_trace | `# ============================================================` |
+| 24 | code | Session Filtering, HMM, Risk Manager, Execution | diagnostic_backtest_trace | `# ============================================================` |
+| 25 | code | HMM | hmm_diagnostics | `# ============================================================` |
+| 26 | code | XGBoost, Probability threshold, Execution | probability_distribution, threshold_sensitivity | `# ============================================================` |
+| 27 | code |  | calibration_metrics | `# ============================================================` |
+| 28 | code | Candidate Generation | compare_strategy_tester_signals | `# ============================================================` |
+| 29 | code | Candidate Generation, Feature Engineering, Session Filtering, HMM, Execution | all_diagnostics | `# ============================================================` |
+| 30 | code | Candidate Generation, Triple Barrier Method, Session Filtering, HMM, XGBoost, Risk Manager, Execution | print_funnel, print_labels, print_hmm, print_prob_dist, print_thresh_sens, print_feature_audit… | `# ============================================================` |
+| 31 | code | Candidate Generation, Feature Engineering, HMM, XGBoost, Probability threshold, Execution | build_comparison_table, comp, reference_tf, target_tf, ref, tgt… | `# ============================================================` |
+| 32 | code | Candidate Generation, Session Filtering, HMM, Execution | comp | `# ============================================================` |
+| 33 | markdown |  |  | `## Traceability Layer (Added)` |
+| 34 | code | Triple Barrier Method, HMM, XGBoost, Risk Manager | CandidateTrade, make_candidate_id, parameter_set_id, RejectionReason | `# ============================================================` |
+| 35 | code | Candidate Generation, Feature Engineering, Triple Barrier Method, HMM, XGBoost, Risk Manager, Execution | PipelineProfiler, PIPELINE_STAGES, profiler | `# ============================================================` |
+| 36 | code | Candidate Generation | attach_candidate_ids, assert_candidate_id_preserved | `# ============================================================` |
+| 37 | code | Candidate Generation, HMM, Execution | run_ml_filtered_backtest_traced | `# ============================================================` |
+| 38 | code | Probability threshold | probability_diagnostics_full, probability_drift_report | `# ============================================================` |
+| 39 | code | HMM | hmm_diagnostics_v2 | `# ============================================================` |
+| 40 | code | XGBoost | calibration_metrics_v2 | `# ============================================================` |
+| 41 | code | Feature Engineering, Triple Barrier Method, HMM, XGBoost | get_candidate_lifecycle | `# ============================================================` |
+| 42 | code | Candidate Generation, Triple Barrier Method, HMM, XGBoost | build_st_explorer_consistency_table | `# ============================================================` |
+| 43 | code | Candidate Generation, Execution | build_timeframe_report | `# ============================================================` |
+| 44 | code | Candidate Generation, HMM, Probability threshold, Execution | RootCauseAnalyzer | `# ============================================================` |
+| 45 | code | Candidate Generation, Feature Engineering, Triple Barrier Method, HMM, XGBoost, Probability threshold, Risk Manager, Execution | all_diag_v2, all_candidates_by_tf | `# ============================================================` |
+| 46 | code | Candidate Generation, HMM, XGBoost | drift_df, consistency_table, timeframe_report, rca, thresholds_by_tf, root_cause_df | `# ============================================================` |
+| 47 | markdown |  |  | `## Pipeline Verification & Certification (Added)` |
+| 48 | code | Triple Barrier Method, Session Filtering, HMM, XGBoost | VERIFY_PIPELINE | `# ============================================================` |
+| 49 | code | Session Filtering |  | `# ============================================================` |
+| 50 | code | Session Filtering |  | `# ============================================================` |
+| 51 | code | Feature Engineering, Triple Barrier Method |  | `# ============================================================` |
+| 52 | code | HMM, XGBoost |  | `# ============================================================` |
+| 53 | code | Feature Engineering, XGBoost |  | `# ============================================================` |
+| 54 | code | Session Filtering |  | `# ============================================================` |
+| 55 | code | Feature Engineering, Execution |  | `# ============================================================` |
+| 56 | code |  |  | `# ============================================================` |
+| 57 | code | Candidate Generation, Triple Barrier Method, Session Filtering, HMM, Execution |  | `# ============================================================` |
+| 58 | code | Candidate Generation, Session Filtering |  | `# ============================================================` |
+| 59 | code |  |  | `# ============================================================` |
+| 60 | code |  | _uuid_report, _integrity, _result | `# --- Pipeline Observability finalize (tag: pipeline_observability_v1) ----` |
 
 ## Inputs / Outputs / Shared / Exported (heuristic)
 
@@ -141,6 +144,7 @@
 * `MAX_POSITIONS_PER_CYCLE`
 * `ML_TARGET_PARAMS`
 * `N_JOBS`
+* `OBS_OUTPUT_DIR`
 * `PIPELINE_STAGES`
 * `PIP_SIZE_PRICE`
 * `PIP_VALUE_CENTS_PER_1LOT`
@@ -170,16 +174,20 @@
 * `_empty_combo_result`
 * `_get_or_compute_ml_folds`
 * `_here`
+* `_integrity`
+* `_manifest_path`
 * `_normalize_metrics`
 * `_normalize_ohlcv`
 * `_prev_py_path`
 * `_project_root`
 * `_project_root_str`
+* `_result`
 * `_run_backtest_numba`
 * `_safe_float`
 * `_safe_int`
 * `_select_center_with_fallback`
 * `_triple_barrier_numba`
+* `_uuid_report`
 * `add_session_features`
 * `adx`
 * `all_candidates_by_tf`
@@ -225,6 +233,7 @@
 * `hmm_occ`
 * `load_optimized_strategies`
 * `load_panel`
+* `logger`
 * `m15_all`
 * `m15_all_sorted`
 * `m15_loss`
@@ -236,11 +245,14 @@
 * `m5_oos`
 * `m5_train`
 * `make_candidate_id`
+* `model_uuid_tracker`
 * `neg`
 * `neu`
+* `obs`
 * `parameter_set_id`
 * `pct_lost`
 * `pipeline`
+* `pipeline_manifest`
 * `plot_plateau_heatmaps`
 * `pos`
 * `print_calibration`
