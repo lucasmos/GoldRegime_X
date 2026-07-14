@@ -33,3 +33,25 @@ mql5/*.ex5
 .idea/
 nul
 .kilo/
+
+# Too large for GitHub (>100 MB hard limit)
+pipeline_verification_bundle/reports/candidate_portfolios.json
+pipeline_verification_bundle/reports/candidate_portfolios.json
+pipeline_verification_bundle/reports/candidate_trades_export.csv
+pipeline_verification_bundle/reports/candidate_trades_export.csv
+
+# Also exclude any regenerated copies with size suffixes / timestamps
+**/candidate_portfolios*.json
+**/candidate_trades_export*.csv
+
+cd C:\GoldRegime_X
+
+@"
+
+# --- Files >100 MB that GitHub rejects ---
+pipeline_verification_bundle/reports/candidate_portfolios.json
+pipeline_verification_bundle/reports/candidate_trades_export.csv
+"@ | Add-Content -Path .gitignore -Encoding UTF8
+
+git add .gitignore
+git commit -m "Ignore files exceeding GitHub 100MB limit"
