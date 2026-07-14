@@ -187,17 +187,29 @@ class CandidateLedger:
     """Per-timeframe collection of CandidateTrace instances, keyed by candidate_id."""
 
     def __init__(self) -> None:
-        self._traces: Dict[Tuple[str, int], CandidateTrace] = {}
+        self._traces: Dict[Tuple[str, str], CandidateTrace] = {}
 
-    def _key(self, tf: str, cid: int) -> Tuple[str, int]:
-        return (str(tf).upper(), int(cid))
+    def _key(self, tf: str, cid: Any) -> Tuple[str, str]:
+        # Accept int, str, UUID, hash-hex, etc. -- coerce to str so hex IDs
+        # produced by upstream traceability layers do not raise.
+        return (str(tf).upper(), str(cid))
 
-    def create(self, cid: int, tf: str, timestamp, strategy: str) -> CandidateTrace:
+    @staticmethod
+    def _coerce_cid(cid: Any) -> Any:
+        """Preserve int type when possible, otherwise keep the original object."""
+        if isinstance(cid, (int, np.integer)) and not isinstance(cid, bool):
+            return int(cid)
+        try:
+            return int(cid)
+        except (TypeError, ValueError):
+            return cid  # e.g. hex-string candidate ID
+
+    def create(self, cid: Any, tf: str, timestamp, strategy: str) -> CandidateTrace:
         k = self._key(tf, cid)
         if k in self._traces:
             return self._traces[k]
         tr = CandidateTrace(
-            candidate_id=int(cid),
+            candidate_id=self._coerce_cid(cid),
             timeframe=str(tf).upper(),
             timestamp=pd.Timestamp(timestamp),
             strategy=str(strategy),
@@ -240,17 +252,14 @@ class CandidateLedger:
     def record_stage(self, cid: Any, tf: str, stage: str,
                      passed: bool, reason: str = "") -> CandidateTrace:
         """Mark a stage as passed/failed on the trace and populate rejection info."""
-        # Coerce cid to int if possible (matches internal key type).
-        try:
-            cid_i = int(cid)
-        except Exception:
-            cid_i = hash(str(cid)) & 0x7fffffff
+        # Preserve the original ID type (int stays int, hex-string stays str).
+        cid_stored = self._coerce_cid(cid)
         tf_u = str(tf).upper()
-        k = self._key(tf_u, cid_i)
+        k = self._key(tf_u, cid_stored)
         tr = self._traces.get(k)
         if tr is None:
             tr = CandidateTrace(
-                candidate_id=cid_i, timeframe=tf_u,
+                candidate_id=cid_stored, timeframe=tf_u,
                 timestamp=pd.Timestamp.utcnow(), strategy="unknown",
             )
             self._traces[k] = tr
@@ -288,7 +297,7 @@ class DecisionLog:
         strategy: str = "",
     ) -> None:
         self._rows.append({
-            "candidate_id": int(candidate_id),
+            "candidate_id": CandidateLedger._coerce_cid(candidate_id),
             "timeframe": str(timeframe).upper(),
             "stage": str(stage),
             "decision": str(decision).upper(),
@@ -688,7 +697,7 @@ def session_audit_frame(
     rows: List[Dict[str, Any]] = []
     for _, r in sess.iterrows():
         tf = r["timeframe"]
-        cid = int(r["candidate_id"])
+        cid = CandidateLedger._coerce_cid(r["candidate_id"])
         trace = ledger.get(cid, tf)
         ts = pd.Timestamp(trace.timestamp) if trace is not None else pd.Timestamp(r["timestamp"])
         try:
@@ -755,7 +764,9 @@ def explain_lost_trades(
     # A candidate is "lost" if it did not reach the Executed stage.
     lost = [t for t in traces if not t.executed]
     # Preserve generation order (by timestamp then id).
-    lost.sort(key=lambda t: (pd.Timestamp(t.timestamp), t.candidate_id))
+    # Sort key must be type-uniform: mixed int/str candidate IDs would raise
+    # TypeError('<' not supported between instances of 'int' and 'str').
+    lost.sort(key=lambda t: (pd.Timestamp(t.timestamp), str(t.candidate_id)))
     lost = lost[:int(limit)]
 
     def _fmt_stage(passed: bool, stage: str, rejected_at: Optional[str]) -> str:
@@ -777,7 +788,7 @@ def explain_lost_trades(
         else:
             prob_line = "Probability: Not Evaluated"
         lines.append(
-            "Candidate %d\n"
+            "Candidate %s\n"
             "  Strategy: %s\n"
             "  Time: %s\n"
             "  Session: %s\n"
@@ -926,7 +937,7 @@ class PipelineObservability:
         # Enforce: rejection => exactly one reason (Phase 2 rule).
         if not passed and not reason:
             raise ValueError(
-                "Rejection at stage %r requires an explicit reason (candidate=%d, tf=%s)."
+                "Rejection at stage %r requires an explicit reason (candidate=%s, tf=%s)."
                 % (stage, candidate_id, tf)
             )
         # Mutate the trace.

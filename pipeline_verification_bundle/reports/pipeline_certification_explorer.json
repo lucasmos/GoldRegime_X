@@ -121,24 +121,24 @@
       "details": {
         "M15": {
           "exported": 28937,
-          "imported": 6725,
-          "processed": 6725,
-          "executed": 410,
+          "imported": 8107,
+          "processed": 8107,
+          "executed": 493,
           "duplicates_exported": 1504264,
           "duplicates_imported": 0,
-          "missing": 23567,
-          "orphaned": 1355,
+          "missing": 22789,
+          "orphaned": 1959,
           "executed_not_processed": 0
         },
         "M5": {
           "exported": 41934,
-          "imported": 19296,
-          "processed": 19296,
-          "executed": 1211,
+          "imported": 26773,
+          "processed": 26773,
+          "executed": 1691,
           "duplicates_exported": 6067425,
           "duplicates_imported": 0,
-          "missing": 33702,
-          "orphaned": 11064,
+          "missing": 30357,
+          "orphaned": 15196,
           "executed_not_processed": 0
         }
       },
@@ -150,11 +150,11 @@
       "details": {
         "M15": {
           "dominant": "HMM",
-          "pct": 98.24777195140373
+          "pct": 97.88200513584083
         },
         "M5": {
           "dominant": "HMM",
-          "pct": 98.55969077619064
+          "pct": 98.03208125042738
         }
       },
       "message": ""

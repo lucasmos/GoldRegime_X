@@ -1,0 +1,85 @@
+{
+  "experiment_id": "c48e5a398b29",
+  "timestamp": "2026-07-14T07:23:44.593453+00:00",
+  "timeframes": {
+    "M15": {
+      "generated": 0,
+      "session_pass": 0,
+      "tbm_pass": 0,
+      "hmm_pass": 0,
+      "threshold_pass": 0,
+      "executed": 0
+    },
+    "M5": {
+      "generated": 0,
+      "session_pass": 0,
+      "tbm_pass": 0,
+      "hmm_pass": 0,
+      "threshold_pass": 0,
+      "executed": 0
+    }
+  },
+  "run_id": "c48e5a398b29",
+  "generated_at_utc": "2026-07-14T07:23:44.593453+00:00",
+  "integrity_flags": {},
+  "survival_matrix": [
+    {
+      "Stage": "Generated"
+    },
+    {
+      "Stage": "FeatureEngineering"
+    },
+    {
+      "Stage": "Session"
+    },
+    {
+      "Stage": "TBM"
+    },
+    {
+      "Stage": "HMM"
+    },
+    {
+      "Stage": "Probability"
+    },
+    {
+      "Stage": "Threshold"
+    },
+    {
+      "Stage": "Risk"
+    },
+    {
+      "Stage": "Executed"
+    }
+  ],
+  "survival_gap_warnings": [],
+  "per_timeframe": {
+    "M15": {
+      "generated": 0,
+      "executed": 0,
+      "survival_pct": 0.0,
+      "threshold": null,
+      "model_hash": null,
+      "bottleneck_stage": null,
+      "bottleneck_drop_pct": 0.0,
+      "hmm_snapshot": null,
+      "probability_summary": {},
+      "feature_drift": [],
+      "reconciliation": {}
+    },
+    "M5": {
+      "generated": 0,
+      "executed": 0,
+      "survival_pct": 0.0,
+      "threshold": null,
+      "model_hash": null,
+      "bottleneck_stage": null,
+      "bottleneck_drop_pct": 0.0,
+      "hmm_snapshot": null,
+      "probability_summary": {},
+      "feature_drift": [],
+      "reconciliation": {}
+    }
+  },
+  "total_candidates": 0,
+  "dashboard": "============================== PIPELINE HEALTH ==============================\n\n\nPipeline Status: PASS\n============================================================================="
+}
