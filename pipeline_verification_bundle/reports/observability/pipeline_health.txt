@@ -1,16 +1,16 @@
 ============================== PIPELINE HEALTH ==============================
 
-M15 Generated: 8107
-M15 Executed:  0
-M15 Survival:  0.00%
+M15 Generated: 28937
+M15 Executed:  20195
+M15 Survival:  69.79%
 
-M5 Generated: 26773
-M5 Executed:  0
-M5 Survival:  0.00%
+M5 Generated: 41934
+M5 Executed:  29972
+M5 Survival:  71.47%
 
-Largest M15 Bottleneck: FeatureEngineering (-100.0%)
-Largest M5 Bottleneck: FeatureEngineering (-100.0%)
+Largest M15 Bottleneck: Executed (-30.2%)
+Largest M5 Bottleneck: Executed (-28.5%)
 
 
-Pipeline Status: FAIL
+Pipeline Status: PASS
 =============================================================================
